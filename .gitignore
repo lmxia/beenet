@@ -1,0 +1,10 @@
+/target
+/dist
+**/Cargo.lock.bak
+.DS_Store
+.vscode/*
+!.vscode/launch.json
+*.swp
+*.swo
+/wasm_cache/
+/logs/

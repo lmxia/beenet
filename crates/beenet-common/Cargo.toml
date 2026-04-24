@@ -1,0 +1,18 @@
+[package]
+name = "beenet-common"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Shared types (CID, config, errors) for Beenet."
+
+[dependencies]
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+cid = { workspace = true }
+multihash = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }

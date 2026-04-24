@@ -1,0 +1,22 @@
+[package]
+name = "beenet-gateway"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Beenet M1 gateway: HTTP -> libp2p invoke bridge."
+
+[dependencies]
+anyhow = { workspace = true }
+axum = { workspace = true }
+beenet-common = { workspace = true }
+beenet-proto = { workspace = true }
+clap = { workspace = true }
+libp2p = { workspace = true }
+serde = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
