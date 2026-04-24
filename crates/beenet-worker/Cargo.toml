@@ -22,3 +22,10 @@ beenet-manifest = { workspace = true }
 beenet-proto = { workspace = true }
 wasmtime = { workspace = true }
 wasmtime-wasi = { workspace = true }
+wasmtime-wasi-http = { workspace = true }
+http = { workspace = true }
+http-body = { workspace = true }
+http-body-util = { workspace = true }
+hyper = { workspace = true }
+async-trait = { workspace = true }
+bytes = { workspace = true }

@@ -3,7 +3,7 @@ schema_version = 1
 [task]
 name = "hello-filter-http"
 version = "0.1.0"
-interface = "fermyon:spin/inbound-http"
+interface = "wasi:http/incoming-handler@0.2"
 
 [runtime]
 max_memory_mb = 64

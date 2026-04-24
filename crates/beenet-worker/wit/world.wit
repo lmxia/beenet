@@ -1,5 +1,0 @@
-package fermyon:spin;
-
-world http-trigger {
-  export inbound-http;
-}

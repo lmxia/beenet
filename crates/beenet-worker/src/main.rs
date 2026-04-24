@@ -1,10 +1,22 @@
+//! Beenet M1 worker.
+//!
+//! Listens on libp2p `/beenet/invoke/1.0`, loads a wasm component by CID from
+//! the local wasm cache, and executes it through a [`TaskExecutor`].
+//!
+//! M1 ships exactly one executor: [`Wasip2HttpExecutor`], which targets
+//! `wasi:http/incoming-handler@0.2` (`readme.md §3.2` "gear 0"). Future gears
+//! (e.g. `beenet:task/runner@0.1` in M3) slot in as additional `TaskExecutor`
+//! implementations without disturbing the trigger / loader / cache layers.
+
+mod executor;
+
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
 use beenet_common::{BeenetCid, INVOKE_PROTOCOL};
 use beenet_manifest::Manifest;
 use beenet_proto::{InvokeRequest, InvokeResponse, Status, TimeoutStage, Usage};
@@ -14,19 +26,13 @@ use libp2p::core::multiaddr::Protocol;
 use libp2p::request_response::{self, ProtocolSupport};
 use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
 use libp2p::{identify, identity, ping, Multiaddr, PeerId, StreamProtocol, SwarmBuilder};
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, Semaphore};
 use tracing::{error, info, warn};
-use wasmtime::component::{Component, InstancePre, Linker};
-use wasmtime::{Config, Engine, Store};
-use wasmtime_wasi::p2::pipe::MemoryOutputPipe;
-use wasmtime_wasi::{ResourceTable, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
+use wasmtime::component::{Component, Linker};
+use wasmtime::{Config, Engine};
 
-wasmtime::component::bindgen!({
-    path: "wit",
-    world: "http-trigger",
-});
-
-use fermyon::spin::http_types::{Method, Request, Response};
+use crate::executor::{ExecOutcome, Wasip2HttpExecutor};
+pub use crate::executor::{HostState, TaskExecutor};
 
 #[derive(Parser, Debug, Clone)]
 #[command(name = "beenet-worker", about = "Beenet M1 worker")]
@@ -42,6 +48,12 @@ struct Args {
 
     #[arg(long, env = "BEENET_DEFAULT_MEMORY_MB", default_value_t = 64)]
     default_memory_mb: u32,
+
+    /// Worker-level concurrency gate (`readme.md §6.2.4`).
+    ///
+    /// Defaults to `available_parallelism * 4` (see `readme.md §1.2`).
+    #[arg(long, env = "BEENET_MAX_CONCURRENCY")]
+    max_concurrency: Option<usize>,
 }
 
 #[derive(NetworkBehaviour)]
@@ -51,80 +63,104 @@ struct WorkerBehaviour {
     ping: ping::Behaviour,
 }
 
-#[derive(Clone)]
-struct TaskEntry {
-    manifest: Manifest,
-    pre: InstancePre<HostState>,
+/// An entry in the per-CID task cache (`readme.md §6.1` L1).
+///
+/// Wraps the parsed manifest together with the executor-specific pre-instance
+/// handle (see [`TaskExecutor::prepare`]).
+pub struct TaskEntry<E: TaskExecutor> {
+    pub manifest: Manifest,
+    pub prepared: E::Prepared,
 }
 
-struct Runtime {
+struct Runtime<E: TaskExecutor> {
     engine: Engine,
-    linker: Linker<HostState>,
+    executor: E,
     wasm_cache_dir: PathBuf,
     default_deadline_ms: u32,
     default_memory_mb: u32,
-    cache: RwLock<HashMap<BeenetCid, Arc<TaskEntry>>>,
+    cache: RwLock<HashMap<BeenetCid, Arc<TaskEntry<E>>>>,
+    gate: Arc<Semaphore>,
 }
 
-struct HostState {
-    wasi: WasiCtx,
-    table: ResourceTable,
-    stdout: MemoryOutputPipe,
-    stderr: MemoryOutputPipe,
-}
-
-impl WasiView for HostState {
-    fn ctx(&mut self) -> WasiCtxView<'_> {
-        WasiCtxView {
-            ctx: &mut self.wasi,
-            table: &mut self.table,
-        }
-    }
-}
-
-impl Runtime {
-    fn new(args: &Args) -> Result<Self> {
-        let config = Config::new();
-        let engine = Engine::new(&config)?;
-
-        let mut linker = Linker::<HostState>::new(&engine);
-        wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
-
-        Ok(Self {
+impl<E: TaskExecutor> Runtime<E> {
+    fn new(engine: Engine, executor: E, args: &Args) -> Self {
+        let max_concurrency = args.max_concurrency.unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| n.get() * 4)
+                .unwrap_or(8)
+        });
+        Self {
             engine,
-            linker,
+            executor,
             wasm_cache_dir: args.wasm_cache_dir.clone(),
             default_deadline_ms: args.default_deadline_ms,
             default_memory_mb: args.default_memory_mb,
             cache: RwLock::new(HashMap::new()),
-        })
+            gate: Arc::new(Semaphore::new(max_concurrency)),
+        }
     }
 
     async fn execute(&self, req: InvokeRequest) -> InvokeResponse {
         let started = Instant::now();
-        match self.execute_inner(&req).await {
+
+        // `readme.md §6.2.4`: worker-level concurrency gate. On exhaustion we
+        // return Rejected (`§3.6`: fully exempt from billing).
+        let permit = match self.gate.clone().try_acquire_owned() {
+            Ok(p) => p,
+            Err(_) => {
+                return InvokeResponse {
+                    request_id: req.request_id,
+                    status: Status::Rejected {
+                        reason: "worker concurrency gate exhausted".into(),
+                    },
+                    body: Vec::new(),
+                    usage: Usage {
+                        wall_ns: started.elapsed().as_nanos() as u64,
+                        billable: false,
+                        ..Usage::default()
+                    },
+                };
+            }
+        };
+
+        let out = self.execute_inner(&req, started).await;
+        drop(permit);
+
+        match out {
             Ok((status, body, usage)) => InvokeResponse {
                 request_id: req.request_id,
                 status,
                 body,
                 usage,
             },
-            Err(err) => InvokeResponse {
-                request_id: req.request_id,
-                status: Status::RuntimeError {
-                    reason: err.to_string(),
-                },
-                body: Vec::new(),
-                usage: Usage {
-                    wall_ns: started.elapsed().as_nanos() as u64,
-                    billable: true,
-                    ..Usage::default()
-                },
-            },
+            Err(err) => {
+                warn!(
+                    cid = %req.cid,
+                    request_id = %req.request_id,
+                    error = ?err,
+                    "task execution failed"
+                );
+                InvokeResponse {
+                    request_id: req.request_id,
+                    status: Status::RuntimeError {
+                        reason: err.to_string(),
+                    },
+                    body: Vec::new(),
+                    usage: Usage {
+                        wall_ns: started.elapsed().as_nanos() as u64,
+                        billable: true,
+                        ..Usage::default()
+                    },
+                }
+            }
         }
     }
 
-    async fn execute_inner(&self, req: &InvokeRequest) -> Result<(Status, Vec<u8>, Usage)> {
+    async fn execute_inner(
+        &self,
+        req: &InvokeRequest,
+        started: Instant,
+    ) -> Result<(Status, Vec<u8>, Usage)> {
         let entry = self
             .load_task(&req.cid)
             .await
@@ -142,9 +178,8 @@ impl Runtime {
             .max_memory_mb
             .unwrap_or(self.default_memory_mb);
 
-        let started = Instant::now();
-        let call = self.call_component(&entry, req);
-        let (status, body, stdout, stderr) = match tokio::time::timeout(
+        let call = self.executor.invoke(&entry, req);
+        let outcome = match tokio::time::timeout(
             Duration::from_millis(deadline_ms as u64),
             call,
         )
@@ -152,6 +187,12 @@ impl Runtime {
         {
             Ok(Ok(v)) => v,
             Ok(Err(err)) => {
+                warn!(
+                    cid = %req.cid,
+                    request_id = %req.request_id,
+                    error = %err,
+                    "executor invoke returned error"
+                );
                 return Ok((
                     Status::RuntimeError {
                         reason: err.to_string(),
@@ -181,6 +222,13 @@ impl Runtime {
             }
         };
 
+        let ExecOutcome {
+            status,
+            body,
+            stdout,
+            stderr,
+        } = outcome;
+
         if !stdout.is_empty() {
             info!(cid = %req.cid, request_id = %req.request_id, stdout = %stdout);
         }
@@ -197,74 +245,7 @@ impl Runtime {
         Ok((status, body, usage))
     }
 
-    async fn call_component(
-        &self,
-        entry: &TaskEntry,
-        req: &InvokeRequest,
-    ) -> Result<(Status, Vec<u8>, String, String)> {
-        let stdout = MemoryOutputPipe::new(64 * 1024);
-        let stderr = MemoryOutputPipe::new(64 * 1024);
-        let wasi = WasiCtxBuilder::new()
-            .stdout(stdout.clone())
-            .stderr(stderr.clone())
-            .build();
-        let state = HostState {
-            wasi,
-            table: ResourceTable::new(),
-            stdout,
-            stderr,
-        };
-
-        let mut store = Store::new(&self.engine, state);
-        let instance = entry.pre.instantiate_async(&mut store).await?;
-        let func = instance
-            .get_export_index(&mut store, None, "fermyon:spin/inbound-http")
-            .and_then(|i| instance.get_export_index(&mut store, Some(&i), "handle-request"))
-            .ok_or_else(|| anyhow!("component did not export fermyon:spin/inbound-http/handle-request"))?;
-        let func = instance.get_typed_func::<(Request,), (Response,)>(&mut store, &func)?;
-
-        let request = Request {
-            method: Method::Post,
-            uri: "/".to_string(),
-            headers: vec![
-                ("x-beenet-request-id".into(), req.request_id.clone()),
-                ("x-beenet-cid".into(), req.cid.to_string()),
-                ("x-beenet-deadline-ms".into(), req.deadline_ms.to_string()),
-            ],
-            params: vec![],
-            body: Some(req.input.clone()),
-        };
-
-        let (response,) = func.call_async(&mut store, (request,)).await?;
-
-        // Drop WASI resources holding the pipe refs before `try_into_inner`.
-        store.data_mut().wasi = WasiCtxBuilder::new().build();
-        *store.data_mut().ctx().table = ResourceTable::new();
-        let stdout = std::mem::replace(&mut store.data_mut().stdout, MemoryOutputPipe::new(1));
-        let stderr = std::mem::replace(&mut store.data_mut().stderr, MemoryOutputPipe::new(1));
-
-        let stdout = String::from_utf8_lossy(&stdout.try_into_inner().unwrap_or_default()).into_owned();
-        let stderr = String::from_utf8_lossy(&stderr.try_into_inner().unwrap_or_default()).into_owned();
-
-        let body = response.body.unwrap_or_default();
-        let status = match response.status {
-            200..=299 => Status::Ok,
-            400..=499 => Status::BusinessError {
-                http_status: response.status,
-                reason: http_reason(response.status),
-            },
-            500..=599 => Status::RuntimeError {
-                reason: format!("guest returned {}", response.status),
-            },
-            other => Status::RuntimeError {
-                reason: format!("unexpected status {other}"),
-            },
-        };
-
-        Ok((status, body, stdout, stderr))
-    }
-
-    async fn load_task(&self, cid: &BeenetCid) -> Result<Arc<TaskEntry>> {
+    async fn load_task(&self, cid: &BeenetCid) -> Result<Arc<TaskEntry<E>>> {
         if let Some(entry) = self.cache.read().await.get(cid).cloned() {
             return Ok(entry);
         }
@@ -272,15 +253,14 @@ impl Runtime {
         let wasm_path = self.wasm_path(cid);
         let wasm = fs::read(&wasm_path)
             .with_context(|| format!("read cached wasm `{}`", wasm_path.display()))?;
-        let manifest = beenet_manifest::extract(&wasm)
-            .map_err(|e| anyhow!("manifest extraction failed: {e}"))?;
-        let component =
-            Component::new(&self.engine, &wasm).map_err(|e| anyhow!("compile failed: {e}"))?;
-        let pre = self
-            .linker
-            .instantiate_pre(&component)
-            .map_err(|e| anyhow!("instantiate_pre failed: {e}"))?;
-        let entry = Arc::new(TaskEntry { manifest, pre });
+        let manifest = beenet_manifest::extract(&wasm).context("manifest extraction failed")?;
+        let component = Component::new(&self.engine, &wasm)
+            .map_err(|e| anyhow::anyhow!("compile component failed: {e}"))?;
+        let prepared = self
+            .executor
+            .prepare(&component)
+            .context("executor prepare failed")?;
+        let entry = Arc::new(TaskEntry { manifest, prepared });
         self.cache.write().await.insert(cid.clone(), entry.clone());
         Ok(entry)
     }
@@ -288,24 +268,6 @@ impl Runtime {
     fn wasm_path(&self, cid: &BeenetCid) -> PathBuf {
         self.wasm_cache_dir.join(format!("{cid}.wasm"))
     }
-}
-
-fn http_reason(status: u16) -> String {
-    match status {
-        400 => "bad request",
-        401 => "unauthorized",
-        403 => "forbidden",
-        404 => "not found",
-        409 => "conflict",
-        422 => "unprocessable entity",
-        429 => "too many requests",
-        500 => "internal server error",
-        502 => "bad gateway",
-        503 => "service unavailable",
-        504 => "gateway timeout",
-        _ => "http error",
-    }
-    .to_string()
 }
 
 fn build_swarm(local_key: identity::Keypair) -> Result<libp2p::Swarm<WorkerBehaviour>> {
@@ -335,6 +297,26 @@ fn build_swarm(local_key: identity::Keypair) -> Result<libp2p::Swarm<WorkerBehav
     Ok(swarm)
 }
 
+fn build_engine_and_linker() -> Result<(Engine, Linker<HostState>)> {
+    let config = Config::new();
+    let engine = Engine::new(&config)?;
+    let mut linker = Linker::<HostState>::new(&engine);
+
+    // WASI p2 base interfaces (io/cli/clocks/random/filesystem/sockets…).
+    //
+    // `readme.md §D16`: M1's default security posture is capability-not-granted
+    // at the `WasiCtx` level — sockets and filesystem are in the linker but the
+    // guest gets permission-denied at runtime unless `WasiCtxBuilder` explicitly
+    // opts in. M1.5 replaces this posture with `OutboundNetworkingFactor` +
+    // `NoFilesMounter` for enforceable allowlists.
+    wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
+    // `wasi:http/{types,outgoing-handler}` — inbound handler is invoked via
+    // `ProxyPre::instantiate_async`, not via the linker.
+    wasmtime_wasi_http::p2::add_only_http_to_linker_async(&mut linker)?;
+
+    Ok((engine, linker))
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -348,17 +330,20 @@ async fn main() -> Result<()> {
     fs::create_dir_all(&args.wasm_cache_dir)
         .with_context(|| format!("create `{}`", args.wasm_cache_dir.display()))?;
 
+    let (engine, linker) = build_engine_and_linker()?;
+    let executor = Wasip2HttpExecutor::new(linker);
+    let runtime = Arc::new(Runtime::new(engine, executor, &args));
+
     let local_key = identity::Keypair::generate_ed25519();
     let local_peer_id = PeerId::from(local_key.public());
     let mut swarm = build_swarm(local_key)?;
     swarm.listen_on(args.listen_addr.clone())?;
 
-    let runtime = Arc::new(Runtime::new(&args)?);
-
     info!(
         peer_id = %local_peer_id,
         listen_addr = %args.listen_addr,
         wasm_cache_dir = %args.wasm_cache_dir.display(),
+        max_concurrency = runtime.gate.available_permits(),
         "worker started"
     );
 
@@ -375,6 +360,10 @@ async fn main() -> Result<()> {
                     request, channel, ..
                 } => {
                     info!(from = %peer, cid = %request.cid, request_id = %request.request_id, "invoke");
+                    let runtime = runtime.clone();
+                    // Spawn so a slow task doesn't block the swarm loop; the
+                    // concurrency gate inside `execute` still provides the
+                    // worker-wide upper bound.
                     let response = runtime.execute(request).await;
                     if let Err(resp) = swarm
                         .behaviour_mut()
