@@ -1,0 +1,20 @@
+[package]
+name = "beenet-factors"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Flat Spin RuntimeFactors for Beenet worker (WASI + variables + outbound HTTP)."
+
+[dependencies]
+anyhow = { workspace = true }
+serde_json = { workspace = true }
+spin-factor-outbound-http = { workspace = true }
+spin-factor-outbound-networking = { workspace = true }
+spin-factor-variables = { workspace = true }
+spin-factor-wasi = { workspace = true }
+spin-factors = { workspace = true }
+spin-locked-app = { workspace = true }
+tracing = { workspace = true }

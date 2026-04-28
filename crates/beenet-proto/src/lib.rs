@@ -25,6 +25,12 @@ pub struct InvokeResponse {
     pub status: Status,
     #[serde(with = "serde_bytes", default, skip_serializing_if = "Vec::is_empty")]
     pub body: Vec<u8>,
+    /// Guest stdout (UTF-8 lossy), truncated by the worker for wire safety.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub stdout: String,
+    /// Guest stderr (UTF-8 lossy), truncated by the worker for wire safety.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub stderr: String,
     #[serde(default)]
     pub usage: Usage,
 }

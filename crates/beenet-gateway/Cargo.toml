@@ -11,6 +11,7 @@ description = "Beenet M1 gateway: HTTP -> libp2p invoke bridge."
 [dependencies]
 anyhow = { workspace = true }
 axum = { workspace = true }
+base64 = { workspace = true }
 beenet-common = { workspace = true }
 beenet-proto = { workspace = true }
 clap = { workspace = true }

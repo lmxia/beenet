@@ -1,213 +1,132 @@
-//! Pluggable task executors.
-//!
-//! A `TaskExecutor` owns the per-interface translation between a Beenet
-//! [`InvokeRequest`] and a wasm component invocation. M1 provides exactly one:
-//! [`Wasip2HttpExecutor`] for `wasi:http/incoming-handler@0.2` components. A
-//! future `beenet:task/runner@0.1` executor (gear 1, `readme.md §3.2`, M3) can
-//! be added by implementing this trait without touching the trigger / cache /
-//! gating layers.
+//! Spin [`FactorsExecutor`](spin_factors_executor::FactorsExecutor) + wasi:http p2 invoke path (M1.5).
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
-use async_trait::async_trait;
+use beenet_factors::BeenetFactors;
 use beenet_proto::{InvokeRequest, Status};
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
-use wasmtime_wasi_http::p2::body::{HyperIncomingBody, HyperOutgoingBody};
-use wasmtime::component::{Component, Linker, ResourceTable};
-use wasmtime::Store;
+use spin_app::App;
+use spin_factor_outbound_http::OutboundHttpFactor;
+use spin_factor_wasi::WasiFactor;
+use spin_factors_executor::FactorsExecutorApp;
 use wasmtime_wasi::p2::pipe::MemoryOutputPipe;
-use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
+use wasmtime_wasi_http::p2::body::{HyperIncomingBody, HyperOutgoingBody};
 use wasmtime_wasi_http::p2::bindings::http::types::{ErrorCode, Scheme};
 use wasmtime_wasi_http::p2::bindings::ProxyPre;
-use wasmtime_wasi_http::p2::{WasiHttpCtxView, WasiHttpView};
-use wasmtime_wasi_http::WasiHttpCtx;
 
-use crate::TaskEntry;
+/// Max stdout/stderr bytes shipped on `InvokeResponse` (M1.5 wire cap).
+pub const WIRE_LOG_CAP_BYTES: usize = 16 * 1024;
 
-/// Per-store host state plumbed into every wasm instance.
-///
-/// `target.md §D16`: capability-not-granted default — we build `WasiCtx` with
-/// only stdio wired and no env / no preopens / no `inherit_network`. M1.5 will
-/// replace this with BeenetFactors.
-pub struct HostState {
-    wasi: WasiCtx,
-    http: WasiHttpCtx,
-    table: ResourceTable,
-}
-
-impl HostState {
-    fn new() -> (Self, MemoryOutputPipe, MemoryOutputPipe) {
-        let stdout = MemoryOutputPipe::new(64 * 1024);
-        let stderr = MemoryOutputPipe::new(64 * 1024);
-        let wasi = WasiCtxBuilder::new()
-            .stdout(stdout.clone())
-            .stderr(stderr.clone())
-            .build();
-        let state = Self {
-            wasi,
-            http: WasiHttpCtx::new(),
-            table: ResourceTable::new(),
-        };
-        (state, stdout, stderr)
-    }
-}
-
-impl WasiView for HostState {
-    fn ctx(&mut self) -> WasiCtxView<'_> {
-        WasiCtxView {
-            ctx: &mut self.wasi,
-            table: &mut self.table,
-        }
-    }
-}
-
-impl WasiHttpView for HostState {
-    fn http(&mut self) -> WasiHttpCtxView<'_> {
-        WasiHttpCtxView {
-            ctx: &mut self.http,
-            table: &mut self.table,
-            hooks: Default::default(),
-        }
-    }
-}
-
-/// Result of a single task invocation as produced by a [`TaskExecutor`].
 pub struct ExecOutcome {
     pub status: Status,
     pub body: Vec<u8>,
     pub stdout: String,
     pub stderr: String,
+    pub mem_bytes: u64,
 }
 
-/// Contract all task interfaces implement.
-///
-/// `Prepared` is the executor-specific cached artefact produced at
-/// [`prepare`](Self::prepare) time (typically a
-/// [`wasmtime::component::InstancePre`] wrapped by a generated `Pre` struct).
-/// It is stored once per CID in the L1 cache (`readme.md §6.1`).
-#[async_trait]
-pub trait TaskExecutor: Send + Sync + 'static {
-    type Prepared: Send + Sync + 'static;
+/// Run one HTTP invoke against a prepared Spin factors app (single `http` component).
+pub async fn invoke_prepared(
+    app: &FactorsExecutorApp<BeenetFactors, ()>,
+    component_id: &str,
+    req: &InvokeRequest,
+    deadline_ms: u32,
+    max_memory_bytes: usize,
+) -> Result<ExecOutcome> {
+    let stdout_pipe = MemoryOutputPipe::new(64 * 1024);
+    let stderr_pipe = MemoryOutputPipe::new(64 * 1024);
 
-    /// Compile-time / instantiate-time preparation for a component. Called
-    /// once per CID on first invocation.
-    fn prepare(&self, component: &Component) -> Result<Self::Prepared>;
+    let mut instance_builder = app.prepare(component_id)?;
+    instance_builder
+        .store_builder()
+        .max_memory_size(max_memory_bytes.max(1));
 
-    /// Invoke the prepared component for a single request.
-    async fn invoke(&self, entry: &TaskEntry<Self>, req: &InvokeRequest) -> Result<ExecOutcome>
-    where
-        Self: Sized;
-}
+    let wasi = instance_builder
+        .factor_builder::<WasiFactor>()
+        .context("missing WasiFactor")?;
+    wasi.stdout(stdout_pipe.clone());
+    wasi.stderr(stderr_pipe.clone());
 
-/// `wasi:http/incoming-handler@0.2` executor (gear 0, M1).
-///
-/// Synthesises a `hyper::Request` from [`InvokeRequest`], routes it through
-/// [`ProxyPre::instantiate_async`] + the generated `incoming_handler`, then
-/// drains the outgoing body into [`ExecOutcome::body`]. HTTP status is mapped
-/// to [`Status`] per `readme.md §3.2.2` (A/B table).
-pub struct Wasip2HttpExecutor {
-    linker: Arc<Linker<HostState>>,
-}
+    let instance_pre = app
+        .get_instance_pre(component_id)
+        .context("get_instance_pre")?
+        .clone();
+    let proxy_pre = ProxyPre::new(instance_pre)
+        .map_err(|e| anyhow!("component is not a wasi:http/proxy world: {e}"))?;
 
-impl Wasip2HttpExecutor {
-    pub fn new(linker: Linker<HostState>) -> Self {
-        Self {
-            linker: Arc::new(linker),
+    let (_instance, mut store) = instance_builder.instantiate(()).await?;
+
+    let deadline = Instant::now() + Duration::from_millis(deadline_ms as u64);
+    store.set_deadline(deadline);
+
+    let http_req = build_incoming_request(req)?;
+
+    let mut wasi_http = OutboundHttpFactor::get_wasi_http_impl(
+        store.data_mut().factors_instance_state_mut(),
+    )
+    .context("missing OutboundHttpFactor / wasi-http state")?;
+
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    let incoming = wasi_http
+        .new_incoming_request(Scheme::Http, http_req)
+        .map_err(|e| anyhow!("new_incoming_request failed: {e}"))?;
+    let outparam = wasi_http
+        .new_response_outparam(sender)
+        .map_err(|e| anyhow!("new_response_outparam failed: {e}"))?;
+
+    let proxy = proxy_pre.instantiate_async(&mut store).await?;
+    let task = tokio::spawn(async move {
+        proxy
+            .wasi_http_incoming_handler()
+            .call_handle(&mut store, incoming, outparam)
+            .await?;
+        Ok::<_, anyhow::Error>(store)
+    });
+
+    match receiver.await {
+        Ok(Ok(resp)) => {
+            let (status, body) = drain_response(resp).await?;
+            let store = task.await.context("guest task join")??;
+            let mem = store.data().core_state().memory_consumed();
+            Ok(finalise(
+                status,
+                body,
+                stdout_pipe,
+                stderr_pipe,
+                mem,
+            ))
         }
-    }
-}
-
-#[async_trait]
-impl TaskExecutor for Wasip2HttpExecutor {
-    type Prepared = ProxyPre<HostState>;
-
-    fn prepare(&self, component: &Component) -> Result<Self::Prepared> {
-        let instance_pre = self
-            .linker
-            .instantiate_pre(component)
-            .map_err(|e| anyhow!("instantiate_pre: {e}"))?;
-        ProxyPre::new(instance_pre)
-            .map_err(|e| anyhow!("component is not a wasi:http/proxy world: {e}"))
-    }
-
-    async fn invoke(&self, entry: &TaskEntry<Self>, req: &InvokeRequest) -> Result<ExecOutcome> {
-        let (state, stdout_pipe, stderr_pipe) = HostState::new();
-        let mut store = Store::new(entry.prepared.engine(), state);
-
-        let http_req = build_incoming_request(req)?;
-
-        let (sender, receiver) = tokio::sync::oneshot::channel();
-        let incoming = store
-            .data_mut()
-            .http()
-            .new_incoming_request(Scheme::Http, http_req)
-            .map_err(|e| anyhow!("new_incoming_request failed: {e}"))?;
-        let outparam = store
-            .data_mut()
-            .http()
-            .new_response_outparam(sender)
-            .map_err(|e| anyhow!("new_response_outparam failed: {e}"))?;
-
-        let proxy_pre = entry.prepared.clone();
-        let task = tokio::spawn(async move {
-            let proxy = proxy_pre.instantiate_async(&mut store).await?;
-            proxy
-                .wasi_http_incoming_handler()
-                .call_handle(&mut store, incoming, outparam)
-                .await?;
-            Ok::<_, anyhow::Error>(store)
-        });
-
-        // Wait for the guest to either call `response-outparam::set` (success
-        // or explicit failure) or drop the outparam (which closes the oneshot
-        // sender; in that case we inspect the task result).
-        let store = match receiver.await {
-            Ok(Ok(resp)) => {
-                let (status, body) = drain_response(resp).await?;
-                let _ = task.await;
-                return Ok(finalise(status, body, stdout_pipe, stderr_pipe));
+        Ok(Err(err)) => {
+            let _ = task.await;
+            Ok(ExecOutcome {
+                status: Status::RuntimeError {
+                    reason: format!("guest rejected request: {err}"),
+                },
+                body: Vec::new(),
+                stdout: drain_pipe_truncated(&stdout_pipe),
+                stderr: drain_pipe_truncated(&stderr_pipe),
+                mem_bytes: 0,
+            })
+        }
+        Err(_) => match task.await {
+            Ok(Ok(store)) => {
+                let mem = store.data().core_state().memory_consumed();
+                let _ = mem;
+                bail!("guest finished without calling response-outparam::set");
             }
-            Ok(Err(err)) => {
-                // Guest called `response-outparam::set(err)` — surface as runtime.
-                let _ = task.await;
-                return Ok(ExecOutcome {
-                    status: Status::RuntimeError {
-                        reason: format!("guest rejected request: {err}"),
-                    },
-                    body: Vec::new(),
-                    stdout: drain_pipe(&stdout_pipe),
-                    stderr: drain_pipe(&stderr_pipe),
-                });
-            }
-            Err(_) => {
-                // Sender dropped without `set`; inspect the task.
-                match task.await {
-                    Ok(Ok(s)) => s,
-                    Ok(Err(e)) => bail!("guest trapped before setting response: {e}"),
-                    Err(e) => bail!("guest task panicked: {e}"),
-                }
-            }
-        };
-        // Unreachable in the success path; placeholder to keep the compiler happy
-        // if this branch is taken (guest finished cleanly but never set outparam,
-        // which we treat as a runtime error).
-        let _ = store;
-        bail!("guest finished without calling response-outparam::set");
+            Ok(Err(e)) => bail!("guest trapped before setting response: {e}"),
+            Err(e) => bail!("guest task panicked: {e}"),
+        },
     }
 }
 
 fn build_incoming_request(req: &InvokeRequest) -> Result<hyper::Request<HyperIncomingBody>> {
-    // `HyperIncomingBody = UnsyncBoxBody<Bytes, ErrorCode>`, so we map the
-    // infallible `Full` error into `ErrorCode` and use `.boxed_unsync()`.
     let body: HyperIncomingBody = Full::new(Bytes::from(req.input.clone()))
         .map_err(|never: std::convert::Infallible| -> ErrorCode { match never {} })
         .boxed_unsync();
-    // `wasi:http/types.new_incoming_request` requires either the URI to carry an
-    // authority or a `Host` header. Beenet invocations are always synthesised
-    // with a fixed authority `beenet.local` — task code that cares about the
-    // authority can read `x-beenet-cid` instead.
     let mut builder = hyper::Request::builder()
         .method(http::Method::POST)
         .uri("http://beenet.local/")
@@ -221,9 +140,7 @@ fn build_incoming_request(req: &InvokeRequest) -> Result<hyper::Request<HyperInc
     builder.body(body).context("build hyper request")
 }
 
-async fn drain_response(
-    resp: hyper::Response<HyperOutgoingBody>,
-) -> Result<(u16, Vec<u8>)> {
+async fn drain_response(resp: hyper::Response<HyperOutgoingBody>) -> Result<(u16, Vec<u8>)> {
     let status = resp.status().as_u16();
     let collected = resp
         .into_body()
@@ -238,6 +155,7 @@ fn finalise(
     body: Vec<u8>,
     stdout_pipe: MemoryOutputPipe,
     stderr_pipe: MemoryOutputPipe,
+    mem_bytes: u64,
 ) -> ExecOutcome {
     let status = match http_status {
         200..=299 => Status::Ok,
@@ -255,14 +173,29 @@ fn finalise(
     ExecOutcome {
         status,
         body,
-        stdout: drain_pipe(&stdout_pipe),
-        stderr: drain_pipe(&stderr_pipe),
+        stdout: drain_pipe_truncated(&stdout_pipe),
+        stderr: drain_pipe_truncated(&stderr_pipe),
+        mem_bytes,
     }
 }
 
-fn drain_pipe(pipe: &MemoryOutputPipe) -> String {
+fn drain_pipe_truncated(pipe: &MemoryOutputPipe) -> String {
     let bytes = pipe.contents();
-    String::from_utf8_lossy(&bytes).into_owned()
+    let s = String::from_utf8_lossy(&bytes).into_owned();
+    truncate_utf8(s, WIRE_LOG_CAP_BYTES)
+}
+
+fn truncate_utf8(mut s: String, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s.truncate(end);
+    s.push_str("\n… [truncated]");
+    s
 }
 
 fn http_reason(status: u16) -> String {
@@ -281,4 +214,22 @@ fn http_reason(status: u16) -> String {
         _ => "http error",
     }
     .to_string()
+}
+
+/// Build [`spin_app::App`] + load through [`spin_factors_executor::FactorsExecutor::load_app`].
+pub async fn load_factors_app(
+    executor: Arc<spin_factors_executor::FactorsExecutor<BeenetFactors, ()>>,
+    cid: &beenet_common::BeenetCid,
+    manifest: &beenet_manifest::Manifest,
+    loader: &impl spin_factors_executor::ComponentLoader<BeenetFactors, ()>,
+) -> Result<Arc<FactorsExecutorApp<BeenetFactors, ()>>> {
+    let locked = beenet_factors::locked_app_single_http_component(
+        &cid.to_string(),
+        &manifest.networking.allowed_outbound_hosts,
+    )?;
+    let app = App::new("beenet-task", locked);
+    let app_loaded = executor
+        .load_app(app, Default::default(), loader, Some("http"))
+        .await?;
+    Ok(Arc::new(app_loaded))
 }

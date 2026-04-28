@@ -5,6 +5,7 @@ members = [
     "crates/beenet-proto",
     "crates/beenet-manifest",
     "crates/beenet-pack",
+    "crates/beenet-factors",
     "crates/beenet-worker",
     "crates/beenet-gateway",
 ]
@@ -25,11 +26,12 @@ repository = "https://github.com/beenet/beenet"
 beenet-common   = { path = "crates/beenet-common" }
 beenet-proto    = { path = "crates/beenet-proto" }
 beenet-manifest = { path = "crates/beenet-manifest" }
+beenet-factors = { path = "crates/beenet-factors" }
 
 # ---- core runtime ----
 wasmtime          = { version = "43", features = ["component-model-async"] }
-wasmtime-wasi     = { version = "43" }
-wasmtime-wasi-http = { version = "43", features = ["component-model-async"] }
+wasmtime-wasi     = { version = "43", features = ["p2", "p3"] }
+wasmtime-wasi-http = { version = "43", features = ["p2", "p3", "component-model-async"] }
 wasm-encoder      = "0.245"
 wasmparser        = "0.245"
 wasm-metadata     = "0.245"
@@ -80,6 +82,18 @@ multihash = "0.19"
 sha2 = "0.10"
 hex = "0.4"
 uuid = { version = "1", features = ["v4"] }
+base64 = "0.22"
+
+# Spin host embedding (M1.5): checkout `spin` as sibling of `beenet` (see `beenet.code-workspace`).
+spin-app = { path = "../spin/crates/app" }
+spin-core = { path = "../spin/crates/core" }
+spin-factors = { path = "../spin/crates/factors" }
+spin-factors-executor = { path = "../spin/crates/factors-executor" }
+spin-locked-app = { path = "../spin/crates/locked-app" }
+spin-factor-wasi = { path = "../spin/crates/factor-wasi" }
+spin-factor-variables = { path = "../spin/crates/factor-variables" }
+spin-factor-outbound-networking = { path = "../spin/crates/factor-outbound-networking" }
+spin-factor-outbound-http = { path = "../spin/crates/factor-outbound-http" }
 
 [profile.release]
 opt-level = 3

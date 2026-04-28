@@ -4,7 +4,9 @@ use std::time::Duration;
 use anyhow::{anyhow, Result};
 use axum::body::Bytes;
 use axum::extract::{Path, State};
+use axum::http::header::HeaderValue;
 use axum::http::{Response, StatusCode};
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::Router;
@@ -185,6 +187,16 @@ fn into_http_response(resp: InvokeResponse) -> axum::response::Response {
     let mut builder = Response::builder().status(status);
     builder = builder.header("x-beenet-request-id", &resp.request_id);
     builder = builder.header("x-beenet-status", status_label(&resp.status));
+    if !resp.stdout.is_empty() {
+        if let Ok(v) = HeaderValue::from_str(&STANDARD.encode(&resp.stdout)) {
+            builder = builder.header("x-beenet-stdout-b64", v);
+        }
+    }
+    if !resp.stderr.is_empty() {
+        if let Ok(v) = HeaderValue::from_str(&STANDARD.encode(&resp.stderr)) {
+            builder = builder.header("x-beenet-stderr-b64", v);
+        }
+    }
     builder
         .body(axum::body::Body::from(resp.body))
         .unwrap()
@@ -247,6 +259,8 @@ async fn run_swarm_loop(
                                 reason: format!("outbound failure: {error}"),
                             },
                             body: Vec::new(),
+                            stdout: String::new(),
+                            stderr: String::new(),
                             usage: Usage::default(),
                         });
                     }

@@ -18,11 +18,17 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 serde = { workspace = true }
 beenet-common = { workspace = true }
+beenet-factors = { workspace = true }
 beenet-manifest = { workspace = true }
 beenet-proto = { workspace = true }
+spin-app = { workspace = true }
+spin-core = { workspace = true }
+spin-factors-executor = { workspace = true }
 wasmtime = { workspace = true }
 wasmtime-wasi = { workspace = true }
 wasmtime-wasi-http = { workspace = true }
+spin-factor-outbound-http = { workspace = true }
+spin-factor-wasi = { workspace = true }
 http = { workspace = true }
 http-body = { workspace = true }
 http-body-util = { workspace = true }
