@@ -1,8 +1,8 @@
 # Beenet —— 基于 CID 的分布式 Agent 任务网络
 
-> 文档版本：**v2.12（M1 端到端闭环版）**  
+> 文档版本：**v2.13（M1 端到端闭环版 + Spin 对照纪要）**  
 > 状态：M1 最短闭环已跑通（档 0 = Wasip2）；进入 M1.5 规划  
-> 说明：v2.12 对应 M1 端到端可运行的工作树：worker 走 `wasmtime-wasi-http` 的 p2 `ProxyPre`，example 为 `spin-sdk 5.x` 的 `#[http_component]`。
+> 说明：v2.13 在 v2.12 基础上增加 §11.3（Spin 对照纪要）；v2.12 对应 M1 端到端可运行的工作树：worker 走 `wasmtime-wasi-http` 的 p2 `ProxyPre`，example 为 `spin-sdk 5.x` 的 `#[http_component]`。
 
 ---
 
@@ -277,6 +277,13 @@ bill = base_fee + compute_fee + resource_fee
 - M1.5 并发闸门阈值默认值（候选 `CPU * 4`，见 §1.2）
 - `InvokeResponse` 的 stdout/stderr wire 扩展：内联 vs `log_blob_ref`（超过阈值落外挂存储）
 
+### 11.3 与 Spin `trigger-http` / `HandlerType` 对照（纪要）
+
+- **Spin `handler_type` / `component_handler_types`**：`HttpServer::new` 阶段对每个 HTTP 组件取 `InstancePre`，经 `HandlerType::from_instance_pre` 扫描 **Wasm export**（wasi:http 各版本、`fermyon:spin/inbound-http` 等），得到**唯一**候选后写入 `HashMap<component_id, …>`；请求路径只做查表分派（见 `spin/crates/trigger-http/src/server.rs`、`spin/crates/http/src/trigger.rs`）。
+- **Beenet _worker 当前形态**：`locked_app_single_http_component` + `wasmtime_wasi_http::p2::bindings::ProxyPre::new(instance_pre)`，**实质上固定为 wasi:http P2 `incoming-handler`（与 Spin 的 `Wasi0_2` / `ProxyIndices` 同族）**。不覆盖 Wagi、WASI HTTP 0.3、`fermyon:spin/inbound-http` 等分支时，**不必**复刻整张 `HandlerType` 枚举；若未来要「接任意 Spin 应用或多导出形态」，再考虑复用 `from_instance_pre` + `trigger-http/src/wasi.rs` 式分派。
+- **`instantiate` 两次形态**：`FactorsInstanceBuilder::instantiate`（`factors-executor` 内已对 `instance_pre` 调用 `instantiate_async`）负责 **factors `Store` + 第一个 `Instance`**；Beenet 随后 `ProxyPre::instantiate_async(&mut store)` 是在**同一 `Store`** 上取 **typed `Proxy`** 以 `call_handle`，**不是**与前者同语义的重复。Spin `wasi.rs` 则在**同一** `instance` 上用 `indices.load(&mut store, &instance)`，故 **tuple 首元被显式使用**；Beenet 未走 `indices`，首元绑定为 `_instance` 主要为 **保活**（避免 `(_, store)` 使第一个 `Instance` 立即析构）。
+- **`get_instance_pre` 与 `prepare` 所持 `instance_pre`**：同一套预编译结果的句柄引用/克隆，**非**二次从磁盘加载组件。
+
 ---
 
 ## 12. 参考锚点
@@ -306,6 +313,7 @@ bill = base_fee + compute_fee + resource_fee
 
 ## Changelog
 
+- v2.13：新增 §11.3——与 Spin `HandlerType` / `trigger-http` 执行路径对照纪要（Beenet 固定 P2 incoming-handler、双 `instantiate` 语义、`_instance` 保活、`get_instance_pre` 非重复加载）。
 - v2.12：M1 档 0 Wasip2 端到端跑通（`curl POST /run/ipfs/<cid>` 返回 200 + 正确 body）。worker 切 `wasmtime-wasi-http::p2::ProxyPre`，引入 `TaskExecutor` trait + `Wasip2HttpExecutor` 实现，加并发闸门（`available_parallelism * 4`）。删 `crates/beenet-worker/wit/` 三份自写 WIT。D16 表述精确化为 `WasiCtxBuilder` capability-not-granted。
 - v2.11：`wasm-tools component wit` 验证 spin-sdk 5.x 的 `#[http_component]` 编译产物原生导出 `wasi:http/incoming-handler@0.2.0`。统一 M1 档 0 = Wasip2，废弃档 0-a/0-b 双档拆分。D9 改写。§10 M1 下列出待修项（worker bindgen 对错了 WIT）。
 - v2.10：对齐 M1 实际代码仓实况。修订 D9、D10（pin 延后到 M1.5）、D14（M1 仅读 manifest）。新增 D16（M1 WASI 默认姿态）。§7 区分已落地与规划。§10 拆出 M1.5 里程碑。§11.2 补并发闸门阈值与 stdout/stderr wire 扩展。
