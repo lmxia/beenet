@@ -17,6 +17,7 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 serde = { workspace = true }
+reqwest = { workspace = true }
 beenet-common = { workspace = true }
 beenet-factors = { workspace = true }
 beenet-manifest = { workspace = true }

@@ -11,16 +11,20 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
+use beenet_common::config::{
+    resolve_config_path_with_cli, WorkerCliOverrides, WorkerSettings,
+};
 use beenet_common::{BeenetCid, INVOKE_PROTOCOL};
 use beenet_factors::BeenetFactors;
 use beenet_manifest::Manifest;
-use beenet_proto::{InvokeRequest, InvokeResponse, Status, TimeoutStage, Usage};
+use beenet_proto::{InvokeRequest, InvokeResponse, LoadStage, Status, TimeoutStage, Usage};
 use clap::Parser;
 use futures::StreamExt;
 use libp2p::core::multiaddr::Protocol;
 use libp2p::request_response::{self, ProtocolSupport};
 use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
 use libp2p::{identify, identity, ping, Multiaddr, PeerId, StreamProtocol, SwarmBuilder};
+use serde::Serialize;
 use spin_app::AppComponent;
 use spin_core::wasmtime::component::Component;
 use spin_factors_executor::{ComponentLoader, FactorsExecutor};
@@ -29,27 +33,57 @@ use tracing::{error, info, warn};
 
 use crate::executor::{invoke_prepared, load_factors_app, ExecOutcome};
 
+/// CLI overrides for fields also set in `config.toml` under `[worker]`.
 #[derive(Parser, Debug, Clone)]
 #[command(name = "beenet-worker", about = "Beenet worker (M1.5 factors)")]
 struct Args {
-    #[arg(long, env = "BEENET_LISTEN_ADDR", default_value = "/ip4/127.0.0.1/tcp/4001")]
-    listen_addr: Multiaddr,
+    /// `config.toml` path (default: platform config dir `beenet/config.toml`).
+    #[arg(long, value_name = "PATH")]
+    config: Option<PathBuf>,
 
-    #[arg(long, env = "BEENET_WASM_CACHE_DIR", default_value = "./wasm_cache")]
-    wasm_cache_dir: PathBuf,
+    #[arg(long)]
+    listen_addr: Option<String>,
 
-    #[arg(long, env = "BEENET_DEFAULT_DEADLINE_MS", default_value_t = 10_000)]
-    default_deadline_ms: u32,
+    #[arg(long)]
+    wasm_cache_dir: Option<PathBuf>,
 
-    #[arg(long, env = "BEENET_DEFAULT_MEMORY_MB", default_value_t = 64)]
-    default_memory_mb: u32,
+    #[arg(long)]
+    default_deadline_ms: Option<u32>,
+
+    #[arg(long)]
+    default_memory_mb: Option<u32>,
 
     /// Worker-wide hard cap (L1) on per-instance linear memory (`target.md` D14).
-    #[arg(long, env = "BEENET_MAX_INSTANCE_MEMORY_MB", default_value_t = 256)]
-    max_instance_memory_mb: u32,
+    #[arg(long)]
+    max_instance_memory_mb: Option<u32>,
 
-    #[arg(long, env = "BEENET_MAX_CONCURRENCY")]
+    #[arg(long)]
     max_concurrency: Option<usize>,
+
+    /// HTTP registry base URL; overrides `[worker].registry_url` in config.
+    #[arg(long)]
+    registry_url: Option<String>,
+
+    /// Heartbeat `POST` path; overrides `[worker].registry_heartbeat_path`.
+    #[arg(long)]
+    registry_heartbeat_path: Option<String>,
+
+    /// Join token; overrides `[worker].join_token` (must match `[registry].join_token`).
+    #[arg(long)]
+    join_token: Option<String>,
+
+    #[arg(long)]
+    registry_heartbeat_secs: Option<u64>,
+
+    /// Optional `GET {base}/{cid}` base for wasm cache misses.
+    #[arg(long)]
+    wasm_fetch_base: Option<String>,
+
+    #[arg(long)]
+    wasm_fetch_bearer: Option<String>,
+
+    #[arg(long)]
+    wasm_fetch_timeout_secs: Option<u64>,
 }
 
 #[derive(NetworkBehaviour)]
@@ -68,6 +102,9 @@ pub struct TaskEntry {
 struct Runtime {
     factors_executor: Arc<FactorsExecutor<BeenetFactors, ()>>,
     wasm_cache_dir: PathBuf,
+    wasm_fetch_base: Option<String>,
+    wasm_fetch_bearer: Option<String>,
+    wasm_fetch_timeout: Duration,
     default_deadline_ms: u32,
     default_memory_mb: u32,
     max_instance_memory_mb: u32,
@@ -97,18 +134,28 @@ impl ComponentLoader<BeenetFactors, ()> for BeenetComponentLoader {
 }
 
 impl Runtime {
-    fn new(factors_executor: Arc<FactorsExecutor<BeenetFactors, ()>>, args: &Args) -> Self {
-        let max_concurrency = args.max_concurrency.unwrap_or_else(|| {
+    fn new(factors_executor: Arc<FactorsExecutor<BeenetFactors, ()>>, s: &WorkerSettings) -> Self {
+        let max_concurrency = s.max_concurrency.unwrap_or_else(|| {
             std::thread::available_parallelism()
                 .map(|n| n.get() * 4)
                 .unwrap_or(8)
         });
         Self {
             factors_executor,
-            wasm_cache_dir: args.wasm_cache_dir.clone(),
-            default_deadline_ms: args.default_deadline_ms,
-            default_memory_mb: args.default_memory_mb,
-            max_instance_memory_mb: args.max_instance_memory_mb,
+            wasm_cache_dir: s.wasm_cache_dir.clone(),
+            wasm_fetch_base: s
+                .wasm_fetch_base
+                .as_ref()
+                .map(|x| x.trim().to_string())
+                .filter(|x| !x.is_empty()),
+            wasm_fetch_bearer: s
+                .wasm_fetch_bearer
+                .clone()
+                .filter(|x| !x.trim().is_empty()),
+            wasm_fetch_timeout: Duration::from_secs(s.wasm_fetch_timeout_secs.max(1)),
+            default_deadline_ms: s.default_deadline_ms,
+            default_memory_mb: s.default_memory_mb,
+            max_instance_memory_mb: s.max_instance_memory_mb,
             cache: RwLock::new(HashMap::new()),
             gate: Arc::new(Semaphore::new(max_concurrency)),
         }
@@ -168,10 +215,26 @@ impl Runtime {
     }
 
     async fn execute_inner(&self, req: &InvokeRequest, started: Instant) -> Result<InvokeResponse> {
-        let entry = self
-            .load_task(&req.cid)
-            .await
-            .with_context(|| format!("load task {}", req.cid))?;
+        let entry = match self.load_task(&req.cid).await {
+            Ok(e) => e,
+            Err(e) => {
+                return Ok(InvokeResponse {
+                    request_id: req.request_id.clone(),
+                    status: Status::LoadError {
+                        stage: LoadStage::Fetch,
+                        reason: format!("{e:#}"),
+                    },
+                    body: Vec::new(),
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    usage: Usage {
+                        wall_ns: started.elapsed().as_nanos() as u64,
+                        billable: false,
+                        ..Usage::default()
+                    },
+                });
+            }
+        };
 
         let deadline_ms = entry
             .manifest
@@ -282,6 +345,8 @@ impl Runtime {
             return Ok(entry);
         }
 
+        self.ensure_wasm_cached(cid).await?;
+
         let wasm_path = self.wasm_path(cid);
         let wasm = fs::read(&wasm_path)
             .with_context(|| format!("read cached wasm `{}`", wasm_path.display()))?;
@@ -309,6 +374,106 @@ impl Runtime {
 
     fn wasm_path(&self, cid: &BeenetCid) -> PathBuf {
         self.wasm_cache_dir.join(format!("{cid}.wasm"))
+    }
+
+    async fn ensure_wasm_cached(&self, cid: &BeenetCid) -> Result<()> {
+        let path = self.wasm_path(cid);
+        if path.exists() {
+            return Ok(());
+        }
+        let Some(base) = self.wasm_fetch_base.as_deref() else {
+            anyhow::bail!(
+                "wasm cache miss for {cid}: file `{}` missing and [worker].wasm_fetch_base is not set",
+                path.display()
+            );
+        };
+        let url = wasm_fetch_url(base, cid);
+        info!(%url, %cid, "fetching wasm into cache");
+        let client = reqwest::Client::builder()
+            .timeout(self.wasm_fetch_timeout)
+            .build()
+            .context("build HTTP client for wasm fetch")?;
+        let mut req = client.get(url.clone());
+        if let Some(ref token) = self.wasm_fetch_bearer {
+            req = req.bearer_auth(token);
+        }
+        let resp = req.send().await.with_context(|| format!("GET {url}"))?;
+        if !resp.status().is_success() {
+            anyhow::bail!(
+                "wasm fetch from {} returned HTTP {}",
+                url,
+                resp.status()
+            );
+        }
+        let bytes = resp.bytes().await.context("wasm fetch read body")?;
+        if bytes.is_empty() {
+            anyhow::bail!("wasm fetch returned empty body from {url}");
+        }
+        let got = BeenetCid::from_bytes(&bytes);
+        if &got != cid {
+            anyhow::bail!("wasm content CID mismatch: expected {cid}, got {got} (check object key and corruption)");
+        }
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("create `{}`", parent.display()))?;
+        }
+        fs::write(&path, &bytes).with_context(|| format!("write `{}`", path.display()))?;
+        info!(path = %path.display(), %cid, "wasm stored in cache after fetch");
+        Ok(())
+    }
+}
+
+/// `GET {trimmed_base}/{cid_string}` — same path segment `beenet-pack upload` uses for object key tail.
+fn wasm_fetch_url(base: &str, cid: &BeenetCid) -> String {
+    format!("{}/{}", base.trim_end_matches('/'), cid)
+}
+
+fn join_registry_heartbeat_url(base: &str, path: &str) -> String {
+    let base = base.trim_end_matches('/');
+    if path.starts_with('/') {
+        format!("{base}{path}")
+    } else {
+        format!("{base}/{path}")
+    }
+}
+
+#[derive(Serialize)]
+struct RegistryHeartbeatBody<'a> {
+    join_token: &'a str,
+    peer_id: &'a str,
+    dial_multiaddr: &'a str,
+}
+
+async fn registry_heartbeat_loop(
+    http: reqwest::Client,
+    heartbeat_url: String,
+    join_token: String,
+    peer_id: String,
+    dial_multiaddr: String,
+    period: Duration,
+) {
+    let mut interval = tokio::time::interval(period);
+    loop {
+        interval.tick().await;
+        let body = RegistryHeartbeatBody {
+            join_token: &join_token,
+            peer_id: &peer_id,
+            dial_multiaddr: &dial_multiaddr,
+        };
+        match http.post(&heartbeat_url).json(&body).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                info!(status = %resp.status(), "registry heartbeat ok");
+            }
+            Ok(resp) => {
+                warn!(
+                    status = %resp.status(),
+                    "registry heartbeat rejected or failed"
+                );
+            }
+            Err(e) => {
+                warn!(error = %e, "registry heartbeat request error");
+            }
+        }
     }
 }
 
@@ -348,34 +513,86 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    let args = Args::parse();
-    fs::create_dir_all(&args.wasm_cache_dir)
-        .with_context(|| format!("create `{}`", args.wasm_cache_dir.display()))?;
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    let cli = Args::parse();
+    let path = resolve_config_path_with_cli(cli.config.clone(), &argv);
+    if !path.exists() {
+        anyhow::bail!(
+            "missing config file `{}` (add a [worker] table or pass --config)",
+            path.display()
+        );
+    }
+    let file_cfg = beenet_common::config::load_file(&path)?;
+    let overrides = WorkerCliOverrides {
+        listen_addr: cli.listen_addr.clone(),
+        wasm_cache_dir: cli.wasm_cache_dir.clone(),
+        default_deadline_ms: cli.default_deadline_ms,
+        default_memory_mb: cli.default_memory_mb,
+        max_instance_memory_mb: cli.max_instance_memory_mb,
+        max_concurrency: cli.max_concurrency,
+        registry_url: cli.registry_url.clone(),
+        registry_heartbeat_path: cli.registry_heartbeat_path.clone(),
+        join_token: cli.join_token.clone(),
+        registry_heartbeat_secs: cli.registry_heartbeat_secs,
+        wasm_fetch_base: cli.wasm_fetch_base.clone(),
+        wasm_fetch_bearer: cli.wasm_fetch_bearer.clone(),
+        wasm_fetch_timeout_secs: cli.wasm_fetch_timeout_secs,
+    };
+    let settings = beenet_common::config::resolve_worker_settings(&file_cfg, &overrides)?;
+    let listen_addr: Multiaddr = settings
+        .listen_addr
+        .parse()
+        .with_context(|| format!("invalid listen multiaddr `{}`", settings.listen_addr))?;
+
+    fs::create_dir_all(&settings.wasm_cache_dir)
+        .with_context(|| format!("create `{}`", settings.wasm_cache_dir.display()))?;
 
     let factors = BeenetFactors::new();
     let engine_builder = spin_core::Engine::builder(&spin_core::Config::default())?;
     let factors_executor = Arc::new(FactorsExecutor::new(engine_builder, factors)?);
-    let runtime = Arc::new(Runtime::new(factors_executor, &args));
+    let runtime = Arc::new(Runtime::new(factors_executor, &settings));
 
     let local_key = identity::Keypair::generate_ed25519();
     let local_peer_id = PeerId::from(local_key.public());
     let mut swarm = build_swarm(local_key)?;
-    swarm.listen_on(args.listen_addr.clone())?;
+    swarm.listen_on(listen_addr.clone())?;
+
+    let dial_multiaddr = listen_addr
+        .clone()
+        .with(Protocol::P2p(local_peer_id.into()));
+    let dial_str = dial_multiaddr.to_string();
 
     info!(
         peer_id = %local_peer_id,
-        listen_addr = %args.listen_addr,
-        wasm_cache_dir = %args.wasm_cache_dir.display(),
+        listen_addr = %listen_addr,
+        dial_multiaddr = %dial_str,
+        wasm_cache_dir = %settings.wasm_cache_dir.display(),
         max_concurrency = runtime.gate.available_permits(),
         max_instance_memory_mb = runtime.max_instance_memory_mb,
         "worker started"
     );
 
+    let heartbeat_url =
+        join_registry_heartbeat_url(&settings.registry_url, &settings.registry_heartbeat_path);
+    let http = reqwest::Client::new();
+    let peer_s = local_peer_id.to_string();
+    let dial_owned = dial_str.clone();
+    let period = Duration::from_secs(settings.registry_heartbeat_secs);
+    let join_token = settings.join_token.clone();
+    tokio::spawn(registry_heartbeat_loop(
+        http,
+        heartbeat_url,
+        join_token,
+        peer_s,
+        dial_owned,
+        period,
+    ));
+
     while let Some(event) = swarm.next().await {
         match event {
             SwarmEvent::NewListenAddr { address, .. } => {
                 let with_peer = address.with(Protocol::P2p(local_peer_id.into()));
-                info!("worker reachable at {with_peer}");
+                info!("worker listening at {with_peer} (dial multiaddr for heartbeat: {dial_str})");
             }
             SwarmEvent::Behaviour(WorkerBehaviourEvent::RequestResponse(
                 request_response::Event::Message { peer, message, .. },
@@ -423,4 +640,23 @@ async fn main() -> Result<()> {
 
     error!("swarm ended unexpectedly");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::wasm_fetch_url;
+    use beenet_common::BeenetCid;
+    use std::str::FromStr;
+
+    #[test]
+    fn wasm_fetch_url_joins_base_and_cid() {
+        let cid = BeenetCid::from_str(
+            "bafkreigdvzf6jabcvbsyiqf27ew4zrqwxehehv7xg2tnfds4aq325jv4xu",
+        )
+        .unwrap();
+        assert_eq!(
+            wasm_fetch_url("https://example.com/wasm/", &cid),
+            format!("https://example.com/wasm/{cid}")
+        );
+    }
 }

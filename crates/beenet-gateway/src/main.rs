@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
@@ -10,29 +11,41 @@ use base64::{engine::general_purpose::STANDARD, Engine as _};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::Router;
+use beenet_common::config::{
+    load_file, resolve_config_path_with_cli, resolve_gateway_settings, GatewayCliOverrides,
+};
 use beenet_common::{BeenetCid, INVOKE_PROTOCOL};
-use beenet_proto::{InvokeRequest, InvokeResponse, Status, TimeoutStage, Usage};
+use beenet_proto::{InvokeRequest, InvokeResponse, LoadStage, Status, TimeoutStage, Usage};
 use clap::Parser;
 use libp2p::futures::StreamExt;
 use libp2p::core::multiaddr::Protocol;
 use libp2p::request_response::{self, ProtocolSupport};
 use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
 use libp2p::{identify, identity, ping, Multiaddr, PeerId, StreamProtocol, SwarmBuilder};
-use tokio::sync::{mpsc, oneshot};
+use serde::Deserialize;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use tokio::sync::{mpsc, oneshot, RwLock};
 use tracing::{info, warn};
 use uuid::Uuid;
 
 #[derive(Parser, Debug, Clone)]
 #[command(name = "beenet-gateway", about = "Beenet M1 gateway")]
 struct Args {
-    #[arg(long, env = "BEENET_GATEWAY_ADDR", default_value = "127.0.0.1:8080")]
-    http_addr: std::net::SocketAddr,
+    #[arg(long, value_name = "PATH")]
+    config: Option<PathBuf>,
 
-    #[arg(long, env = "BEENET_WORKER_ADDR")]
-    worker_addr: Multiaddr,
+    #[arg(long)]
+    http_addr: Option<String>,
 
-    #[arg(long, env = "BEENET_DEFAULT_DEADLINE_MS", default_value_t = 10_000)]
-    default_deadline_ms: u32,
+    #[arg(long)]
+    registry_url: Option<String>,
+
+    #[arg(long)]
+    registry_poll_ms: Option<u64>,
+
+    #[arg(long)]
+    default_deadline_ms: Option<u32>,
 }
 
 #[derive(NetworkBehaviour)]
@@ -105,16 +118,40 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    let args = Args::parse();
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    let cli = Args::parse();
+    let path = resolve_config_path_with_cli(cli.config.clone(), &argv);
+    if !path.exists() {
+        anyhow::bail!(
+            "missing config file `{}` (add [gateway] or pass --config)",
+            path.display()
+        );
+    }
+    let file_cfg = load_file(&path)?;
+    let overrides = GatewayCliOverrides {
+        http_addr: cli.http_addr.clone(),
+        registry_url: cli.registry_url.clone(),
+        registry_poll_ms: cli.registry_poll_ms,
+        default_deadline_ms: cli.default_deadline_ms,
+    };
+    let settings = resolve_gateway_settings(&file_cfg, &overrides)?;
+
+    let worker_addrs: Arc<RwLock<Vec<Multiaddr>>> = Arc::new(RwLock::new(Vec::new()));
+    tokio::spawn(registry_poll_loop(
+        settings.registry_url.clone(),
+        settings.registry_poll_ms,
+        worker_addrs.clone(),
+    ));
+
     let local_key = identity::Keypair::generate_ed25519();
     let swarm = build_swarm(local_key)?;
     let (tx, rx) = mpsc::channel(32);
 
-    tokio::spawn(run_swarm_loop(args.worker_addr.clone(), rx, swarm));
+    tokio::spawn(run_swarm_loop(worker_addrs.clone(), rx, swarm));
 
     let state = AppState {
         client: GatewayClient { tx },
-        default_deadline_ms: args.default_deadline_ms,
+        default_deadline_ms: settings.default_deadline_ms,
     };
 
     let app = Router::new()
@@ -122,8 +159,13 @@ async fn main() -> Result<()> {
         .route("/run/ipfs/:cid", post(run_ipfs))
         .with_state(state);
 
-    info!(http_addr = %args.http_addr, worker_addr = %args.worker_addr, "gateway started");
-    let listener = tokio::net::TcpListener::bind(args.http_addr).await?;
+    info!(
+        http_addr = %settings.http_addr,
+        registry_url = %settings.registry_url,
+        poll_ms = settings.registry_poll_ms,
+        "gateway started"
+    );
+    let listener = tokio::net::TcpListener::bind(settings.http_addr).await?;
     axum::serve(listener, app).await?;
     Ok(())
 }
@@ -214,25 +256,95 @@ fn status_label(status: &Status) -> &'static str {
     }
 }
 
+#[derive(Debug, Deserialize)]
+struct WorkersListBody {
+    workers: Vec<WorkerListEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkerListEntry {
+    dial_multiaddr: String,
+}
+
+async fn registry_poll_loop(
+    registry_base: String,
+    period_ms: u64,
+    out: Arc<RwLock<Vec<Multiaddr>>>,
+) {
+    let client = reqwest::Client::new();
+    let url = format!("{}/v1/workers", registry_base.trim_end_matches('/'));
+    let mut tick = tokio::time::interval(std::time::Duration::from_millis(period_ms.max(500)));
+    loop {
+        tick.tick().await;
+        match client.get(&url).send().await {
+            Ok(resp) if resp.status().is_success() => match resp.json::<WorkersListBody>().await {
+                Ok(body) => {
+                    let parsed: Vec<Multiaddr> = body
+                        .workers
+                        .into_iter()
+                        .filter_map(|w| w.dial_multiaddr.parse().ok())
+                        .collect();
+                    let mut guard = out.write().await;
+                    if guard.len() != parsed.len()
+                        || guard.iter().zip(parsed.iter()).any(|(a, b)| a != b)
+                    {
+                        info!(count = parsed.len(), "registry worker list updated");
+                    }
+                    *guard = parsed;
+                }
+                Err(e) => warn!(error = %e, "registry JSON decode failed"),
+            },
+            Ok(resp) => warn!(status = %resp.status(), "registry GET /v1/workers failed"),
+            Err(e) => warn!(error = %e, "registry poll request error"),
+        }
+    }
+}
+
 async fn run_swarm_loop(
-    worker_addr: Multiaddr,
+    worker_addrs: Arc<RwLock<Vec<Multiaddr>>>,
     mut cmd_rx: mpsc::Receiver<Command>,
     mut swarm: libp2p::Swarm<GatewayBehaviour>,
 ) {
-    let worker_peer = match peer_id_from_multiaddr(&worker_addr) {
-        Ok(p) => p,
-        Err(err) => {
-            warn!("invalid worker multiaddr `{worker_addr}`: {err}");
-            return;
-        }
-    };
-
+    let rr = AtomicUsize::new(0);
     let mut pending: HashMap<request_response::OutboundRequestId, oneshot::Sender<InvokeResponse>> =
         HashMap::new();
 
     loop {
         tokio::select! {
             Some(cmd) = cmd_rx.recv() => {
+                let addrs = worker_addrs.read().await.clone();
+                if addrs.is_empty() {
+                    let _ = cmd.respond_to.send(InvokeResponse {
+                        request_id: cmd.req.request_id,
+                        status: Status::LoadError {
+                            stage: LoadStage::Fetch,
+                            reason: "no workers with an active registry lease (empty list or registry unreachable)".into(),
+                        },
+                        body: Vec::new(),
+                        stdout: String::new(),
+                        stderr: String::new(),
+                        usage: Usage::default(),
+                    });
+                    continue;
+                }
+                let idx = rr.fetch_add(1, Ordering::Relaxed) % addrs.len();
+                let worker_addr = addrs[idx].clone();
+                let worker_peer = match peer_id_from_multiaddr(&worker_addr) {
+                    Ok(p) => p,
+                    Err(err) => {
+                        let _ = cmd.respond_to.send(InvokeResponse {
+                            request_id: cmd.req.request_id,
+                            status: Status::RuntimeError {
+                                reason: format!("invalid worker multiaddr in registry: {err}"),
+                            },
+                            body: Vec::new(),
+                            stdout: String::new(),
+                            stderr: String::new(),
+                            usage: Usage::default(),
+                        });
+                        continue;
+                    }
+                };
                 if let Err(err) = swarm.dial(worker_addr.clone()) {
                     warn!("dial failed: {err}");
                 }

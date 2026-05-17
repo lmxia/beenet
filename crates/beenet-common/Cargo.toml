@@ -10,8 +10,10 @@ description = "Shared types (CID, config, errors) for Beenet."
 
 [dependencies]
 anyhow = { workspace = true }
+dirs = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
+toml = { workspace = true }
 cid = { workspace = true }
 multihash = { workspace = true }
 sha2 = { workspace = true }

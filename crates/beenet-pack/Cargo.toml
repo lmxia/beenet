@@ -6,10 +6,13 @@ rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Pack and inspect Beenet tasks."
+description = "Pack, inspect, and upload Beenet tasks (S3-compatible storage)."
 
 [dependencies]
 anyhow = { workspace = true }
 clap = { workspace = true }
+tokio = { workspace = true }
+aws-sdk-s3 = { workspace = true }
+aws-credential-types = { workspace = true }
 beenet-common = { workspace = true }
 beenet-manifest = { workspace = true }

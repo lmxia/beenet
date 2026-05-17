@@ -2,6 +2,8 @@
 //!
 //! Keep this crate small: CID, errors, a handful of constants.
 
+pub mod config;
+
 use std::fmt;
 use std::str::FromStr;
 

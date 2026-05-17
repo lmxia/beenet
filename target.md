@@ -1,8 +1,8 @@
 # Beenet —— 基于 CID 的分布式 Agent 任务网络
 
-> 文档版本：**v2.13（M1 端到端闭环版 + Spin 对照纪要）**  
+> 文档版本：**v2.19（HTTP CID 拉取 + OSS S3 `upload`）**  
 > 状态：M1 最短闭环已跑通（档 0 = Wasip2）；进入 M1.5 规划  
-> 说明：v2.13 在 v2.12 基础上增加 §11.3（Spin 对照纪要）；v2.12 对应 M1 端到端可运行的工作树：worker 走 `wasmtime-wasi-http` 的 p2 `ProxyPre`，example 为 `spin-sdk 5.x` 的 `#[http_component]`。
+> 说明：v2.19：`[worker].wasm_fetch_base` 在缓存未命中时 `GET {base}/{cid}` 拉取并 **CID 校验** 后写入 `wasm_cache`；**`beenet-pack upload`** 以 **S3 兼容 API** 上传至阿里云 OSS 等；manifest 仍 **内嵌 wasm**（与 v2.18 一致）。v2.18：`/v1/workers/heartbeat`。
 
 ---
 
@@ -53,7 +53,7 @@ Beenet 是一个“寻址即计算”的去中心化任务网络：
 
 - **Gateway**：鉴权、限流、路由、转发、聚合审计。
 - **Worker**：拉取/缓存 CID、执行 Wasm、回传结果。
-- **Registry**（M2）：热路径元信息。
+- **Registry**（热路径元信息）：**HTTP 版已实现**（§4.3，`beenet-registry`）；CID→Workers 索引、持久化与多副本一致性仍属 **M2**。
 - **DHT**：冷路径发现。
 - **Agent**：可绕过 Gateway 直接 P2P 调用 Worker。
 
@@ -61,11 +61,16 @@ Beenet 是一个“寻址即计算”的去中心化任务网络：
 
 ## 3. 对 Spin 的三层扩展
 
-### 3.1 加载层：`IpfsComponentLoader`
+### 3.1 加载层：`IpfsComponentLoader` / HTTP Blob 拉取（已部分落地）
 
-- 输入：CID。
+- 输入：**CID**（`BeenetCid` = **整包 packaged wasm** 字节的 CIDv1 / raw / sha2-256，见 `beenet-common`）。
 - 输出：Wasm bytes -> `Component` / `InstancePre`。
-- M1 可先本地文件伪 CID，M3 接 IPFS。
+- **当前工作区**：
+  - **首选**：本地 **`[worker].wasm_cache_dir`（默认 `./wasm_cache`）下的 `<cid>.wasm`**（命中则不再出网）。
+  - **缓存未命中**：若配置了 **`[worker].wasm_fetch_base`**，Worker 请求 **`GET {trimmed_base}/{cid}`**，校验 **响应体 hashed 必须等于请求 CID** 后写入 `wasm_cache` 再加载。
+  - **Manifest**：仍从 **wasm custom section** 解析（`beenet-pack build` 内嵌）；远程拉取的是 **与本地 pack 相同 artifact**。
+- **发布**：**`beenet-pack upload`** 使用 **`aws-sdk-s3`**（SigV4）推到 **S3 兼容** 端点；**阿里云 OSS** 凭据与端点写在 **`config.toml` 的 `[oss]`**（`endpoint`、`region`、**默认 `force_path_style=false`** 等）；对象 key 为 **`{key_prefix}{cid}`**（与 Worker GET 路径一致）。AK/SK 使用 **RAM 子账号**（生产忌主账号）。
+- **M3**：在同一条「按 CID 取字节」抽象上可接 **IPFS Gateway** 或原生 IPFS，而不改调用方 CID 语义。
 
 ### 3.2 网络层：`P2pTrigger` + 执行器
 
@@ -94,7 +99,7 @@ Beenet 是一个“寻址即计算”的去中心化任务网络：
 ### 3.5 任务打包：单文件分发
 
 - **D12**：manifest 内嵌 `beenet:manifest/v1` custom section。
-- `beenet-pack` 提供 build/inspect。
+- `beenet-pack` 提供 `build` / `inspect` / **`upload`**（S3 兼容存储）。
 - **D13**：主来源是 custom section；本地 `policies.toml` 仅兜底；调用方不能随请求注入策略。
 
 ### 3.6 计费与计量（v2.9）
@@ -147,6 +152,59 @@ bill = base_fee + compute_fee + resource_fee
   - `Timeout { gateway | exec }`
   - `Rejected`
 
+### 4.1 Worker 寻址与发现
+
+**当前工作区**：Gateway **仅** 通过 **`[gateway].registry_url`** 轮询 **`GET /v1/workers`** 获得可拨号的 Worker **dial_multiaddr**；Worker **必须** 对 Registry 的 **`POST /v1/workers/heartbeat`** 做 **周期性心跳**，以 **续租**（更新 `last_seen`，避免被当作离线剔除）。
+
+**术语**：**注册（入网）** 与 **心跳（续租）** 使用 **同一请求**；首次成功 POST 即完成入网，其后同 payload 的定时 POST 均为 **心跳**。
+
+**历史**：最早 M1 曾允许 Gateway 通过环境变量手工粘贴单一 Worker multiaddr，已 **废弃**，避免与「无状态、多 Worker」目标冲突。
+
+**原则**（仍适用）：
+
+- **CID 不解决「找谁」**：「谁在线、拨谁」由 **Registry（及后续 DHT 兜底）** 与负载策略回答。
+- **与 M2 对齐**：按 **CID** 过滤副本、一致性哈希 LB、Registry 持久化与高可用等待办见 §5、§4.3「尚未覆盖」。
+
+**分阶段（演进）**：
+
+| 阶段 | 目标 | 机制概要 | Gateway 侧行为 |
+| --- | --- | --- | --- |
+| **当前** | 官方控制面 + 多 Worker | **HTTP Registry**（§4.3）：Worker **心跳**；Gateway **轮询** Worker 列表 | 按轮询结果选择 Worker（当前实现为简单轮询） |
+| **后续** | 纯 P2P 辅助发现 | **Bootstrap / mDNS / gossip**（与 libp2p 组网） | 可与 Registry 并存，作兜底或内网发现 |
+| **M2** | 生产级选路 | **CID→Workers** 索引、**DHT** 冷路径、§5 **一致性哈希 + least-inflight** | 按 CID 查询 Registry → 候选集 → libp2p 重试策略 |
+
+**开放点**：mDNS / DHT 默认策略；Registry 多副本一致性；心跳间隔与 **租约 TTL**（当前 Registry 侧约 **60s** 无心跳则剔除）的生产取值。
+
+### 4.2 运营模型：官方协调域 + 边缘 join
+
+目标形态：**运营方持有一个对外稳定名字（推荐有效 HTTPS 域名）**，同时 **Worker 与 Gateway 从任意网络位置陆续 join**；**调用方只需 CID + 该官方入口**（或兼容的第三方 Gateway），即可触发已注册、在线的某台 Worker 上的 Wasm 执行，**Worker 拓扑对用户透明**。
+
+**官方协调域通常承载（可合设或分子域/服务）**：
+
+- **对外 HTTP 入口**：域名背后是 **无状态、可横向扩展的 Gateway 集群**（LB 调度），用户以 `POST /run/ipfs/:cid` 等形态调用。
+- **控制面 / 目录（Registry，M2）**：Worker **登记/心跳**、**CID ↔ 可服务副本**、健康与版本 hint；Gateway **按 CID 拉候选 Worker**，配合 §5 选路。
+- **入网辅助**：**Bootstrap / Rendezvous** 等地址也可挂在同一运营体系下，供边缘节点 **首次加入** libp2p 连通面（与 §4.1 一致）；**任意地理位置** 往往还需 **NAT / Relay** 才能保证稳定可达。
+
+**与用户叙事对齐的边界**：
+
+- **CID 只标识「算什么的包」**，不保证「此刻一定有在线算力」；须至少有一条 **已 join 且持有该 CID 组件** 的 Worker，调用才得以成功。
+- **「谁都能 join」** 与 **「谁都能接线上生产流量」** 宜分层：入网发现是一层，**准入 / 凭据 / 配额**（邀请码、证书、mTLS、API key 等）由运营模型另定，避免开放中继。
+- **官方域名不是单机**：须 **高可用**（多副本 Registry、多 bootstrap、多 Gateway），避免单点故障。
+
+**与去中心化路标**：上述为 **强运营、强协调面** 的第一阶段产品形态；**DHT**（§2）可作为后续 **弱中心 / 多运营方** 或冷启动兜底的补充，与 Registry 主路径并存而非互斥。
+
+### 4.3 控制面：HTTP Registry（工作区已落地）
+
+对应 **§4.2 官方域名 + path + join token** 的最低实现：**运营方跑 `beenet-registry`**（可挂在 `https://官方域名/…` 反向代理后）；Worker 在 **`config.toml` 的 `[worker]`** 中配置 **`registry_url`** 与 **`registry_heartbeat_path`**（默认 **`/v1/workers/heartbeat`**）；**`join_token`** 须与 **`[registry].join_token`** 一致。
+
+| 组件 | 配置（`config.toml`） / 行为 |
+| --- | --- |
+| **Registry** | **`[registry]`**：`http_addr`（默认 `127.0.0.1:3030`）；`join_token`（必填）。`POST /v1/workers/heartbeat`：**心跳**载荷 `{ "join_token", "peer_id", "dial_multiaddr" }`（upsert + 续租 `last_seen`；校验 dial 含 `/p2p/<peer_id>`）。`GET /v1/workers` 返回租约仍有效的 Worker（内存表；约 **60s** 无心跳则剔除）。`GET /health`。 |
+| **Worker** | **`[worker]`**：`registry_url`、`join_token` 必填；`registry_heartbeat_secs`（默认 **20**）；`registry_heartbeat_path`（默认 **`/v1/workers/heartbeat`**）。`listen_addr` 控制监听 multiaddr，心跳体携带 `listen + /p2p/<local_peer_id>`。 |
+| **Gateway** | **`[gateway]`**：`registry_url` 必填；`registry_poll_ms`（默认 **2000**）轮询 `GET …/v1/workers`，维护 dial 列表并以 **轮询** 选 Worker 发起 libp2p invoke。 |
+
+**尚未覆盖（仍归 M2/M3）**：按 CID 过滤副本、一致性哈希 LB、Registry 持久化与高可用、临时 token 颁发/吊销服务、DHT 兜底。
+
 ---
 
 ## 5. 负载均衡策略（M2）
@@ -188,20 +246,20 @@ bill = base_fee + compute_fee + resource_fee
 
 ## 7. 仓库骨架
 
-已落地（M1）：
+已落地（M1 / M1.5）：
 
 - `crates/beenet-common`：`BeenetCid`（CIDv1/raw/sha2-256）+ 协议常量。
 - `crates/beenet-proto`：`InvokeRequest` / `InvokeResponse` / `Status` / `Usage`，libp2p CBOR 上线。
 - `crates/beenet-manifest`：`beenet:manifest/v1` TOML schema + wasm custom section embed/extract。
-- `crates/beenet-pack`：`build` / `inspect` CLI。
-- `crates/beenet-worker`：`P2pTrigger` 雏形 = libp2p request-response + wasmtime 直连执行（档 0，`wasi:http/incoming-handler@0.2`）。
-- `crates/beenet-gateway`：axum HTTP `POST /run/ipfs/:cid` → libp2p 转发。
+- `crates/beenet-pack`：`build` / `inspect` / **`upload`**（S3 兼容，含阿里云 OSS）。
+- `crates/beenet-factors`：扁平 `BeenetFactors`（Wasi/Variables/OutboundNetworking/OutboundHttp/Audit）。
+- `crates/beenet-worker`：libp2p invoke + FactorsExecutor；Registry **心跳**；可选 **HTTP 拉取 wasm**（`[worker].wasm_fetch_base`）写本地缓存。
+- `crates/beenet-gateway`：HTTP `POST /run/ipfs/:cid` → libp2p；**轮询 Registry** 动态 Worker 列表（§4.3）。
+- `crates/beenet-registry`：HTTP 控制面 `POST /v1/workers/heartbeat`、`GET /v1/workers`、内存表 + 心跳剔除。
 - `examples/hello-filter-http`：`spin-sdk` 的 `#[http_component]` 示例任务。
 
 规划中：
 
-- `crates/beenet-registry`（M2）
-- `crates/beenet-factors`（M1.5）：扁平 `BeenetFactors`，承载 Wasi/Variables/OutboundNetworking/OutboundHttp/Audit。
 - `sdks/rust/beenet-sdk`（M3）
 - `wit/beenet/task.wit`（M2.5 草案，M3 冻结）
 
@@ -228,7 +286,7 @@ bill = base_fee + compute_fee + resource_fee
 
 ## 10. 里程碑
 
-- **M1（已闭环）**：最短闭环已端到端跑通（`POST /run/ipfs/<cid>` → gateway → libp2p → worker → wasi:http proxy → spin-sdk guest → body 回传）。单 worker、本地伪 CID（`./wasm_cache/<cid>.wasm`）、档 0（`wasi:http/incoming-handler@0.2`，走 `wasmtime-wasi-http` 的 p2 `ProxyPre`）、裸 HTTP gateway、无 Registry/LB。Gateway 通过 `BEENET_WORKER_ADDR=/ip4/.../tcp/.../p2p/<peerid>` 硬编码定位单 worker。
+- **M1（已闭环）**：最短闭环已端到端跑通（`POST /run/ipfs/<cid>` → gateway → libp2p → worker → wasi:http proxy → spin-sdk guest → body 回传）。本地伪 CID（`./wasm_cache/<cid>.wasm`）、档 0（`wasi:http/incoming-handler@0.2`，`wasmtime-wasi-http` p2 `ProxyPre`）、裸 HTTP gateway。**运维**：**`beenet-registry`** + **`config.toml` 的 `[gateway]` / `[worker]`**；Worker 向 Registry **心跳**；Gateway **轮询** Worker 列表（§4.3）。
   - **M1 已完成**：`beenet-common` / `beenet-proto` / `beenet-manifest` / `beenet-pack`，libp2p request-response 通信骨架，gateway→worker 转发，`Status` A/B 表，`beenet-worker` 的 `TaskExecutor` trait 抽象 + `Wasip2HttpExecutor` 实现（档 0），worker 并发闸门（tokio `Semaphore`，默认 `available_parallelism * 4`，超闸门返回 `Status::Rejected`）。
   - **M1 已交付但仍有限制**：`InvokeResponse` 不回传 stdout/stderr（仅 worker 本地 tracing）、manifest `max_memory_mb` 只读不 apply、`deadline_ms` 走 `tokio::time::timeout`（非 wasmtime epoch）、出网钳制靠 `WasiCtx` 默认 capability-not-granted 兜底（见 D16）——这些都由 M1.5 正式化。
 - **M1.5（下一步）**：
@@ -238,7 +296,8 @@ bill = base_fee + compute_fee + resource_fee
   - 接 `MaxInstanceMemoryHook` + `StoreLimits`，让 D14 L1/L2 真正 apply。
   - `InvokeResponse` wire 扩展 `stdout` / `stderr`（或可选 `log_blob_ref` 走外挂存储）。
   - pin 落实 D10 的 spin commit（首次真正引入 `spin-*` 依赖）。
-- **M2**：多 worker + Registry + LB（一致性哈希 + least-inflight）。
+  - **（可选并行）Gateway→Worker 发现前置**：见 §4.1——bootstrap / mDNS 等与 HTTP Registry **并存**时的角色划分；按 CID 的正式选路仍归 M2。
+- **M2**：在 **§4.3 HTTP Registry（Peer 列表 + join token + 心跳租约）** 之上，补齐 **按 CID 索引副本**、**DHT/发现兜底**、**LB（一致性哈希 + least-inflight）**。
 - **M2.5**：`beenet:task/runner@0.1` WIT 草案（档 1 预览）。
 - **M3**：IPFS Loader + 原生 `beenet-sdk`（档 1 正式）。
 - **M4**：生产化（鉴权、计费、可观测、流式、fuel 计量）。
@@ -313,6 +372,12 @@ bill = base_fee + compute_fee + resource_fee
 
 ## Changelog
 
+- v2.19：`[worker].wasm_fetch_base`（`GET {base}/{cid}` + CID 校验）；**`beenet-pack upload`**（`aws-sdk-s3`，阿里云 OSS 等）；§3.1 / §7 同步。
+- v2.18：Registry Worker API 路径 **`POST /v1/workers/heartbeat`**（替代 `/v1/workers/register`）；`[worker].registry_heartbeat_path`（曾用 `BEENET_REGISTRY_HEARTBEAT_PATH`；替代 `BEENET_REGISTRY_REGISTER_PATH`）。
+- v2.17：文档统一「**心跳 / 续租**」措辞；代码侧 **移除 `BEENET_WORKER_ADDR`**，Gateway/Worker **必须** 配置 Registry URL；§4.1 重写为与 §4.3 一致。
+- v2.16：落地 `beenet-registry`（§4.3）、Worker 对 Registry 周期 POST、Gateway 轮询 Worker 列表并轮询选路；§2 / §7 / §10 同步。
+- v2.15：新增 §4.2「运营模型：官方协调域 + 边缘 join」——官方域名作 HTTP 入口 + Registry/bootstrap 协调；多 Worker/Gateway 边缘加入；CID+入口的用户叙事与边界（算力存在性、准入与高可用）。
+- v2.14：新增 §4.1「Worker 寻址与发现」——明确替代手工 `BEENET_WORKER_ADDR` 的目标、原则与分阶段（bootstrap/mDNS → M2 Registry+DHT+LB）；§10 M1.5/M2 增加对应条目。
 - v2.13：新增 §11.3——与 Spin `HandlerType` / `trigger-http` 执行路径对照纪要（Beenet 固定 P2 incoming-handler、双 `instantiate` 语义、`_instance` 保活、`get_instance_pre` 非重复加载）。
 - v2.12：M1 档 0 Wasip2 端到端跑通（`curl POST /run/ipfs/<cid>` 返回 200 + 正确 body）。worker 切 `wasmtime-wasi-http::p2::ProxyPre`，引入 `TaskExecutor` trait + `Wasip2HttpExecutor` 实现，加并发闸门（`available_parallelism * 4`）。删 `crates/beenet-worker/wit/` 三份自写 WIT。D16 表述精确化为 `WasiCtxBuilder` capability-not-granted。
 - v2.11：`wasm-tools component wit` 验证 spin-sdk 5.x 的 `#[http_component]` 编译产物原生导出 `wasi:http/incoming-handler@0.2.0`。统一 M1 档 0 = Wasip2，废弃档 0-a/0-b 双档拆分。D9 改写。§10 M1 下列出待修项（worker bindgen 对错了 WIT）。

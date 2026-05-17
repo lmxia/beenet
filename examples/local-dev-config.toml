@@ -1,0 +1,21 @@
+# 本地联调用（无 OSS）：与 `readme.md` 端到端示例一致。
+# 使用方式（仓库根目录）：
+#   beenet-registry  --config examples/local-dev-config.toml
+#   beenet-worker    --config examples/local-dev-config.toml
+#   beenet-gateway   --config examples/local-dev-config.toml
+#
+# 若需从 OSS 拉 wasm，在 [worker] 增加 wasm_fetch_base；upload 需在主 config.toml 写 [oss] 或使用 `beenet-pack upload` 的 --oss-* 覆盖。
+
+[registry]
+http_addr = "127.0.0.1:3030"
+join_token = "my-dev-token"
+
+[gateway]
+http_addr = "127.0.0.1:8080"
+registry_url = "http://127.0.0.1:3030"
+
+[worker]
+listen_addr = "/ip4/127.0.0.1/tcp/4001"
+registry_url = "http://127.0.0.1:3030"
+join_token = "my-dev-token"
+wasm_cache_dir = "wasm_cache"
