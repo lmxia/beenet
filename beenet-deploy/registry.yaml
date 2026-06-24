@@ -1,0 +1,142 @@
+# beenet-registry + Redis
+#
+# Apply:
+#   kubectl apply -f registry.yaml
+#
+# Get admin token:
+#   kubectl logs -n beenet -l app=beenet-registry
+#
+# Replace image tags with your actual built images before applying.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: beenet
+---
+# ── Redis ───────────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: beenet-redis-pvc
+  namespace: beenet
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: beenet-redis
+  namespace: beenet
+  labels:
+    app: beenet-redis
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: beenet-redis
+  template:
+    metadata:
+      labels:
+        app: beenet-redis
+    spec:
+      containers:
+        - name: redis
+          image: redis:7-alpine
+          ports:
+            - containerPort: 6379
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          resources:
+            requests:
+              cpu: 50m
+              memory: 32Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: beenet-redis-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: beenet-redis
+  namespace: beenet
+  labels:
+    app: beenet-redis
+spec:
+  type: ClusterIP
+  selector:
+    app: beenet-redis
+  ports:
+    - port: 6379
+      targetPort: 6379
+---
+# ── Registry ────────────────────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: beenet-registry
+  namespace: beenet
+  labels:
+    app: beenet-registry
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: beenet-registry
+  template:
+    metadata:
+      labels:
+        app: beenet-registry
+    spec:
+      containers:
+        - name: registry
+          image: beenet/registry:latest   # replace with your image
+          args:
+            - "--http-addr"
+            - "0.0.0.0:3030"
+            - "--redis-url"
+            - "redis://beenet-redis:6379"
+          ports:
+            - containerPort: 3030
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 3030
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 3030
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 128Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: beenet-registry
+  namespace: beenet
+  labels:
+    app: beenet-registry
+spec:
+  type: ClusterIP
+  selector:
+    app: beenet-registry
+  ports:
+    - port: 3030
+      targetPort: 3030

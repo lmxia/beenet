@@ -1,0 +1,8 @@
+apiVersion: v2
+name: beenet-gateway
+description: >
+  Beenet HTTP gateway — receives invoke requests and dispatches to registered
+  workers discovered via the beenet-registry.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"

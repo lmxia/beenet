@@ -1,0 +1,86 @@
+# Local stack: Redis + MinIO + registry + gateway (worker runs on the host).
+#
+#   docker compose -f docker/docker-compose.dev.yml up -d --build
+#   docker compose -f docker/docker-compose.dev.yml logs -f beenet-registry
+#
+# Registry prints an admin token on startup. Create a join token:
+#   curl -s -X POST http://127.0.0.1:3030/v1/admin/tokens \
+#     -H "Authorization: Bearer <admin_token>" \
+#     -H "Content-Type: application/json" \
+#     -d '{"description":"dev","ttl_secs":86400}'
+#
+# MinIO console: http://127.0.0.1:9001  (minioadmin / minioadmin)
+# S3 API:         http://127.0.0.1:9000
+# Public wasm GET: http://127.0.0.1:9000/beenet/<cid>
+#
+# Then start worker on the host (see readme.md).
+
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+  minio:
+    image: quay.io/minio/minio:latest
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    volumes:
+      - minio-data:/data
+
+  minio-init:
+    image: quay.io/minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_started
+    entrypoint: >
+      /bin/sh -c "
+      until mc alias set local http://minio:9000 minioadmin minioadmin; do sleep 1; done;
+      mc mb local/beenet --ignore-existing;
+      mc anonymous set download local/beenet;
+      echo 'MinIO bucket beenet ready (anonymous download)';
+      "
+
+  beenet-registry:
+    image: beenet/beenet-registry:dev
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.registry
+      args:
+        HTTP_PROXY: ${HTTP_PROXY:-}
+        HTTPS_PROXY: ${HTTPS_PROXY:-}
+    depends_on:
+      - redis
+    ports:
+      - "3030:3030"
+    command:
+      - "--http-addr"
+      - "0.0.0.0:3030"
+      - "--redis-url"
+      - "redis://redis:6379"
+
+  beenet-gateway:
+    image: beenet/beenet-gateway:dev
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.gateway
+      args:
+        HTTP_PROXY: ${HTTP_PROXY:-}
+        HTTPS_PROXY: ${HTTPS_PROXY:-}
+    depends_on:
+      - beenet-registry
+    ports:
+      - "18080:8080"
+    command:
+      - "--http-addr"
+      - "0.0.0.0:8080"
+      - "--registry-url"
+      - "http://beenet-registry:3030"
+
+volumes:
+  minio-data:

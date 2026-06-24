@@ -12,7 +12,8 @@ use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::Router;
 use beenet_common::config::{
-    load_file, resolve_config_path_with_cli, resolve_gateway_settings, GatewayCliOverrides,
+    load_file, resolve_config_path_with_cli, resolve_gateway_settings_optional_file,
+    GatewayCliOverrides,
 };
 use beenet_common::{BeenetCid, INVOKE_PROTOCOL};
 use beenet_proto::{InvokeRequest, InvokeResponse, LoadStage, Status, TimeoutStage, Usage};
@@ -121,20 +122,28 @@ async fn main() -> Result<()> {
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let cli = Args::parse();
     let path = resolve_config_path_with_cli(cli.config.clone(), &argv);
-    if !path.exists() {
-        anyhow::bail!(
-            "missing config file `{}` (add [gateway] or pass --config)",
-            path.display()
-        );
-    }
-    let file_cfg = load_file(&path)?;
     let overrides = GatewayCliOverrides {
         http_addr: cli.http_addr.clone(),
         registry_url: cli.registry_url.clone(),
         registry_poll_ms: cli.registry_poll_ms,
         default_deadline_ms: cli.default_deadline_ms,
     };
-    let settings = resolve_gateway_settings(&file_cfg, &overrides)?;
+    let settings = if path.exists() {
+        let file_cfg = load_file(&path)?;
+        resolve_gateway_settings_optional_file(Some(&file_cfg), &overrides)?
+    } else if cli.config.is_some() {
+        anyhow::bail!(
+            "missing config file `{}` (add [gateway] or pass --config)",
+            path.display()
+        );
+    } else if cli.registry_url.is_some() {
+        resolve_gateway_settings_optional_file(None, &overrides)?
+    } else {
+        anyhow::bail!(
+            "missing config file `{}` (add [gateway], pass --config, or set --registry-url for container mode)",
+            path.display()
+        );
+    };
 
     let worker_addrs: Arc<RwLock<Vec<Multiaddr>>> = Arc::new(RwLock::new(Vec::new()));
     tokio::spawn(registry_poll_loop(

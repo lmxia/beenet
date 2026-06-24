@@ -1,0 +1,66 @@
+# beenet-gateway
+#
+# Apply (after registry.yaml):
+#   kubectl apply -f gateway.yaml
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: beenet-gateway
+  namespace: beenet
+  labels:
+    app: beenet-gateway
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: beenet-gateway
+  template:
+    metadata:
+      labels:
+        app: beenet-gateway
+    spec:
+      containers:
+        - name: gateway
+          image: beenet/gateway:latest   # replace with your image
+          args:
+            - "--http-addr"
+            - "0.0.0.0:8080"
+            - "--registry-url"
+            - "http://beenet-registry:3030"
+          ports:
+            - containerPort: 8080
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 128Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: beenet-gateway
+  namespace: beenet
+  labels:
+    app: beenet-gateway
+spec:
+  type: ClusterIP   # change to LoadBalancer to expose externally
+  selector:
+    app: beenet-gateway
+  ports:
+    - port: 8080
+      targetPort: 8080

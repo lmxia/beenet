@@ -11,19 +11,11 @@ use serde::Deserialize;
 #[derive(Debug, Deserialize, Default)]
 pub struct BeenetConfigFile {
     #[serde(default)]
-    pub registry: Option<RegistrySection>,
-    #[serde(default)]
     pub gateway: Option<GatewaySection>,
     #[serde(default)]
     pub worker: Option<WorkerSection>,
     #[serde(default)]
     pub oss: Option<OssSection>,
-}
-
-#[derive(Debug, Deserialize, Default)]
-pub struct RegistrySection {
-    pub http_addr: Option<String>,
-    pub join_token: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -113,7 +105,10 @@ pub struct WorkerSettings {
     pub max_concurrency: Option<usize>,
     pub registry_url: String,
     pub registry_heartbeat_path: String,
-    pub join_token: String,
+    /// One-time join token used to register with the registry.
+    /// Optional: only required if the worker has never registered before
+    /// (i.e. no persistent identity key exists, or the registry was restarted).
+    pub join_token: Option<String>,
     pub registry_heartbeat_secs: u64,
     pub wasm_fetch_base: Option<String>,
     pub wasm_fetch_bearer: Option<String>,
@@ -150,8 +145,7 @@ pub fn resolve_worker_settings(
     let w = require_worker_section(cfg)?;
     let registry_url = opt_merge(cli.registry_url.clone(), w.registry_url.as_ref())
         .ok_or_else(|| anyhow!("config [worker] must set registry_url (or pass --registry-url)"))?;
-    let join_token = opt_merge(cli.join_token.clone(), w.join_token.as_ref())
-        .ok_or_else(|| anyhow!("config [worker] must set join_token (or pass --join-token)"))?;
+    let join_token = opt_merge(cli.join_token.clone(), w.join_token.as_ref());
 
     let listen_addr = opt_merge(cli.listen_addr.clone(), w.listen_addr.as_ref())
         .unwrap_or_else(|| DEFAULT_WORKER_LISTEN_ADDR.to_string());
@@ -281,9 +275,28 @@ pub fn resolve_gateway_settings(
     cli: &GatewayCliOverrides,
 ) -> Result<GatewaySettings> {
     let g = require_gateway_section(cfg)?;
-    let registry_url = opt_merge(cli.registry_url.clone(), g.registry_url.as_ref())
-        .ok_or_else(|| anyhow!("config [gateway] must set registry_url"))?;
-    let http_str = opt_merge(cli.http_addr.clone(), g.http_addr.as_ref())
+    resolve_gateway_settings_merged(Some(g), cli)
+}
+
+/// Resolve gateway settings from an optional config file plus CLI overrides.
+/// When `cfg` is `None`, `--registry-url` must be supplied (container / K8s mode).
+pub fn resolve_gateway_settings_optional_file(
+    cfg: Option<&BeenetConfigFile>,
+    cli: &GatewayCliOverrides,
+) -> Result<GatewaySettings> {
+    let section = cfg.and_then(|c| c.gateway.as_ref());
+    resolve_gateway_settings_merged(section, cli)
+}
+
+fn resolve_gateway_settings_merged(
+    g: Option<&GatewaySection>,
+    cli: &GatewayCliOverrides,
+) -> Result<GatewaySettings> {
+    let registry_url = opt_merge(cli.registry_url.clone(), g.and_then(|s| s.registry_url.as_ref()))
+        .ok_or_else(|| {
+            anyhow!("missing registry_url: pass --registry-url or set [gateway].registry_url in config")
+        })?;
+    let http_str = opt_merge(cli.http_addr.clone(), g.and_then(|s| s.http_addr.as_ref()))
         .unwrap_or_else(|| DEFAULT_GATEWAY_HTTP_ADDR.to_string());
     let http_addr: SocketAddr = http_str
         .parse()
@@ -291,50 +304,19 @@ pub fn resolve_gateway_settings(
     Ok(GatewaySettings {
         http_addr,
         registry_url,
-        registry_poll_ms: pick_u64(cli.registry_poll_ms, g.registry_poll_ms, DEFAULT_REGISTRY_POLL_MS),
+        registry_poll_ms: pick_u64(
+            cli.registry_poll_ms,
+            g.and_then(|s| s.registry_poll_ms),
+            DEFAULT_REGISTRY_POLL_MS,
+        ),
         default_deadline_ms: pick_u32(
             cli.default_deadline_ms,
-            g.default_deadline_ms,
+            g.and_then(|s| s.default_deadline_ms),
             DEFAULT_DEADLINE_MS,
         ),
     })
 }
 
-#[derive(Clone, Debug)]
-pub struct RegistrySettings {
-    pub http_addr: SocketAddr,
-    pub join_token: String,
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct RegistryCliOverrides {
-    pub http_addr: Option<String>,
-    pub join_token: Option<String>,
-}
-
-pub fn require_registry_section(cfg: &BeenetConfigFile) -> Result<&RegistrySection> {
-    cfg.registry
-        .as_ref()
-        .ok_or_else(|| anyhow!("config must include a [registry] table"))
-}
-
-pub fn resolve_registry_settings(
-    cfg: &BeenetConfigFile,
-    cli: &RegistryCliOverrides,
-) -> Result<RegistrySettings> {
-    let r = require_registry_section(cfg)?;
-    let join_token = opt_merge(cli.join_token.clone(), r.join_token.as_ref())
-        .ok_or_else(|| anyhow!("config [registry] must set join_token"))?;
-    let http_str = opt_merge(cli.http_addr.clone(), r.http_addr.as_ref())
-        .unwrap_or_else(|| DEFAULT_REGISTRY_HTTP_ADDR.to_string());
-    let http_addr: SocketAddr = http_str
-        .parse()
-        .with_context(|| format!("invalid registry http_addr `{http_str}`"))?;
-    Ok(RegistrySettings {
-        http_addr,
-        join_token,
-    })
-}
 
 /// Platform config dir + `beenet/config.toml`.
 pub fn default_config_path() -> PathBuf {
@@ -398,13 +380,16 @@ mod tests {
     }
 
     #[test]
-    fn worker_merge_requires_registry_join() {
+    fn worker_merge_requires_registry_url() {
         let mut f = BeenetConfigFile::default();
         f.worker = Some(WorkerSection::default());
+        // registry_url is required; join_token is now optional.
         assert!(resolve_worker_settings(&f, &WorkerCliOverrides::default()).is_err());
         f.worker.as_mut().unwrap().registry_url = Some("http://localhost:3030".into());
-        assert!(resolve_worker_settings(&f, &WorkerCliOverrides::default()).is_err());
+        let s = resolve_worker_settings(&f, &WorkerCliOverrides::default()).unwrap();
+        assert!(s.join_token.is_none());
         f.worker.as_mut().unwrap().join_token = Some("t".into());
-        assert!(resolve_worker_settings(&f, &WorkerCliOverrides::default()).is_ok());
+        let s = resolve_worker_settings(&f, &WorkerCliOverrides::default()).unwrap();
+        assert_eq!(s.join_token.as_deref(), Some("t"));
     }
 }

@@ -29,34 +29,27 @@ curl → Gateway(HTTP) → libp2p → Worker → wasi:http/incoming-handler@0.2 
 
 ## 配置文件
 
-**Registry / Gateway / Worker / `beenet-pack upload`** 都从同一份 **TOML** 读运行参数：**不**再读取 `BEENET_*` 环境变量（日志仍可用 `RUST_LOG`，与 `tracing-subscriber` 一致）。
+**Gateway / Worker / `beenet-pack upload`** 从 **TOML** 读运行参数（日志仍可用 `RUST_LOG`）。**`beenet-registry`** 不读配置文件，只用 CLI（`--http-addr`、`--redis-url`）。
 
-- **默认路径**：`dirs::config_dir()/beenet/config.toml`（常见 `~/.config/beenet/config.toml`；macOS 也可能是 `~/Library/Application Support/beenet/config.toml`）。
-- **覆盖**：**`--config /path/to/config.toml`**（各二进制均支持）。
+- **默认路径**：`dirs::config_dir()/beenet/config.toml`
+- **覆盖**：**`--config /path/to/config.toml`**（Gateway / Worker 支持）
+- **Gateway 容器模式**：无配置文件时，只要传入 **`--registry-url`**（及可选 **`--http-addr`**）即可启动
 
-**优先级**：命令行里传入的 `--listen-addr`、`--registry-url` 等与 TOML 同名的 **flag** 会覆盖文件中对应字段；未在文件或 CLI 里给出的项使用代码内置默认值（与旧版 clap 默认一致）。
-
-`beenet-pack build` / **`inspect`** **不需要** 该文件。缺少配置文件、或缺少当前进程所需的 table / 必填字段时，会直接报错退出。
+`beenet-pack build` / **`inspect`** **不需要** 配置文件。
 
 开发与联调可共用一份配置，例如：
 
 ```toml
-[registry]
-http_addr = "127.0.0.1:3030"
-join_token = "my-dev-token"
-
 [gateway]
 http_addr = "127.0.0.1:8080"
 registry_url = "http://127.0.0.1:3030"
-# registry_poll_ms = 2000
-# default_deadline_ms = 10000
 
 [worker]
 listen_addr = "/ip4/127.0.0.1/tcp/4001"
 registry_url = "http://127.0.0.1:3030"
-join_token = "my-dev-token"
-wasm_fetch_base = "https://my-bucket.oss-cn-hangzhou.aliyuncs.com/beenet"
-# wasm_cache_dir = "./wasm_cache"
+# join_token 由 registry Admin API 签发，见下文端到端示例
+wasm_cache_dir = "wasm_cache"
+# wasm_fetch_base = "https://my-bucket.oss-cn-hangzhou.aliyuncs.com/beenet"
 
 [oss]
 endpoint = "https://oss-cn-hangzhou.aliyuncs.com"
@@ -64,12 +57,96 @@ bucket = "my-bucket"
 access_key_id = "LTAI..."
 access_key_secret = "..."
 region = "oss-cn-hangzhou"
-# key_prefix = "beenet/"
-# force_path_style = false
 ```
 
-- **`[oss]`**：`beenet-pack upload` 必填 `endpoint`、`bucket`、`access_key_id`、`access_key_secret`、`region`；也可用 CLI **`--oss-endpoint`** 等逐项覆盖文件。
-- **`wasm_fetch_base`**：不要末尾 `/`；实际请求 **`{base}/{cid}`**，需与 `upload` 写入的对象键一致。
+- **`[oss]`**：`beenet-pack upload` 必填；也可用 CLI **`--oss-endpoint`** 等覆盖。
+- **`wasm_fetch_base`**：不要末尾 `/`；实际请求 **`{base}/{cid}`**。
+
+也可直接使用 **`examples/local-dev-config.toml`**：已预置 **MinIO**（本地 S3）的 `[oss]` 与 `[worker].wasm_fetch_base`，配合 `docker/docker-compose.dev.yml` 做 upload 联调。
+
+## 容器化（Registry + Gateway + MinIO）
+
+`registry` 与 `gateway` 提供 Dockerfile；**worker 仍在宿主机运行**（依赖 Spin 宿主，暂不容器化）。
+
+`docker/docker-compose.dev.yml` 会一并启动：
+
+| 服务 | 宿主机端口 | 说明 |
+| --- | --- | --- |
+| Redis | 6379 | Registry 持久化 Worker 注册信息 |
+| MinIO (S3 API) | 9000 | `beenet-pack upload` 目标 |
+| MinIO Console | 9001 | Web 控制台（`minioadmin` / `minioadmin`） |
+| beenet-registry | 3030 | 控制面 |
+| beenet-gateway | **18080** | HTTP 入口（映射容器 8080，避免与本地 8080 冲突） |
+
+```bash
+# 构建镜像（在仓库根目录）
+make docker-build
+# 若容器内 cargo 需走代理（例如本机 7890）：
+#   HTTP_PROXY=http://host.docker.internal:7890 HTTPS_PROXY=http://host.docker.internal:7890 make docker-build
+
+# 启动 Redis + MinIO + registry + gateway
+docker compose -f docker/docker-compose.dev.yml up -d --build
+docker compose -f docker/docker-compose.dev.yml logs -f beenet-registry
+```
+
+MinIO 使用 `quay.io/minio/*` 镜像（避免 Docker Hub 拉取超时）。`minio-init` 会自动创建 bucket `beenet` 并开启匿名下载，Worker 可通过 `http://127.0.0.1:9000/beenet/<cid>` 拉取 wasm。
+
+**upload 到 MinIO**（需先 `cargo build --release -p beenet-pack` 并完成 §2 打包）：
+
+```bash
+./target/release/beenet-pack upload \
+  --config examples/local-dev-config.toml \
+  --wasm dist/task.wasm
+```
+
+`examples/local-dev-config.toml` 中相关片段：
+
+```toml
+[worker]
+wasm_fetch_base = "http://127.0.0.1:9000/beenet"
+
+[oss]
+endpoint = "http://127.0.0.1:9000"
+bucket = "beenet"
+access_key_id = "minioadmin"
+access_key_secret = "minioadmin"
+region = "us-east-1"
+force_path_style = true   # MinIO 必须
+```
+
+Registry 启动时会打印 **Admin Token**。用它签发 Worker 入网用的 **join token**：
+
+```bash
+ADMIN_TOKEN="<registry 日志里的 admin token>"
+curl -s -X POST http://127.0.0.1:3030/v1/admin/tokens \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"description":"dev","ttl_secs":86400}'
+# 响应 JSON 里的 token_value 即 join_token
+```
+
+**Gateway 在 Docker 里、Worker 在宿主机时**：Worker 的 `listen_addr` 不能写 `127.0.0.1`（容器内无法拨号），需改成宿主机局域网 IP，例如：
+
+```bash
+# macOS 若 en0 无地址，可用: ifconfig | grep "inet " | grep -v 127.0.0.1
+HOST_IP=$(ipconfig getifaddr en0 2>/dev/null || hostname -I | awk '{print $1}')
+./target/release/beenet-worker \
+  --config examples/local-dev-config.toml \
+  --listen-addr "/ip4/${HOST_IP}/tcp/4001" \
+  --join-token "<token_value>"
+```
+
+然后通过 Docker Gateway 发起请求（注意端口 **18080**）：
+
+```bash
+export CID="$(./target/release/beenet-pack inspect dist/task.wasm | awk '/^CID:/{print $2}')"
+curl -i -X POST "http://127.0.0.1:18080/run/ipfs/$CID" \
+  --data 'please filter my badword please'
+```
+
+Worker 在缓存未命中时会从 MinIO 拉取 wasm（日志可见 `fetching wasm into cache`）。
+
+Gateway 与 Worker 都在宿主机时，可继续用 `127.0.0.1:8080`（见下文 §4–§7）。
 
 ## 端到端示例
 
@@ -108,21 +185,43 @@ OUT: dist/task.wasm
 SIZE: …
 ```
 
-### 3. 发布到阿里云 OSS（推荐）
+**配置文件**：可将上文「配置文件」中的 TOML 存到默认路径；或直接使用 **`examples/local-dev-config.toml`**（含 MinIO `[oss]`，也可删掉 `[oss]` / `wasm_fetch_base` 走 §3b 本地缓存）。
 
-在 **`config.toml`** 的 **`[oss]`** 中填入 **RAM 子账号** 的 AK/SK（勿提交仓库）。典型 **华东1（杭州）**：[oss] 示例见上节。然后：
+### 3. 发布 wasm（S3 兼容存储）
+
+#### 3a. 本地 MinIO（推荐用于开发）
+
+先 `docker compose -f docker/docker-compose.dev.yml up -d` 启动 MinIO，再 upload：
 
 ```bash
-./target/release/beenet-pack upload --wasm dist/task.wasm
+./target/release/beenet-pack upload \
+  --config examples/local-dev-config.toml \
+  --wasm dist/task.wasm
+```
+
+验证对象可读：
+
+```bash
+CID=$(./target/release/beenet-pack inspect dist/task.wasm | awk '/^CID:/{print $2}')
+curl -s -o /dev/null -w "%{http_code}\n" "http://127.0.0.1:9000/beenet/${CID}"
+# 预期 200
+```
+
+#### 3b. 阿里云 OSS（生产）
+
+在 **`config.toml`** 的 **`[oss]`** 中填入 **RAM 子账号** 的 AK/SK（勿提交仓库）。典型 **华东1（杭州）**：[oss] 示例见「配置文件」一节。然后：
+
+```bash
+./target/release/beenet-pack upload --config /path/to/config.toml --wasm dist/task.wasm
 ```
 
 也可用 **`--oss-endpoint`、`--oss-bucket`、…** 覆盖文件中的单个字段。
 
 若 PutObject 失败，可在 **`[oss]`** 中设 **`force_path_style = true`** 再试。
 
-### 3b. 仅本地缓存（离线调试）
+#### 3c. 仅本地缓存（离线调试）
 
-不写 OSS 时，可把打包产物拷入缓存：
+不写 S3 时，可把打包产物拷入缓存：
 
 ```bash
 CID=$(./target/release/beenet-pack inspect dist/task.wasm | awk '/^CID:/{print $2}')
@@ -131,18 +230,34 @@ cp dist/task.wasm "wasm_cache/${CID}.wasm"
 
 ### 4. 启动 Registry（控制面）
 
+Registry 依赖 **Redis**（默认 `redis://127.0.0.1:6379`）。本地可先起一个 Redis：
+
 ```bash
-RUST_LOG=info ./target/release/beenet-registry --config examples/local-dev-config.toml
+docker run -d --name beenet-redis -p 6379:6379 redis:7-alpine
 ```
 
-监听地址与 **`join_token`** 来自配置文件中的 **`[registry]`**；也可用 **`--http-addr` / `--join-token`** 覆盖。
+然后启动 registry（**无需** `--config`）：
+
+```bash
+RUST_LOG=info ./target/release/beenet-registry --http-addr 127.0.0.1:3030
+```
+
+启动日志会打印 **Admin Token**。用它创建 Worker 用的 **join token**（见上文「容器化」一节里的 `curl` 示例），记下 `token_value`。
 
 ### 5. 启动 Worker
 
-另开终端（同样先 `cd` 到仓库根目录，保证 `wasm_cache` 相对路径与配置一致）：
+另开终端（`cd` 到仓库根目录，保证 `wasm_cache` 相对路径一致）：
 
 ```bash
-RUST_LOG=info ./target/release/beenet-worker --config examples/local-dev-config.toml
+RUST_LOG=info ./target/release/beenet-worker \
+  --config examples/local-dev-config.toml \
+  --join-token "<token_value>"
+```
+
+确认入网：
+
+```bash
+curl -s http://127.0.0.1:3030/v1/workers | jq .
 ```
 
 ### 6. 启动 Gateway
@@ -150,6 +265,8 @@ RUST_LOG=info ./target/release/beenet-worker --config examples/local-dev-config.
 ```bash
 RUST_LOG=info ./target/release/beenet-gateway --config examples/local-dev-config.toml
 ```
+
+若 Gateway 跑在 Docker 里，改用 `--registry-url http://127.0.0.1:3030`（无需配置文件），并把对外端口改为 compose 映射的 **18080**（见 `docker/docker-compose.dev.yml`）。
 
 ### 7. 发起请求
 
@@ -169,7 +286,7 @@ content-length: 27
 please filter my *** please
 ```
 
-若 **`connection refused`**：确认三进程已启动且端口未被占用。若 **`x-beenet-status: load-error`**：确认已执行 **§3b** 将 **`dist/task.wasm`** 拷到 **`wasm_cache/$CID.wasm`**，且 Worker 进程的工作目录与配置里的 **`wasm_cache_dir`** 一致（`examples/local-dev-config.toml` 使用相对路径 **`wasm_cache`**，须在仓库根目录启动 Worker）。
+若 **`connection refused`**：确认三进程已启动且端口未被占用。若 **`x-beenet-status: load-error`**：确认 wasm 已 upload 到 S3 / 拷入 `wasm_cache`，且 Worker 的工作目录与 `wasm_cache_dir` 一致。若 **`x-beenet-status: runtime-error`** 且 Gateway 在 Docker 内：检查 Worker 是否仍在运行，以及 `listen_addr` 是否为宿主机可达 IP（非 `127.0.0.1`）。
 
 ## 写你自己的任务
 
@@ -189,7 +306,9 @@ please filter my *** please
 | `crates/beenet-worker` | libp2p + Factors；Registry；**可选 HTTP 拉取 wasm** |
 | `crates/beenet-gateway` | HTTP → libp2p；**必填** Registry URL，轮询 Worker 列表 |
 | `examples/hello-filter-http` | `#[http_component]` 示例任务 |
-| `examples/local-dev-config.toml` | 本地联调用 **`config.toml`**（registry / gateway / worker，无 OSS） |
+| `examples/local-dev-config.toml` | 本地联调配置（MinIO `[oss]` + gateway / worker） |
+| `docker/` | Registry / Gateway Dockerfile、`docker-compose.dev.yml`（含 MinIO） |
+| `Makefile` | `make build`、`make docker-build`、`make docker-up` 等 |
 
 ## 许可
 

@@ -7,10 +7,11 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
+use base64::{engine::general_purpose::STANDARD, Engine};
 use beenet_common::config::{
     resolve_config_path_with_cli, WorkerCliOverrides, WorkerSettings,
 };
@@ -24,7 +25,7 @@ use libp2p::core::multiaddr::Protocol;
 use libp2p::request_response::{self, ProtocolSupport};
 use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
 use libp2p::{identify, identity, ping, Multiaddr, PeerId, StreamProtocol, SwarmBuilder};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use spin_app::AppComponent;
 use spin_core::wasmtime::component::Component;
 use spin_factors_executor::{ComponentLoader, FactorsExecutor};
@@ -428,7 +429,7 @@ fn wasm_fetch_url(base: &str, cid: &BeenetCid) -> String {
     format!("{}/{}", base.trim_end_matches('/'), cid)
 }
 
-fn join_registry_heartbeat_url(base: &str, path: &str) -> String {
+fn registry_url(base: &str, path: &str) -> String {
     let base = base.trim_end_matches('/');
     if path.starts_with('/') {
         format!("{base}{path}")
@@ -437,38 +438,189 @@ fn join_registry_heartbeat_url(base: &str, path: &str) -> String {
     }
 }
 
+// ── Identity persistence ───────────────────────────────────────────────────
+
+/// Load the worker's Ed25519 keypair from `<wasm_cache_dir>/identity.key`.
+/// If the file does not exist, generate a new keypair and persist it.
+fn load_or_create_keypair(wasm_cache_dir: &PathBuf) -> Result<identity::Keypair> {
+    let key_path = wasm_cache_dir.join("identity.key");
+    if key_path.exists() {
+        let bytes = fs::read(&key_path)
+            .with_context(|| format!("read identity key `{}`", key_path.display()))?;
+        let keypair = identity::Keypair::from_protobuf_encoding(&bytes)
+            .with_context(|| format!("decode identity key `{}`", key_path.display()))?;
+        info!(path = %key_path.display(), "loaded persistent identity keypair");
+        Ok(keypair)
+    } else {
+        let keypair = identity::Keypair::generate_ed25519();
+        let bytes = keypair
+            .to_protobuf_encoding()
+            .context("encode new identity keypair")?;
+        fs::write(&key_path, &bytes)
+            .with_context(|| format!("write identity key `{}`", key_path.display()))?;
+        info!(
+            path = %key_path.display(),
+            peer_id = %PeerId::from(keypair.public()),
+            "generated and saved new identity keypair"
+        );
+        Ok(keypair)
+    }
+}
+
+// ── Signed payload ─────────────────────────────────────────────────────────
+
+/// Build the canonical signed message and return its base64-encoded Ed25519 signature.
+fn make_signature(
+    keypair: &identity::Keypair,
+    peer_id: &str,
+    dial_multiaddr: &str,
+    timestamp_secs: u64,
+) -> Result<String> {
+    let msg = format!("{peer_id}\n{dial_multiaddr}\n{timestamp_secs}");
+    let sig = keypair
+        .sign(msg.as_bytes())
+        .map_err(|e| anyhow::anyhow!("signing failed: {e}"))?;
+    Ok(STANDARD.encode(sig))
+}
+
+fn unix_secs_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+// ── Registry HTTP types ────────────────────────────────────────────────────
+
 #[derive(Serialize)]
-struct RegistryHeartbeatBody<'a> {
-    join_token: &'a str,
-    peer_id: &'a str,
-    dial_multiaddr: &'a str,
+struct JoinBody {
+    join_token: String,
+    peer_id: String,
+    public_key: String,
+    dial_multiaddr: String,
+    timestamp_secs: u64,
+    signature: String,
+}
+
+#[derive(Deserialize)]
+struct JoinResponse {
+    ok: bool,
+}
+
+#[derive(Serialize)]
+struct HeartbeatBody {
+    peer_id: String,
+    dial_multiaddr: String,
+    timestamp_secs: u64,
+    signature: String,
+}
+
+// ── Registration & heartbeat logic ────────────────────────────────────────
+
+/// Call `POST /v1/workers/join`. Returns `Ok(())` on success.
+async fn do_join(
+    http: &reqwest::Client,
+    join_url: &str,
+    keypair: &identity::Keypair,
+    peer_id: &str,
+    dial_multiaddr: &str,
+    join_token: &str,
+) -> Result<()> {
+    let ts = unix_secs_now();
+    let sig = make_signature(keypair, peer_id, dial_multiaddr, ts)?;
+    let pubkey_bytes = keypair.public().encode_protobuf();
+    let body = JoinBody {
+        join_token: join_token.to_owned(),
+        peer_id: peer_id.to_owned(),
+        public_key: STANDARD.encode(&pubkey_bytes),
+        dial_multiaddr: dial_multiaddr.to_owned(),
+        timestamp_secs: ts,
+        signature: sig,
+    };
+    let resp = http
+        .post(join_url)
+        .json(&body)
+        .send()
+        .await
+        .with_context(|| format!("POST {join_url}"))?;
+    let status = resp.status();
+    if status.is_success() {
+        let jr: JoinResponse = resp.json().await.context("parse join response")?;
+        if jr.ok {
+            info!(%peer_id, "worker registered with registry");
+            return Ok(());
+        }
+        anyhow::bail!("join returned ok=false");
+    }
+    let text = resp.text().await.unwrap_or_default();
+    anyhow::bail!("join rejected (HTTP {status}): {text}")
+}
+
+/// Send one heartbeat. Returns `true` if accepted (200), `false` if 401 (unregistered).
+async fn do_heartbeat(
+    http: &reqwest::Client,
+    heartbeat_url: &str,
+    keypair: &identity::Keypair,
+    peer_id: &str,
+    dial_multiaddr: &str,
+) -> Result<bool> {
+    let ts = unix_secs_now();
+    let sig = make_signature(keypair, peer_id, dial_multiaddr, ts)?;
+    let body = HeartbeatBody {
+        peer_id: peer_id.to_owned(),
+        dial_multiaddr: dial_multiaddr.to_owned(),
+        timestamp_secs: ts,
+        signature: sig,
+    };
+    let resp = http
+        .post(heartbeat_url)
+        .json(&body)
+        .send()
+        .await
+        .with_context(|| format!("POST {heartbeat_url}"))?;
+    let status = resp.status();
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        return Ok(false);
+    }
+    if !status.is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        anyhow::bail!("heartbeat failed (HTTP {status}): {text}");
+    }
+    Ok(true)
 }
 
 async fn registry_heartbeat_loop(
     http: reqwest::Client,
     heartbeat_url: String,
-    join_token: String,
+    join_url: String,
+    keypair: Arc<identity::Keypair>,
     peer_id: String,
     dial_multiaddr: String,
     period: Duration,
+    join_token: Option<String>,
 ) {
     let mut interval = tokio::time::interval(period);
     loop {
         interval.tick().await;
-        let body = RegistryHeartbeatBody {
-            join_token: &join_token,
-            peer_id: &peer_id,
-            dial_multiaddr: &dial_multiaddr,
-        };
-        match http.post(&heartbeat_url).json(&body).send().await {
-            Ok(resp) if resp.status().is_success() => {
-                info!(status = %resp.status(), "registry heartbeat ok");
+        match do_heartbeat(&http, &heartbeat_url, &keypair, &peer_id, &dial_multiaddr).await {
+            Ok(true) => {
+                info!("registry heartbeat ok");
             }
-            Ok(resp) => {
-                warn!(
-                    status = %resp.status(),
-                    "registry heartbeat rejected or failed"
-                );
+            Ok(false) => {
+                // Registry restarted or registration was revoked — attempt re-join.
+                warn!("heartbeat rejected (unregistered); attempting re-join");
+                if let Some(ref token) = join_token {
+                    if let Err(e) =
+                        do_join(&http, &join_url, &keypair, &peer_id, &dial_multiaddr, token).await
+                    {
+                        warn!(error = %e, "re-join failed");
+                    }
+                } else {
+                    warn!(
+                        "worker is not registered and no join_token is configured; \
+                        worker will be invisible to the gateway until manually re-registered"
+                    );
+                }
             }
             Err(e) => {
                 warn!(error = %e, "registry heartbeat request error");
@@ -552,9 +704,10 @@ async fn main() -> Result<()> {
     let factors_executor = Arc::new(FactorsExecutor::new(engine_builder, factors)?);
     let runtime = Arc::new(Runtime::new(factors_executor, &settings));
 
-    let local_key = identity::Keypair::generate_ed25519();
+    // Load or generate a persistent Ed25519 keypair from wasm_cache_dir/identity.key.
+    let local_key = load_or_create_keypair(&settings.wasm_cache_dir)?;
     let local_peer_id = PeerId::from(local_key.public());
-    let mut swarm = build_swarm(local_key)?;
+    let mut swarm = build_swarm(local_key.clone())?;
     swarm.listen_on(listen_addr.clone())?;
 
     let dial_multiaddr = listen_addr
@@ -572,20 +725,48 @@ async fn main() -> Result<()> {
         "worker started"
     );
 
-    let heartbeat_url =
-        join_registry_heartbeat_url(&settings.registry_url, &settings.registry_heartbeat_path);
+    let heartbeat_url = registry_url(&settings.registry_url, &settings.registry_heartbeat_path);
+    let join_url = registry_url(&settings.registry_url, "/v1/workers/join");
     let http = reqwest::Client::new();
+    let keypair_arc = Arc::new(local_key);
     let peer_s = local_peer_id.to_string();
     let dial_owned = dial_str.clone();
+
+    // Initial registration: try heartbeat first; if unregistered, attempt join.
+    match do_heartbeat(&http, &heartbeat_url, &keypair_arc, &peer_s, &dial_owned).await {
+        Ok(true) => {
+            info!(peer_id = %local_peer_id, "worker already registered with registry");
+        }
+        Ok(false) => {
+            // Not yet registered — join now.
+            if let Some(ref token) = settings.join_token {
+                do_join(&http, &join_url, &keypair_arc, &peer_s, &dial_owned, token)
+                    .await
+                    .context("initial worker registration failed")?;
+            } else {
+                anyhow::bail!(
+                    "worker is not registered with the registry and no join_token is configured; \
+                    set [worker].join_token in config or pass --join-token"
+                );
+            }
+        }
+        Err(e) => {
+            // Registry not reachable yet — log a warning and let the heartbeat loop retry.
+            warn!(error = %e, "registry not reachable at startup; will retry in heartbeat loop");
+        }
+    }
+
     let period = Duration::from_secs(settings.registry_heartbeat_secs);
     let join_token = settings.join_token.clone();
     tokio::spawn(registry_heartbeat_loop(
         http,
         heartbeat_url,
-        join_token,
+        join_url,
+        keypair_arc,
         peer_s,
         dial_owned,
         period,
+        join_token,
     ));
 
     while let Some(event) = swarm.next().await {

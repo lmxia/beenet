@@ -1,0 +1,40 @@
+# Build context: beenet/ workspace root.
+#   docker build -f docker/Dockerfile.gateway -t beenet/gateway:dev .
+#
+# beenet-gateway depends on beenet-common + beenet-proto. Spin-dependent
+# workspace members are stripped so the sibling spin/ checkout is not required.
+
+FROM rust:1-slim AS builder
+
+WORKDIR /build
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY Cargo.toml Cargo.lock ./
+
+RUN sed -i \
+    -e '/"crates\/beenet-worker"/d' \
+    -e '/"crates\/beenet-factors"/d' \
+    Cargo.toml
+
+COPY crates/ ./crates/
+
+ARG HTTP_PROXY
+ARG HTTPS_PROXY
+ENV HTTP_PROXY=$HTTP_PROXY HTTPS_PROXY=$HTTPS_PROXY
+
+RUN cargo build --release -p beenet-gateway
+
+FROM debian:bookworm-slim AS runtime
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /build/target/release/beenet-gateway /usr/local/bin/beenet-gateway
+
+EXPOSE 8080
+
+ENTRYPOINT ["beenet-gateway"]

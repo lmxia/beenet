@@ -1,14 +1,11 @@
-# 本地联调用（无 OSS）：与 `readme.md` 端到端示例一致。
-# 使用方式（仓库根目录）：
-#   beenet-registry  --config examples/local-dev-config.toml
-#   beenet-worker    --config examples/local-dev-config.toml
-#   beenet-gateway   --config examples/local-dev-config.toml
+# 本地联调：配合 `docker/docker-compose.dev.yml`（Redis + MinIO + registry + gateway）。
 #
-# 若需从 OSS 拉 wasm，在 [worker] 增加 wasm_fetch_base；upload 需在主 config.toml 写 [oss] 或使用 `beenet-pack upload` 的 --oss-* 覆盖。
-
-[registry]
-http_addr = "127.0.0.1:3030"
-join_token = "my-dev-token"
+# 宿主机进程：
+#   beenet-worker --config examples/local-dev-config.toml --join-token <token>
+#   beenet-pack upload --config examples/local-dev-config.toml --wasm dist/task.wasm
+#
+# Gateway 在 Docker 内时，curl 用 http://127.0.0.1:18080/...（不是 8080）。
+# Worker 在宿主机、Gateway 在容器时，listen_addr 需改为宿主机局域网 IP（见 readme.md）。
 
 [gateway]
 http_addr = "127.0.0.1:8080"
@@ -17,5 +14,14 @@ registry_url = "http://127.0.0.1:3030"
 [worker]
 listen_addr = "/ip4/127.0.0.1/tcp/4001"
 registry_url = "http://127.0.0.1:3030"
-join_token = "my-dev-token"
 wasm_cache_dir = "wasm_cache"
+# MinIO public read (bucket `beenet`, path-style URL)
+wasm_fetch_base = "http://127.0.0.1:9000/beenet"
+
+[oss]
+endpoint = "http://127.0.0.1:9000"
+bucket = "beenet"
+access_key_id = "minioadmin"
+access_key_secret = "minioadmin"
+region = "us-east-1"
+force_path_style = true

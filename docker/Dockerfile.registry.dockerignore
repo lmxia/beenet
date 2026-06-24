@@ -1,0 +1,11 @@
+# Build context is the beenet/ workspace root.
+target/
+.git/
+beenet-deploy/
+examples/
+dist/
+wasm_cache/
+*.md
+*.code-workspace
+.vscode/
+.idea/
