@@ -16,7 +16,7 @@
 curl → Gateway(HTTP) → libp2p → Worker → wasi:http/incoming-handler@0.2 → body 回传
 ```
 
-**必须** 运行 **`beenet-registry`**：Worker 持 **join token** 对默认路径 **`POST /v1/workers/heartbeat`** 发送 **心跳**（首次即入网，后续为 **续租** / 保活；详见 [`target.md` §4.1 / §4.3](./target.md)）。Gateway 轮询 **`GET /v1/workers`** 刷新可拨号列表。
+**必须** 运行 **`beenet-registry`**：Worker 持 **join token** 对默认路径 **`POST /v1/workers/heartbeat`** 发送 **心跳**（首次即入网，后续为 **续租** / 保活；详见 [`target.md` §4.1 / §4.3](./target.md)）。Worker 会把 `supported_cids` 一并上报，Gateway 轮询 **`GET /v1/workers`** 后先做 CID hint 过滤，再选择可拨号列表。
 
 **Wasm 分发（推荐）**：`beenet-pack build` 后使用 **`beenet-pack upload`** 推到 **阿里云 OSS**（S3 兼容 API）；在 **`config.toml` 的 `[worker]`** 中配置 **`wasm_fetch_base`**，在 **`wasm_cache` 未命中** 时 **`GET {base}/{cid}`** 拉取并 **校验 CID** 后缓存（见 [`target.md` §3.1](./target.md)）。
 
@@ -85,7 +85,7 @@ make docker-build
 #   HTTP_PROXY=http://host.docker.internal:7890 HTTPS_PROXY=http://host.docker.internal:7890 make docker-build
 
 # 启动 Redis + MinIO + registry + gateway
-docker compose -f docker/docker-compose.dev.yml up -d --build
+docker compose -f docker/docker-compose.dev.yml up -d --no-build
 docker compose -f docker/docker-compose.dev.yml logs -f beenet-registry
 ```
 
@@ -141,7 +141,7 @@ HOST_IP=$(ipconfig getifaddr en0 2>/dev/null || hostname -I | awk '{print $1}')
 ```bash
 export CID="$(./target/release/beenet-pack inspect dist/task.wasm | awk '/^CID:/{print $2}')"
 curl -i -X POST "http://127.0.0.1:18080/run/ipfs/$CID" \
-  --data 'please filter my badword please'
+  --data 'please route this support ticket to billing'
 ```
 
 Worker 在缓存未命中时会从 MinIO 拉取 wasm（日志可见 `fetching wasm into cache`）。
@@ -273,7 +273,7 @@ RUST_LOG=info ./target/release/beenet-gateway --config examples/local-dev-config
 ```bash
 export CID="$(./target/release/beenet-pack inspect dist/task.wasm | awk '/^CID:/{print $2}')"
 curl -i -X POST "http://127.0.0.1:8080/run/ipfs/$CID" \
-  --data 'please filter my badword please'
+  --data 'please route this support ticket to billing'
 ```
 
 预期：
@@ -283,7 +283,7 @@ HTTP/1.1 200 OK
 x-beenet-status: ok
 content-length: 27
 
-please filter my *** please
+{"label":"billing","action":"route to finance","summary":"please route this support ticket to billing"}
 ```
 
 若 **`connection refused`**：确认三进程已启动且端口未被占用。若 **`x-beenet-status: load-error`**：确认 wasm 已 upload 到 S3 / 拷入 `wasm_cache`，且 Worker 的工作目录与 `wasm_cache_dir` 一致。若 **`x-beenet-status: runtime-error`** 且 Gateway 在 Docker 内：检查 Worker 是否仍在运行，以及 `listen_addr` 是否为宿主机可达 IP（非 `127.0.0.1`）。
@@ -305,7 +305,7 @@ please filter my *** please
 | `crates/beenet-registry` | HTTP Registry：Worker **心跳** `POST /v1/workers/heartbeat`、`GET /v1/workers` |
 | `crates/beenet-worker` | libp2p + Factors；Registry；**可选 HTTP 拉取 wasm** |
 | `crates/beenet-gateway` | HTTP → libp2p；**必填** Registry URL，轮询 Worker 列表 |
-| `examples/hello-filter-http` | `#[http_component]` 示例任务 |
+| `examples/hello-filter-http` | `#[http_component]` 工单分类示例任务 |
 | `examples/local-dev-config.toml` | 本地联调配置（MinIO `[oss]` + gateway / worker） |
 | `docker/` | Registry / Gateway Dockerfile、`docker-compose.dev.yml`（含 MinIO） |
 | `Makefile` | `make build`、`make docker-build`、`make docker-up` 等 |

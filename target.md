@@ -1,8 +1,8 @@
 # Beenet —— 基于 CID 的分布式 Agent 任务网络
 
-> 文档版本：**v2.19（HTTP CID 拉取 + OSS S3 `upload`）**  
+> 文档版本：**v2.20（AI factor + CID hint 路由 + 本地 compose E2E）**  
 > 状态：M1 最短闭环已跑通（档 0 = Wasip2）；进入 M1.5 规划  
-> 说明：v2.19：`[worker].wasm_fetch_base` 在缓存未命中时 `GET {base}/{cid}` 拉取并 **CID 校验** 后写入 `wasm_cache`；**`beenet-pack upload`** 以 **S3 兼容 API** 上传至阿里云 OSS 等；manifest 仍 **内嵌 wasm**（与 v2.18 一致）。v2.18：`/v1/workers/heartbeat`。
+> 说明：v2.20：AI factor 已接入 Beenet factors；`usage` 增加 `ai_*` 计量字段；Worker 通过 `supported_cids` 上报 CID hint，Gateway 先过滤再轮询；本地 Docker compose 已验证 `registry / gateway / worker` E2E。v2.19：`[worker].wasm_fetch_base` 在缓存未命中时 `GET {base}/{cid}` 拉取并 **CID 校验** 后写入 `wasm_cache`；**`beenet-pack upload`** 以 **S3 兼容 API** 上传至阿里云 OSS 等；manifest 仍 **内嵌 wasm**（与 v2.18 一致）。v2.18：`/v1/workers/heartbeat`。
 
 ---
 
@@ -29,7 +29,7 @@ Beenet 是一个“寻址即计算”的去中心化任务网络：
 - 任务原子化与沙箱化。
 - 动态内容寻址（CID）。
 - 激活内网算力（libp2p + NAT/Relay 体系）。
-- stdout/stderr 与资源使用量结构化回传（**M1.5**：`InvokeResponse` 加 `stdout`/`stderr` 字段；M1 仅 worker 本地日志）。
+- stdout/stderr 与资源使用量结构化回传（`InvokeResponse` 已包含 `stdout`/`stderr`，`usage` 已包含 `ai_*` 字段）。
 
 ### 1.2 非功能目标
 
@@ -127,7 +127,7 @@ bill = base_fee + compute_fee + resource_fee
 - `RuntimeError` / `Timeout(exec)`：免 base，收 compute/resource
 - `LoadError` / `Rejected`：全免
 
-`usage` 字段（v2.9）包含：
+`usage` 字段（v2.20）包含：
 
 - `wall_ns`
 - `cpu_ns`
@@ -136,6 +136,10 @@ bill = base_fee + compute_fee + resource_fee
 - `chargeable_memory_mb`
 - `fd_writes`
 - `outbound_bytes`
+- `ai_infer_calls`
+- `ai_embedding_calls`
+- `ai_prompt_tokens`
+- `ai_generated_tokens`
 - `billable`
 
 ---
@@ -154,7 +158,7 @@ bill = base_fee + compute_fee + resource_fee
 
 ### 4.1 Worker 寻址与发现
 
-**当前工作区**：Gateway **仅** 通过 **`[gateway].registry_url`** 轮询 **`GET /v1/workers`** 获得可拨号的 Worker **dial_multiaddr**；Worker **必须** 对 Registry 的 **`POST /v1/workers/heartbeat`** 做 **周期性心跳**，以 **续租**（更新 `last_seen`，避免被当作离线剔除）。
+**当前工作区**：Gateway **仅** 通过 **`[gateway].registry_url`** 轮询 **`GET /v1/workers`** 获得可拨号的 Worker **dial_multiaddr**；Worker **必须** 对 Registry 的 **`POST /v1/workers/heartbeat`** 做 **周期性心跳**，以 **续租**（更新 `last_seen`，避免被当作离线剔除）。Worker 还会在注册信息里上报 `supported_cids`，Gateway 先做 CID hint 过滤，再在候选集里轮询。
 
 **术语**：**注册（入网）** 与 **心跳（续租）** 使用 **同一请求**；首次成功 POST 即完成入网，其后同 payload 的定时 POST 均为 **心跳**。
 
@@ -163,7 +167,7 @@ bill = base_fee + compute_fee + resource_fee
 **原则**（仍适用）：
 
 - **CID 不解决「找谁」**：「谁在线、拨谁」由 **Registry（及后续 DHT 兜底）** 与负载策略回答。
-- **与 M2 对齐**：按 **CID** 过滤副本、一致性哈希 LB、Registry 持久化与高可用等待办见 §5、§4.3「尚未覆盖」。
+- **与 M2 对齐**：`supported_cids` 只做 hint，一致性哈希 LB、Registry 持久化与高可用等待办见 §5、§4.3「尚未覆盖」。
 
 **分阶段（演进）**：
 
@@ -199,17 +203,17 @@ bill = base_fee + compute_fee + resource_fee
 
 | 组件 | 配置（`config.toml`） / 行为 |
 | --- | --- |
-| **Registry** | **`[registry]`**：`http_addr`（默认 `127.0.0.1:3030`）；`join_token`（必填）。`POST /v1/workers/heartbeat`：**心跳**载荷 `{ "join_token", "peer_id", "dial_multiaddr" }`（upsert + 续租 `last_seen`；校验 dial 含 `/p2p/<peer_id>`）。`GET /v1/workers` 返回租约仍有效的 Worker（内存表；约 **60s** 无心跳则剔除）。`GET /health`。 |
-| **Worker** | **`[worker]`**：`registry_url`、`join_token` 必填；`registry_heartbeat_secs`（默认 **20**）；`registry_heartbeat_path`（默认 **`/v1/workers/heartbeat`**）。`listen_addr` 控制监听 multiaddr，心跳体携带 `listen + /p2p/<local_peer_id>`。 |
-| **Gateway** | **`[gateway]`**：`registry_url` 必填；`registry_poll_ms`（默认 **2000**）轮询 `GET …/v1/workers`，维护 dial 列表并以 **轮询** 选 Worker 发起 libp2p invoke。 |
+| **Registry** | **`[registry]`**：`http_addr`（默认 `127.0.0.1:3030`）；`join_token`（必填）。`POST /v1/workers/heartbeat`：**心跳**载荷 `{ "join_token", "peer_id", "dial_multiaddr", "supported_cids" }`（upsert + 续租 `last_seen`；校验 dial 含 `/p2p/<peer_id>`）。`GET /v1/workers` 返回租约仍有效的 Worker（内存表；约 **60s** 无心跳则剔除）。`GET /health`。 |
+| **Worker** | **`[worker]`**：`registry_url`、`join_token` 必填；`registry_heartbeat_secs`（默认 **20**）；`registry_heartbeat_path`（默认 **`/v1/workers/heartbeat`**）。`listen_addr` 控制监听 multiaddr，心跳体携带 `listen + /p2p/<local_peer_id>`，并上报 `supported_cids`。 |
+| **Gateway** | **`[gateway]`**：`registry_url` 必填；`registry_poll_ms`（默认 **2000**）轮询 `GET …/v1/workers`，维护 dial 列表，先按 `supported_cids` 过滤，再以 **轮询** 选 Worker 发起 libp2p invoke。 |
 
-**尚未覆盖（仍归 M2/M3）**：按 CID 过滤副本、一致性哈希 LB、Registry 持久化与高可用、临时 token 颁发/吊销服务、DHT 兜底。
+**尚未覆盖（仍归 M2/M3）**：一致性哈希 LB、Registry 持久化与高可用、临时 token 颁发/吊销服务、DHT 兜底。
 
 ---
 
 ## 5. 负载均衡策略（M2）
 
-- 一致性哈希（按 CID）提高缓存命中。
+- `supported_cids` 已用于缩小候选 Worker 集，后续再做一致性哈希（按 CID）提高缓存命中。
 - 过载回退到 least-inflight。
 - 热点 CID 可做副本扩散与 hedged 请求（幂等前提下）。
 
@@ -252,11 +256,11 @@ bill = base_fee + compute_fee + resource_fee
 - `crates/beenet-proto`：`InvokeRequest` / `InvokeResponse` / `Status` / `Usage`，libp2p CBOR 上线。
 - `crates/beenet-manifest`：`beenet:manifest/v1` TOML schema + wasm custom section embed/extract。
 - `crates/beenet-pack`：`build` / `inspect` / **`upload`**（S3 兼容，含阿里云 OSS）。
-- `crates/beenet-factors`：扁平 `BeenetFactors`（Wasi/Variables/OutboundNetworking/OutboundHttp/Audit）。
+- `crates/beenet-factors`：扁平 `BeenetFactors`（Wasi/Variables/OutboundNetworking/OutboundHttp/Audit/AI）。
 - `crates/beenet-worker`：libp2p invoke + FactorsExecutor；Registry **心跳**；可选 **HTTP 拉取 wasm**（`[worker].wasm_fetch_base`）写本地缓存。
 - `crates/beenet-gateway`：HTTP `POST /run/ipfs/:cid` → libp2p；**轮询 Registry** 动态 Worker 列表（§4.3）。
 - `crates/beenet-registry`：HTTP 控制面 `POST /v1/workers/heartbeat`、`GET /v1/workers`、内存表 + 心跳剔除。
-- `examples/hello-filter-http`：`spin-sdk` 的 `#[http_component]` 示例任务。
+- `examples/hello-filter-http`：`spin-sdk` 的 `#[http_component]` 支持工单分类示例任务。
 
 规划中：
 
@@ -272,7 +276,7 @@ bill = base_fee + compute_fee + resource_fee
 3. `beenet-pack build` 输出 `task.wasm`。
 4. 计算 CID 并发布。
 5. Gateway/Agent 调用 `cid`。
-6. Worker 执行并回传 body + usage。
+6. Worker 执行并回传 body + usage（含 AI 计量字段）。
 
 ---
 
@@ -294,10 +298,10 @@ bill = base_fee + compute_fee + resource_fee
   - 接 `BeenetFactors`（扁平 `RuntimeFactors`，D3）：`WasiFactor` / `VariablesFactor` / `OutboundNetworkingFactor` / `OutboundHttpFactor` + `AuditFactor`。
   - 让 D6（默认拒绝出网）在 linker 级真正生效（M1 仅靠"不主动挂 `wasi:sockets`"兜底，M1.5 由 OutboundNetworkingFactor 主动钳制）。
   - 接 `MaxInstanceMemoryHook` + `StoreLimits`，让 D14 L1/L2 真正 apply。
-  - `InvokeResponse` wire 扩展 `stdout` / `stderr`（或可选 `log_blob_ref` 走外挂存储）。
+  - `InvokeResponse` wire 扩展 `stdout` / `stderr`（已落地），并把 `usage` 固定为含 AI 计量字段的版本。
   - pin 落实 D10 的 spin commit（首次真正引入 `spin-*` 依赖）。
   - **（可选并行）Gateway→Worker 发现前置**：见 §4.1——bootstrap / mDNS 等与 HTTP Registry **并存**时的角色划分；按 CID 的正式选路仍归 M2。
-- **M2**：在 **§4.3 HTTP Registry（Peer 列表 + join token + 心跳租约）** 之上，补齐 **按 CID 索引副本**、**DHT/发现兜底**、**LB（一致性哈希 + least-inflight）**。
+- **M2**：在 **§4.3 HTTP Registry（Peer 列表 + join token + 心跳租约 + supported_cids hint）** 之上，补齐 **一致性哈希 + least-inflight**、**DHT/发现兜底**。
 - **M2.5**：`beenet:task/runner@0.1` WIT 草案（档 1 预览）。
 - **M3**：IPFS Loader + 原生 `beenet-sdk`（档 1 正式）。
 - **M4**：生产化（鉴权、计费、可观测、流式、fuel 计量）。
@@ -372,6 +376,7 @@ bill = base_fee + compute_fee + resource_fee
 
 ## Changelog
 
+- v2.20：AI factor 接入，`usage` 增补 `ai_*` 字段；worker/registry/gateway 通过 `supported_cids` 做 CID hint 路由；示例任务改为 support-ticket classifier；本地 Docker compose E2E 跑通。
 - v2.19：`[worker].wasm_fetch_base`（`GET {base}/{cid}` + CID 校验）；**`beenet-pack upload`**（`aws-sdk-s3`，阿里云 OSS 等）；§3.1 / §7 同步。
 - v2.18：Registry Worker API 路径 **`POST /v1/workers/heartbeat`**（替代 `/v1/workers/register`）；`[worker].registry_heartbeat_path`（曾用 `BEENET_REGISTRY_HEARTBEAT_PATH`；替代 `BEENET_REGISTRY_REGISTER_PATH`）。
 - v2.17：文档统一「**心跳 / 续租**」措辞；代码侧 **移除 `BEENET_WORKER_ADDR`**，Gateway/Worker **必须** 配置 Registry URL；§4.1 重写为与 §4.3 一致。
