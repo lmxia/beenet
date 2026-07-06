@@ -97,6 +97,7 @@ spin-core = { path = "../spin/crates/core" }
 spin-factors = { path = "../spin/crates/factors" }
 spin-factors-executor = { path = "../spin/crates/factors-executor" }
 spin-locked-app = { path = "../spin/crates/locked-app" }
+spin-world = { path = "../spin/crates/world" }
 spin-factor-wasi = { path = "../spin/crates/factor-wasi" }
 spin-factor-variables = { path = "../spin/crates/factor-variables" }
 spin-factor-outbound-networking = { path = "../spin/crates/factor-outbound-networking" }

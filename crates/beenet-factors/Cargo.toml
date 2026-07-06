@@ -15,6 +15,9 @@ spin-factor-outbound-http = { workspace = true }
 spin-factor-outbound-networking = { workspace = true }
 spin-factor-variables = { workspace = true }
 spin-factor-wasi = { workspace = true }
+spin-core = { workspace = true }
 spin-factors = { workspace = true }
 spin-locked-app = { workspace = true }
+spin-world = { workspace = true }
+async-trait = { workspace = true }
 tracing = { workspace = true }

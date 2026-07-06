@@ -24,6 +24,8 @@ pub struct Manifest {
     #[serde(default)]
     pub networking: Networking,
     #[serde(default)]
+    pub ai: Ai,
+    #[serde(default)]
     pub audit: Audit,
 }
 
@@ -59,6 +61,12 @@ impl Default for Runtime {
 pub struct Networking {
     #[serde(default)]
     pub allowed_outbound_hosts: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct Ai {
+    #[serde(default)]
+    pub allowed_models: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -192,6 +200,7 @@ mod tests {
                 fuel_limit: None,
             },
             networking: Networking::default(),
+            ai: Ai::default(),
             audit: Audit::default(),
         }
     }

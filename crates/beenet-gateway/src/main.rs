@@ -145,7 +145,7 @@ async fn main() -> Result<()> {
         );
     };
 
-    let worker_addrs: Arc<RwLock<Vec<Multiaddr>>> = Arc::new(RwLock::new(Vec::new()));
+    let worker_addrs: Arc<RwLock<Vec<WorkerListEntry>>> = Arc::new(RwLock::new(Vec::new()));
     tokio::spawn(registry_poll_loop(
         settings.registry_url.clone(),
         settings.registry_poll_ms,
@@ -270,15 +270,18 @@ struct WorkersListBody {
     workers: Vec<WorkerListEntry>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq)]
 struct WorkerListEntry {
+    peer_id: String,
     dial_multiaddr: String,
+    #[serde(default)]
+    supported_cids: Vec<String>,
 }
 
 async fn registry_poll_loop(
     registry_base: String,
     period_ms: u64,
-    out: Arc<RwLock<Vec<Multiaddr>>>,
+    out: Arc<RwLock<Vec<WorkerListEntry>>>,
 ) {
     let client = reqwest::Client::new();
     let url = format!("{}/v1/workers", registry_base.trim_end_matches('/'));
@@ -288,10 +291,10 @@ async fn registry_poll_loop(
         match client.get(&url).send().await {
             Ok(resp) if resp.status().is_success() => match resp.json::<WorkersListBody>().await {
                 Ok(body) => {
-                    let parsed: Vec<Multiaddr> = body
+                    let parsed: Vec<WorkerListEntry> = body
                         .workers
                         .into_iter()
-                        .filter_map(|w| w.dial_multiaddr.parse().ok())
+                        .filter(|w| w.dial_multiaddr.parse::<Multiaddr>().is_ok())
                         .collect();
                     let mut guard = out.write().await;
                     if guard.len() != parsed.len()
@@ -310,7 +313,7 @@ async fn registry_poll_loop(
 }
 
 async fn run_swarm_loop(
-    worker_addrs: Arc<RwLock<Vec<Multiaddr>>>,
+    worker_addrs: Arc<RwLock<Vec<WorkerListEntry>>>,
     mut cmd_rx: mpsc::Receiver<Command>,
     mut swarm: libp2p::Swarm<GatewayBehaviour>,
 ) {
@@ -321,8 +324,18 @@ async fn run_swarm_loop(
     loop {
         tokio::select! {
             Some(cmd) = cmd_rx.recv() => {
-                let addrs = worker_addrs.read().await.clone();
-                if addrs.is_empty() {
+                let workers = worker_addrs.read().await.clone();
+                let mut candidates: Vec<WorkerListEntry> = workers
+                    .iter()
+                    .filter(|w| {
+                        w.supported_cids.is_empty() || w.supported_cids.iter().any(|cid| cid == &cmd.req.cid.to_string())
+                    })
+                    .cloned()
+                    .collect();
+                if candidates.is_empty() {
+                    candidates = workers;
+                }
+                if candidates.is_empty() {
                     let _ = cmd.respond_to.send(InvokeResponse {
                         request_id: cmd.req.request_id,
                         status: Status::LoadError {
@@ -336,8 +349,24 @@ async fn run_swarm_loop(
                     });
                     continue;
                 }
-                let idx = rr.fetch_add(1, Ordering::Relaxed) % addrs.len();
-                let worker_addr = addrs[idx].clone();
+                let idx = rr.fetch_add(1, Ordering::Relaxed) % candidates.len();
+                let worker = candidates[idx].clone();
+                let worker_addr: Multiaddr = match worker.dial_multiaddr.parse() {
+                    Ok(addr) => addr,
+                    Err(err) => {
+                        let _ = cmd.respond_to.send(InvokeResponse {
+                            request_id: cmd.req.request_id,
+                            status: Status::RuntimeError {
+                                reason: format!("invalid worker multiaddr in registry: {err}"),
+                            },
+                            body: Vec::new(),
+                            stdout: String::new(),
+                            stderr: String::new(),
+                            usage: Usage::default(),
+                        });
+                        continue;
+                    }
+                };
                 let worker_peer = match peer_id_from_multiaddr(&worker_addr) {
                     Ok(p) => p,
                     Err(err) => {

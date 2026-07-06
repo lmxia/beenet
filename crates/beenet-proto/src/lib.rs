@@ -71,6 +71,10 @@ pub struct Usage {
     pub chargeable_memory_mb: u32,
     pub fd_writes: u32,
     pub outbound_bytes: u64,
+    pub ai_infer_calls: u32,
+    pub ai_embedding_calls: u32,
+    pub ai_prompt_tokens: u32,
+    pub ai_generated_tokens: u32,
     pub billable: bool,
 }
 

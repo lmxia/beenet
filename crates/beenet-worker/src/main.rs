@@ -98,6 +98,7 @@ pub struct TaskEntry {
     pub manifest: Manifest,
     pub factors_app: Arc<spin_factors_executor::FactorsExecutorApp<BeenetFactors, ()>>,
     pub component_id: String,
+    pub supported_cids: Vec<String>,
 }
 
 struct Runtime {
@@ -178,6 +179,10 @@ impl Runtime {
                     stderr: String::new(),
                     usage: Usage {
                         wall_ns: started.elapsed().as_nanos() as u64,
+                        ai_infer_calls: 0,
+                        ai_embedding_calls: 0,
+                        ai_prompt_tokens: 0,
+                        ai_generated_tokens: 0,
                         billable: false,
                         ..Usage::default()
                     },
@@ -207,6 +212,10 @@ impl Runtime {
                     stderr: String::new(),
                     usage: Usage {
                         wall_ns: started.elapsed().as_nanos() as u64,
+                        ai_infer_calls: 0,
+                        ai_embedding_calls: 0,
+                        ai_prompt_tokens: 0,
+                        ai_generated_tokens: 0,
                         billable: true,
                         ..Usage::default()
                     },
@@ -230,6 +239,10 @@ impl Runtime {
                     stderr: String::new(),
                     usage: Usage {
                         wall_ns: started.elapsed().as_nanos() as u64,
+                        ai_infer_calls: 0,
+                        ai_embedding_calls: 0,
+                        ai_prompt_tokens: 0,
+                        ai_generated_tokens: 0,
                         billable: false,
                         ..Usage::default()
                     },
@@ -284,6 +297,10 @@ impl Runtime {
                     usage: Usage {
                         wall_ns: started.elapsed().as_nanos() as u64,
                         chargeable_memory_mb,
+                        ai_infer_calls: 0,
+                        ai_embedding_calls: 0,
+                        ai_prompt_tokens: 0,
+                        ai_generated_tokens: 0,
                         billable: true,
                         ..Usage::default()
                     },
@@ -301,6 +318,10 @@ impl Runtime {
                     usage: Usage {
                         wall_ns: started.elapsed().as_nanos() as u64,
                         chargeable_memory_mb,
+                        ai_infer_calls: 0,
+                        ai_embedding_calls: 0,
+                        ai_prompt_tokens: 0,
+                        ai_generated_tokens: 0,
                         billable: true,
                         ..Usage::default()
                     },
@@ -314,6 +335,7 @@ impl Runtime {
             stdout,
             stderr,
             mem_bytes,
+            ai_usage,
         } = outcome;
 
         if !stdout.is_empty() {
@@ -327,6 +349,10 @@ impl Runtime {
             wall_ns: started.elapsed().as_nanos() as u64,
             mem_bytes,
             chargeable_memory_mb,
+            ai_infer_calls: ai_usage.infer_calls,
+            ai_embedding_calls: ai_usage.embedding_calls,
+            ai_prompt_tokens: ai_usage.prompt_tokens,
+            ai_generated_tokens: ai_usage.generated_tokens,
             billable: status.is_billable_compute(),
             ..Usage::default()
         };
@@ -339,6 +365,15 @@ impl Runtime {
             stderr,
             usage,
         })
+    }
+
+    async fn supported_cids(&self) -> Vec<String> {
+        self.cache
+            .read()
+            .await
+            .keys()
+            .map(ToString::to_string)
+            .collect()
     }
 
     async fn load_task(&self, cid: &BeenetCid) -> Result<Arc<TaskEntry>> {
@@ -368,6 +403,7 @@ impl Runtime {
             manifest,
             factors_app,
             component_id,
+            supported_cids: vec![cid.to_string()],
         });
         self.cache.write().await.insert(cid.clone(), entry.clone());
         Ok(entry)
@@ -500,6 +536,7 @@ struct JoinBody {
     dial_multiaddr: String,
     timestamp_secs: u64,
     signature: String,
+    supported_cids: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -513,6 +550,7 @@ struct HeartbeatBody {
     dial_multiaddr: String,
     timestamp_secs: u64,
     signature: String,
+    supported_cids: Vec<String>,
 }
 
 // ── Registration & heartbeat logic ────────────────────────────────────────
@@ -524,6 +562,7 @@ async fn do_join(
     keypair: &identity::Keypair,
     peer_id: &str,
     dial_multiaddr: &str,
+    supported_cids: Vec<String>,
     join_token: &str,
 ) -> Result<()> {
     let ts = unix_secs_now();
@@ -536,6 +575,7 @@ async fn do_join(
         dial_multiaddr: dial_multiaddr.to_owned(),
         timestamp_secs: ts,
         signature: sig,
+        supported_cids,
     };
     let resp = http
         .post(join_url)
@@ -563,6 +603,7 @@ async fn do_heartbeat(
     keypair: &identity::Keypair,
     peer_id: &str,
     dial_multiaddr: &str,
+    supported_cids: Vec<String>,
 ) -> Result<bool> {
     let ts = unix_secs_now();
     let sig = make_signature(keypair, peer_id, dial_multiaddr, ts)?;
@@ -571,6 +612,7 @@ async fn do_heartbeat(
         dial_multiaddr: dial_multiaddr.to_owned(),
         timestamp_secs: ts,
         signature: sig,
+        supported_cids,
     };
     let resp = http
         .post(heartbeat_url)
@@ -596,13 +638,15 @@ async fn registry_heartbeat_loop(
     keypair: Arc<identity::Keypair>,
     peer_id: String,
     dial_multiaddr: String,
+    runtime: Arc<Runtime>,
     period: Duration,
     join_token: Option<String>,
 ) {
     let mut interval = tokio::time::interval(period);
     loop {
         interval.tick().await;
-        match do_heartbeat(&http, &heartbeat_url, &keypair, &peer_id, &dial_multiaddr).await {
+        let supported_cids = runtime.supported_cids().await;
+        match do_heartbeat(&http, &heartbeat_url, &keypair, &peer_id, &dial_multiaddr, supported_cids.clone()).await {
             Ok(true) => {
                 info!("registry heartbeat ok");
             }
@@ -611,7 +655,7 @@ async fn registry_heartbeat_loop(
                 warn!("heartbeat rejected (unregistered); attempting re-join");
                 if let Some(ref token) = join_token {
                     if let Err(e) =
-                        do_join(&http, &join_url, &keypair, &peer_id, &dial_multiaddr, token).await
+                        do_join(&http, &join_url, &keypair, &peer_id, &dial_multiaddr, supported_cids, token).await
                     {
                         warn!(error = %e, "re-join failed");
                     }
@@ -733,14 +777,15 @@ async fn main() -> Result<()> {
     let dial_owned = dial_str.clone();
 
     // Initial registration: try heartbeat first; if unregistered, attempt join.
-    match do_heartbeat(&http, &heartbeat_url, &keypair_arc, &peer_s, &dial_owned).await {
+    let initial_supported_cids = runtime.supported_cids().await;
+    match do_heartbeat(&http, &heartbeat_url, &keypair_arc, &peer_s, &dial_owned, initial_supported_cids.clone()).await {
         Ok(true) => {
             info!(peer_id = %local_peer_id, "worker already registered with registry");
         }
         Ok(false) => {
             // Not yet registered — join now.
             if let Some(ref token) = settings.join_token {
-                do_join(&http, &join_url, &keypair_arc, &peer_s, &dial_owned, token)
+                do_join(&http, &join_url, &keypair_arc, &peer_s, &dial_owned, initial_supported_cids, token)
                     .await
                     .context("initial worker registration failed")?;
             } else {
@@ -765,6 +810,7 @@ async fn main() -> Result<()> {
         keypair_arc,
         peer_s,
         dial_owned,
+        runtime.clone(),
         period,
         join_token,
     ));

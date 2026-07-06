@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
-use beenet_factors::BeenetFactors;
+use beenet_factors::{ai_usage_snapshot, AiUsageSnapshot, BeenetFactors};
 use beenet_proto::{InvokeRequest, Status};
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
@@ -26,6 +26,7 @@ pub struct ExecOutcome {
     pub stdout: String,
     pub stderr: String,
     pub mem_bytes: u64,
+    pub ai_usage: AiUsageSnapshot,
 }
 
 /// Run one HTTP invoke against a prepared Spin factors app (single `http` component).
@@ -36,6 +37,7 @@ pub async fn invoke_prepared(
     deadline_ms: u32,
     max_memory_bytes: usize,
 ) -> Result<ExecOutcome> {
+    let ai_before = ai_usage_snapshot();
     let stdout_pipe = MemoryOutputPipe::new(64 * 1024);
     let stderr_pipe = MemoryOutputPipe::new(64 * 1024);
 
@@ -97,6 +99,7 @@ pub async fn invoke_prepared(
                 stdout_pipe,
                 stderr_pipe,
                 mem,
+                ai_before,
             ))
         }
         Ok(Err(err)) => {
@@ -109,6 +112,7 @@ pub async fn invoke_prepared(
                 stdout: drain_pipe_truncated(&stdout_pipe),
                 stderr: drain_pipe_truncated(&stderr_pipe),
                 mem_bytes: 0,
+                ai_usage: ai_usage_snapshot().delta_since(ai_before),
             })
         }
         Err(_) => match task.await {
@@ -156,6 +160,7 @@ fn finalise(
     stdout_pipe: MemoryOutputPipe,
     stderr_pipe: MemoryOutputPipe,
     mem_bytes: u64,
+    ai_before: AiUsageSnapshot,
 ) -> ExecOutcome {
     let status = match http_status {
         200..=299 => Status::Ok,
@@ -176,6 +181,7 @@ fn finalise(
         stdout: drain_pipe_truncated(&stdout_pipe),
         stderr: drain_pipe_truncated(&stderr_pipe),
         mem_bytes,
+        ai_usage: ai_usage_snapshot().delta_since(ai_before),
     }
 }
 
@@ -226,6 +232,7 @@ pub async fn load_factors_app(
     let locked = beenet_factors::locked_app_single_http_component(
         &cid.to_string(),
         &manifest.networking.allowed_outbound_hosts,
+        &manifest.ai.allowed_models,
     )?;
     let app = App::new("beenet-task", locked);
     let app_loaded = executor

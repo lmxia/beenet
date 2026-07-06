@@ -95,6 +95,8 @@ struct RedisRegistration {
     public_key_b64: String,
     dial_multiaddr: String,
     registered_at_unix_ms: u64,
+    #[serde(default)]
+    supported_cids: Vec<String>,
 }
 
 /// Upsert one registration into Redis (`HSET beenet:registrations <peer_id> <json>`).
@@ -107,6 +109,7 @@ async fn redis_put(
         public_key_b64: STANDARD.encode(rec.public_key.encode_protobuf()),
         dial_multiaddr: rec.dial_multiaddr.clone(),
         registered_at_unix_ms: rec.registered_at_unix_ms,
+        supported_cids: rec.supported_cids.clone(),
     };
     let json = match serde_json::to_string(&value) {
         Ok(j) => j,
@@ -180,6 +183,7 @@ async fn redis_load_all(
                 public_key,
                 dial_multiaddr: r.dial_multiaddr,
                 registered_at_unix_ms: r.registered_at_unix_ms,
+                supported_cids: r.supported_cids,
             },
         );
     }
@@ -210,6 +214,7 @@ struct RegistrationRecord {
     public_key: identity::PublicKey,
     dial_multiaddr: String,
     registered_at_unix_ms: u64,
+    supported_cids: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -261,6 +266,8 @@ struct RegistrationView {
     peer_id: String,
     dial_multiaddr: String,
     registered_at_unix_ms: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    supported_cids: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -285,6 +292,8 @@ struct JoinBody {
     timestamp_secs: u64,
     /// Ed25519 signature over `"{peer_id}\n{dial_multiaddr}\n{timestamp_secs}"`, base64-encoded.
     signature: String,
+    #[serde(default)]
+    supported_cids: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -300,6 +309,8 @@ struct HeartbeatBody {
     timestamp_secs: u64,
     /// Ed25519 signature over `"{peer_id}\n{dial_multiaddr}\n{timestamp_secs}"`, base64-encoded.
     signature: String,
+    #[serde(default)]
+    supported_cids: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -317,6 +328,8 @@ struct WorkerView {
     peer_id: String,
     dial_multiaddr: String,
     last_seen_unix_ms: u128,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    supported_cids: Vec<String>,
 }
 
 // ── Signature helpers ──────────────────────────────────────────────────────
@@ -436,6 +449,7 @@ async fn list_registrations(State(state): State<AppState>) -> impl IntoResponse 
             peer_id: pid.to_string(),
             dial_multiaddr: rec.dial_multiaddr.clone(),
             registered_at_unix_ms: rec.registered_at_unix_ms,
+            supported_cids: rec.supported_cids.clone(),
         })
         .collect();
     registrations.sort_by_key(|r| r.registered_at_unix_ms);
@@ -536,6 +550,7 @@ async fn post_join(
         public_key: pubkey,
         dial_multiaddr: body.dial_multiaddr.clone(),
         registered_at_unix_ms: unix_ms_now(),
+        supported_cids: body.supported_cids.clone(),
     };
     redis_put(&mut state.redis, &claimed_peer_id, &rec).await;
     state.registered.write().await.insert(claimed_peer_id, rec);
@@ -594,6 +609,9 @@ async fn post_heartbeat(
             last_seen: Instant::now(),
         },
     );
+    if let Some(rec) = state.registered.write().await.get_mut(&pid) {
+        rec.supported_cids = body.supported_cids.clone();
+    }
     info!(peer_id = %pid, "worker heartbeat ok (lease renewed)");
     (StatusCode::OK, Json(HeartbeatOkResponse { ok: true })).into_response()
 }
@@ -613,6 +631,13 @@ async fn get_workers(State(state): State<AppState>) -> impl IntoResponse {
                 peer_id: pid.to_string(),
                 dial_multiaddr: rec.dial_multiaddr.clone(),
                 last_seen_unix_ms,
+                supported_cids: state
+                    .registered
+                    .read()
+                    .await
+                    .get(pid)
+                    .map(|r| r.supported_cids.clone())
+                    .unwrap_or_default(),
             });
         }
     }

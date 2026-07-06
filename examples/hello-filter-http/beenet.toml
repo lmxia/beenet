@@ -12,5 +12,8 @@ deadline_ms = 5000
 [networking]
 allowed_outbound_hosts = []
 
+[ai]
+allowed_models = ["ticket-triage-v1"]
+
 [audit]
 cpu_reporting = "wall"
