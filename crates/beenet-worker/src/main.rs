@@ -6,22 +6,20 @@ mod executor;
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD, Engine};
-use beenet_common::config::{
-    resolve_config_path_with_cli, WorkerCliOverrides, WorkerSettings,
-};
+use beenet_common::config::{resolve_config_path_with_cli, WorkerCliOverrides, WorkerSettings};
 use beenet_common::{BeenetCid, INVOKE_PROTOCOL};
 use beenet_factors::BeenetFactors;
 use beenet_manifest::Manifest;
 use beenet_proto::{InvokeRequest, InvokeResponse, LoadStage, Status, TimeoutStage, Usage};
 use clap::Parser;
 use futures::StreamExt;
-use libp2p::core::multiaddr::Protocol;
 use libp2p::request_response::{self, ProtocolSupport};
 use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
 use libp2p::{identify, identity, ping, Multiaddr, PeerId, StreamProtocol, SwarmBuilder};
@@ -29,8 +27,8 @@ use serde::{Deserialize, Serialize};
 use spin_app::AppComponent;
 use spin_core::wasmtime::component::Component;
 use spin_factors_executor::{ComponentLoader, FactorsExecutor};
-use tokio::sync::{RwLock, Semaphore};
-use tracing::{error, info, warn};
+use tokio::sync::{watch, RwLock, Semaphore};
+use tracing::{info, warn};
 
 use crate::executor::{invoke_prepared, load_factors_app, ExecOutcome};
 
@@ -125,12 +123,10 @@ impl ComponentLoader<BeenetFactors, ()> for BeenetComponentLoader {
         engine: &spin_core::wasmtime::Engine,
         component: &AppComponent,
     ) -> anyhow::Result<Component> {
-        let path = self
-            .wasm_cache_dir
-            .join(format!("{}.wasm", component.id()));
+        let path = self.wasm_cache_dir.join(format!("{}.wasm", component.id()));
         // 我们这里不是composed，区别于spin 原生的，带有依赖管理的components。
-        let wasm = fs::read(&path)
-            .map_err(|e| anyhow::anyhow!("read wasm `{}`: {e}", path.display()))?;
+        let wasm =
+            fs::read(&path).map_err(|e| anyhow::anyhow!("read wasm `{}`: {e}", path.display()))?;
         Component::new(engine, &wasm).map_err(|e| anyhow::anyhow!("compile component: {e}"))
     }
 }
@@ -150,10 +146,7 @@ impl Runtime {
                 .as_ref()
                 .map(|x| x.trim().to_string())
                 .filter(|x| !x.is_empty()),
-            wasm_fetch_bearer: s
-                .wasm_fetch_bearer
-                .clone()
-                .filter(|x| !x.trim().is_empty()),
+            wasm_fetch_bearer: s.wasm_fetch_bearer.clone().filter(|x| !x.trim().is_empty()),
             wasm_fetch_timeout: Duration::from_secs(s.wasm_fetch_timeout_secs.max(1)),
             default_deadline_ms: s.default_deadline_ms,
             default_memory_mb: s.default_memory_mb,
@@ -262,7 +255,9 @@ impl Runtime {
             .max_memory_mb
             .unwrap_or(self.default_memory_mb)
             .min(self.max_instance_memory_mb);
-        let max_memory_bytes = (chargeable_memory_mb as usize).saturating_mul(1024 * 1024).max(1);
+        let max_memory_bytes = (chargeable_memory_mb as usize)
+            .saturating_mul(1024 * 1024)
+            .max(1);
 
         let invoke_fut = invoke_prepared(
             entry.factors_app.as_ref(),
@@ -272,62 +267,59 @@ impl Runtime {
             max_memory_bytes,
         );
 
-        let outcome = match tokio::time::timeout(
-            Duration::from_millis(deadline_ms as u64),
-            invoke_fut,
-        )
-        .await
-        {
-            Ok(Ok(v)) => v,
-            Ok(Err(err)) => {
-                warn!(
-                    cid = %req.cid,
-                    request_id = %req.request_id,
-                    error = %err,
-                    "executor invoke returned error"
-                );
-                return Ok(InvokeResponse {
-                    request_id: req.request_id.clone(),
-                    status: Status::RuntimeError {
-                        reason: err.to_string(),
-                    },
-                    body: Vec::new(),
-                    stdout: String::new(),
-                    stderr: String::new(),
-                    usage: Usage {
-                        wall_ns: started.elapsed().as_nanos() as u64,
-                        chargeable_memory_mb,
-                        ai_infer_calls: 0,
-                        ai_embedding_calls: 0,
-                        ai_prompt_tokens: 0,
-                        ai_generated_tokens: 0,
-                        billable: true,
-                        ..Usage::default()
-                    },
-                });
-            }
-            Err(_) => {
-                return Ok(InvokeResponse {
-                    request_id: req.request_id.clone(),
-                    status: Status::Timeout {
-                        stage: TimeoutStage::Exec,
-                    },
-                    body: Vec::new(),
-                    stdout: String::new(),
-                    stderr: String::new(),
-                    usage: Usage {
-                        wall_ns: started.elapsed().as_nanos() as u64,
-                        chargeable_memory_mb,
-                        ai_infer_calls: 0,
-                        ai_embedding_calls: 0,
-                        ai_prompt_tokens: 0,
-                        ai_generated_tokens: 0,
-                        billable: true,
-                        ..Usage::default()
-                    },
-                });
-            }
-        };
+        let outcome =
+            match tokio::time::timeout(Duration::from_millis(deadline_ms as u64), invoke_fut).await
+            {
+                Ok(Ok(v)) => v,
+                Ok(Err(err)) => {
+                    warn!(
+                        cid = %req.cid,
+                        request_id = %req.request_id,
+                        error = %err,
+                        "executor invoke returned error"
+                    );
+                    return Ok(InvokeResponse {
+                        request_id: req.request_id.clone(),
+                        status: Status::RuntimeError {
+                            reason: err.to_string(),
+                        },
+                        body: Vec::new(),
+                        stdout: String::new(),
+                        stderr: String::new(),
+                        usage: Usage {
+                            wall_ns: started.elapsed().as_nanos() as u64,
+                            chargeable_memory_mb,
+                            ai_infer_calls: 0,
+                            ai_embedding_calls: 0,
+                            ai_prompt_tokens: 0,
+                            ai_generated_tokens: 0,
+                            billable: true,
+                            ..Usage::default()
+                        },
+                    });
+                }
+                Err(_) => {
+                    return Ok(InvokeResponse {
+                        request_id: req.request_id.clone(),
+                        status: Status::Timeout {
+                            stage: TimeoutStage::Exec,
+                        },
+                        body: Vec::new(),
+                        stdout: String::new(),
+                        stderr: String::new(),
+                        usage: Usage {
+                            wall_ns: started.elapsed().as_nanos() as u64,
+                            chargeable_memory_mb,
+                            ai_infer_calls: 0,
+                            ai_embedding_calls: 0,
+                            ai_prompt_tokens: 0,
+                            ai_generated_tokens: 0,
+                            billable: true,
+                            ..Usage::default()
+                        },
+                    });
+                }
+            };
 
         let ExecOutcome {
             status,
@@ -367,13 +359,39 @@ impl Runtime {
         })
     }
 
-    async fn supported_cids(&self) -> Vec<String> {
-        self.cache
+    /// CIDs present on disk under `wasm_cache_dir` (servable / "cold or warm").
+    fn supported_cids_on_disk(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        let Ok(entries) = fs::read_dir(&self.wasm_cache_dir) else {
+            return out;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("wasm") {
+                continue;
+            }
+            if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                if stem.starts_with("bafy") || stem.starts_with("bafk") {
+                    out.push(stem.to_string());
+                }
+            }
+        }
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    /// CIDs currently loaded in the in-memory runtime cache ("hot").
+    async fn loaded_cids(&self) -> Vec<String> {
+        let mut out: Vec<String> = self
+            .cache
             .read()
             .await
             .keys()
             .map(ToString::to_string)
-            .collect()
+            .collect();
+        out.sort();
+        out
     }
 
     async fn load_task(&self, cid: &BeenetCid) -> Result<Arc<TaskEntry>> {
@@ -390,14 +408,9 @@ impl Runtime {
         let loader = BeenetComponentLoader {
             wasm_cache_dir: self.wasm_cache_dir.clone(),
         };
-        let factors_app = load_factors_app(
-            self.factors_executor.clone(),
-            cid,
-            &manifest,
-            &loader,
-        )
-        .await
-        .context("load_factors_app failed")?;
+        let factors_app = load_factors_app(self.factors_executor.clone(), cid, &manifest, &loader)
+            .await
+            .context("load_factors_app failed")?;
         let component_id = cid.to_string();
         let entry = Arc::new(TaskEntry {
             manifest,
@@ -436,11 +449,7 @@ impl Runtime {
         }
         let resp = req.send().await.with_context(|| format!("GET {url}"))?;
         if !resp.status().is_success() {
-            anyhow::bail!(
-                "wasm fetch from {} returned HTTP {}",
-                url,
-                resp.status()
-            );
+            anyhow::bail!("wasm fetch from {} returned HTTP {}", url, resp.status());
         }
         let bytes = resp.bytes().await.context("wasm fetch read body")?;
         if bytes.is_empty() {
@@ -451,8 +460,7 @@ impl Runtime {
             anyhow::bail!("wasm content CID mismatch: expected {cid}, got {got} (check object key and corruption)");
         }
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("create `{}`", parent.display()))?;
+            fs::create_dir_all(parent).with_context(|| format!("create `{}`", parent.display()))?;
         }
         fs::write(&path, &bytes).with_context(|| format!("write `{}`", path.display()))?;
         info!(path = %path.display(), %cid, "wasm stored in cache after fetch");
@@ -509,10 +517,9 @@ fn load_or_create_keypair(wasm_cache_dir: &PathBuf) -> Result<identity::Keypair>
 fn make_signature(
     keypair: &identity::Keypair,
     peer_id: &str,
-    dial_multiaddr: &str,
     timestamp_secs: u64,
 ) -> Result<String> {
-    let msg = format!("{peer_id}\n{dial_multiaddr}\n{timestamp_secs}");
+    let msg = format!("{peer_id}\n{timestamp_secs}");
     let sig = keypair
         .sign(msg.as_bytes())
         .map_err(|e| anyhow::anyhow!("signing failed: {e}"))?;
@@ -533,10 +540,10 @@ struct JoinBody {
     join_token: String,
     peer_id: String,
     public_key: String,
-    dial_multiaddr: String,
     timestamp_secs: u64,
     signature: String,
     supported_cids: Vec<String>,
+    loaded_cids: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -547,10 +554,10 @@ struct JoinResponse {
 #[derive(Serialize)]
 struct HeartbeatBody {
     peer_id: String,
-    dial_multiaddr: String,
     timestamp_secs: u64,
     signature: String,
     supported_cids: Vec<String>,
+    loaded_cids: Vec<String>,
 }
 
 // ── Registration & heartbeat logic ────────────────────────────────────────
@@ -561,21 +568,21 @@ async fn do_join(
     join_url: &str,
     keypair: &identity::Keypair,
     peer_id: &str,
-    dial_multiaddr: &str,
     supported_cids: Vec<String>,
+    loaded_cids: Vec<String>,
     join_token: &str,
 ) -> Result<()> {
     let ts = unix_secs_now();
-    let sig = make_signature(keypair, peer_id, dial_multiaddr, ts)?;
+    let sig = make_signature(keypair, peer_id, ts)?;
     let pubkey_bytes = keypair.public().encode_protobuf();
     let body = JoinBody {
         join_token: join_token.to_owned(),
         peer_id: peer_id.to_owned(),
         public_key: STANDARD.encode(&pubkey_bytes),
-        dial_multiaddr: dial_multiaddr.to_owned(),
         timestamp_secs: ts,
         signature: sig,
         supported_cids,
+        loaded_cids,
     };
     let resp = http
         .post(join_url)
@@ -602,17 +609,17 @@ async fn do_heartbeat(
     heartbeat_url: &str,
     keypair: &identity::Keypair,
     peer_id: &str,
-    dial_multiaddr: &str,
     supported_cids: Vec<String>,
+    loaded_cids: Vec<String>,
 ) -> Result<bool> {
     let ts = unix_secs_now();
-    let sig = make_signature(keypair, peer_id, dial_multiaddr, ts)?;
+    let sig = make_signature(keypair, peer_id, ts)?;
     let body = HeartbeatBody {
         peer_id: peer_id.to_owned(),
-        dial_multiaddr: dial_multiaddr.to_owned(),
         timestamp_secs: ts,
         signature: sig,
         supported_cids,
+        loaded_cids,
     };
     let resp = http
         .post(heartbeat_url)
@@ -637,7 +644,6 @@ async fn registry_heartbeat_loop(
     join_url: String,
     keypair: Arc<identity::Keypair>,
     peer_id: String,
-    dial_multiaddr: String,
     runtime: Arc<Runtime>,
     period: Duration,
     join_token: Option<String>,
@@ -645,8 +651,18 @@ async fn registry_heartbeat_loop(
     let mut interval = tokio::time::interval(period);
     loop {
         interval.tick().await;
-        let supported_cids = runtime.supported_cids().await;
-        match do_heartbeat(&http, &heartbeat_url, &keypair, &peer_id, &dial_multiaddr, supported_cids.clone()).await {
+        let supported_cids = runtime.supported_cids_on_disk();
+        let loaded_cids = runtime.loaded_cids().await;
+        match do_heartbeat(
+            &http,
+            &heartbeat_url,
+            &keypair,
+            &peer_id,
+            supported_cids.clone(),
+            loaded_cids.clone(),
+        )
+        .await
+        {
             Ok(true) => {
                 info!("registry heartbeat ok");
             }
@@ -654,8 +670,16 @@ async fn registry_heartbeat_loop(
                 // Registry restarted or registration was revoked — attempt re-join.
                 warn!("heartbeat rejected (unregistered); attempting re-join");
                 if let Some(ref token) = join_token {
-                    if let Err(e) =
-                        do_join(&http, &join_url, &keypair, &peer_id, &dial_multiaddr, supported_cids, token).await
+                    if let Err(e) = do_join(
+                        &http,
+                        &join_url,
+                        &keypair,
+                        &peer_id,
+                        supported_cids,
+                        loaded_cids,
+                        token,
+                    )
+                    .await
                     {
                         warn!(error = %e, "re-join failed");
                     }
@@ -685,6 +709,7 @@ fn build_swarm(local_key: identity::Keypair) -> Result<libp2p::Swarm<WorkerBehav
             libp2p::noise::Config::new,
             libp2p::yamux::Config::default,
         )?
+        .with_dns()?
         .with_behaviour(|key| WorkerBehaviour {
             request_response: request_response::cbor::Behaviour::new(
                 [(StreamProtocol::new(INVOKE_PROTOCOL), ProtocolSupport::Full)],
@@ -696,17 +721,229 @@ fn build_swarm(local_key: identity::Keypair) -> Result<libp2p::Swarm<WorkerBehav
             )),
             ping: ping::Behaviour::default(),
         })?
+        // Keep the reverse long connection to the gateway; default idle timeout is ~10s.
+        .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(3600)))
         .build();
     Ok(swarm)
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+struct GatewayCandidate {
+    peer_id: String,
+    dial_addr: String,
+}
+
+#[derive(Deserialize)]
+struct GatewaysBody {
+    gateways: Vec<GatewayCandidate>,
+}
+
+fn merge_gateway_candidates(
+    discovered: Vec<GatewayCandidate>,
+    fallback: &[GatewayCandidate],
+) -> Vec<GatewayCandidate> {
+    let mut merged = Vec::new();
+    for candidate in discovered.into_iter() {
+        if merged.len() >= 2 {
+            break;
+        }
+        if candidate.peer_id.trim().is_empty() || candidate.dial_addr.trim().is_empty() {
+            continue;
+        }
+        if PeerId::from_str(&candidate.peer_id).is_err() {
+            continue;
+        }
+        if candidate.dial_addr.parse::<Multiaddr>().is_err() {
+            continue;
+        }
+        if merged
+            .iter()
+            .any(|existing: &GatewayCandidate| existing.peer_id == candidate.peer_id)
+        {
+            continue;
+        }
+        merged.push(candidate);
+    }
+
+    for candidate in fallback {
+        if merged.len() >= 2 {
+            break;
+        }
+        if !merged
+            .iter()
+            .any(|existing| existing.peer_id == candidate.peer_id)
+        {
+            merged.push(candidate.clone());
+        }
+    }
+    merged
+}
+
+fn gateway_peer_set(candidates: &[GatewayCandidate]) -> std::collections::HashSet<PeerId> {
+    candidates
+        .iter()
+        .filter_map(|candidate| PeerId::from_str(&candidate.peer_id).ok())
+        .collect()
+}
+
+fn reconnect_jitter() -> Duration {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|value| (value.subsec_millis() % 750) as u64)
+        .unwrap_or(0);
+    Duration::from_millis(millis)
+}
+
+async fn gateway_discovery_loop(
+    registry_url: String,
+    fallback: Vec<GatewayCandidate>,
+    tx: watch::Sender<Vec<GatewayCandidate>>,
+) {
+    let client = reqwest::Client::new();
+    let url = format!("{}/v1/gateways", registry_url.trim_end_matches('/'));
+    let mut interval = tokio::time::interval(Duration::from_secs(10));
+    loop {
+        interval.tick().await;
+        match client.get(&url).send().await {
+            Ok(response) if response.status().is_success() => {
+                match response.json::<GatewaysBody>().await {
+                    Ok(body) => {
+                        let merged = merge_gateway_candidates(body.gateways, &fallback);
+                        if *tx.borrow() != merged {
+                            let _ = tx.send(merged);
+                        }
+                    }
+                    Err(error) => {
+                        warn!(%error, "gateway discovery JSON decode failed; retaining cached candidates")
+                    }
+                }
+            }
+            Ok(response) => warn!(status = %response.status(), "gateway discovery rejected"),
+            Err(error) => warn!(%error, "gateway discovery failed; retaining cached candidates"),
+        }
+    }
+}
+
+async fn run_swarm_loop(
+    runtime: Arc<Runtime>,
+    mut gateways: watch::Receiver<Vec<GatewayCandidate>>,
+    mut swarm: libp2p::Swarm<WorkerBehaviour>,
+) {
+    let mut connected = std::collections::HashSet::new();
+    let mut dial_in_flight = std::collections::HashSet::new();
+    let mut desired_gateways = gateway_peer_set(&gateways.borrow());
+    let mut retry = tokio::time::interval(Duration::from_secs(5));
+
+    loop {
+        tokio::select! {
+            _ = retry.tick() => {
+                tokio::time::sleep(reconnect_jitter()).await;
+                for candidate in gateways.borrow().clone() {
+                    let Ok(peer_id) = PeerId::from_str(&candidate.peer_id) else { continue };
+                    if !desired_gateways.contains(&peer_id) || connected.contains(&peer_id) || dial_in_flight.contains(&peer_id) { continue; }
+                    let Ok(address) = candidate.dial_addr.parse::<Multiaddr>() else { warn!(%peer_id, "invalid gateway dial address"); continue; };
+                    match swarm.dial(address) { Ok(()) => { dial_in_flight.insert(peer_id); }, Err(error) => warn!(%peer_id, %error, "gateway dial failed") }
+                }
+            }
+            _ = gateways.changed() => {
+                desired_gateways = gateway_peer_set(&gateways.borrow());
+                info!(count = desired_gateways.len(), "gateway candidates updated");
+                for peer_id in connected.clone() {
+                    if !desired_gateways.contains(&peer_id) {
+                        if swarm.disconnect_peer_id(peer_id).is_err() {
+                            warn!(%peer_id, "failed to disconnect stale gateway");
+                        }
+                    }
+                }
+            }
+            event = swarm.select_next_some() => match event {
+                SwarmEvent::ConnectionEstablished {
+                    peer_id, endpoint, ..
+                } => {
+                    info!(%peer_id, ?endpoint, "connection established");
+                    dial_in_flight.remove(&peer_id);
+                    if desired_gateways.contains(&peer_id) {
+                        connected.insert(peer_id);
+                        info!(%peer_id, "reverse long connection to gateway ready");
+                    } else {
+                        warn!(%peer_id, "disconnecting unselected gateway");
+                        let _ = swarm.disconnect_peer_id(peer_id);
+                    }
+                }
+                SwarmEvent::ConnectionClosed { peer_id, num_established, .. } => {
+                    info!(%peer_id, remaining = num_established, "connection closed");
+                    if num_established == 0 { connected.remove(&peer_id); dial_in_flight.remove(&peer_id); }
+                }
+                SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
+                    warn!(?peer_id, ?error, "outgoing connection error");
+                    if let Some(peer_id) = peer_id { dial_in_flight.remove(&peer_id); }
+                }
+                SwarmEvent::IncomingConnectionError {
+                    local_addr,
+                    send_back_addr,
+                    error,
+                    ..
+                } => {
+                    warn!(%local_addr, %send_back_addr, ?error, "incoming connection error");
+                }
+                SwarmEvent::NewListenAddr { address, .. } => {
+                    info!("worker listening at {address}");
+                }
+                SwarmEvent::Behaviour(WorkerBehaviourEvent::RequestResponse(
+                    request_response::Event::Message { peer, message, .. },
+                )) => match message {
+                    request_response::Message::Request {
+                        request, channel, ..
+                    } => {
+                        if !desired_gateways.contains(&peer) { warn!(%peer, "invoke rejected from unselected gateway"); continue; }
+                        info!(from = %peer, cid = %request.cid, request_id = %request.request_id, "invoke");
+                        let response = runtime.execute(request).await;
+                        if let Err(resp) = swarm
+                            .behaviour_mut()
+                            .request_response
+                            .send_response(channel, response)
+                        {
+                            warn!("failed to send response: {:?}", resp);
+                        }
+                    }
+                    request_response::Message::Response { .. } => {}
+                },
+                SwarmEvent::Behaviour(WorkerBehaviourEvent::Identify(event)) => {
+                    info!("identify: {:?}", event);
+                }
+                SwarmEvent::Behaviour(WorkerBehaviourEvent::Ping(event)) => {
+                    info!("ping: {:?}", event);
+                }
+                SwarmEvent::Behaviour(WorkerBehaviourEvent::RequestResponse(
+                    request_response::Event::InboundFailure { peer, error, .. },
+                )) => {
+                    warn!(%peer, ?error, "inbound failure");
+                }
+                SwarmEvent::Behaviour(WorkerBehaviourEvent::RequestResponse(
+                    request_response::Event::OutboundFailure { peer, error, .. },
+                )) => {
+                    warn!(%peer, ?error, "outbound failure");
+                }
+                SwarmEvent::Behaviour(WorkerBehaviourEvent::RequestResponse(
+                    request_response::Event::ResponseSent { peer, .. },
+                )) => {
+                    info!(%peer, "response sent");
+                }
+                other => {
+                    info!("swarm event: {:?}", other);
+                }
+            }
+        }
+    }
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
+        .with_ansi(false)
         .init();
 
     let argv: Vec<String> = std::env::args().skip(1).collect();
@@ -739,7 +976,6 @@ async fn main() -> Result<()> {
         .listen_addr
         .parse()
         .with_context(|| format!("invalid listen multiaddr `{}`", settings.listen_addr))?;
-
     fs::create_dir_all(&settings.wasm_cache_dir)
         .with_context(|| format!("create `{}`", settings.wasm_cache_dir.display()))?;
 
@@ -753,20 +989,22 @@ async fn main() -> Result<()> {
     let local_peer_id = PeerId::from(local_key.public());
     let mut swarm = build_swarm(local_key.clone())?;
     swarm.listen_on(listen_addr.clone())?;
-
-    let dial_multiaddr = listen_addr
-        .clone()
-        .with(Protocol::P2p(local_peer_id.into()));
-    let dial_str = dial_multiaddr.to_string();
+    let fallback_gateways: Vec<GatewayCandidate> = Vec::new();
+    let (gateway_tx, gateway_rx) = watch::channel(fallback_gateways.clone());
+    tokio::spawn(gateway_discovery_loop(
+        settings.registry_url.clone(),
+        fallback_gateways,
+        gateway_tx,
+    ));
+    tokio::spawn(run_swarm_loop(runtime.clone(), gateway_rx, swarm));
 
     info!(
         peer_id = %local_peer_id,
         listen_addr = %listen_addr,
-        dial_multiaddr = %dial_str,
         wasm_cache_dir = %settings.wasm_cache_dir.display(),
         max_concurrency = runtime.gate.available_permits(),
         max_instance_memory_mb = runtime.max_instance_memory_mb,
-        "worker started"
+        "worker started (dials gateway; keeps reverse long connection)"
     );
 
     let heartbeat_url = registry_url(&settings.registry_url, &settings.registry_heartbeat_path);
@@ -774,20 +1012,37 @@ async fn main() -> Result<()> {
     let http = reqwest::Client::new();
     let keypair_arc = Arc::new(local_key);
     let peer_s = local_peer_id.to_string();
-    let dial_owned = dial_str.clone();
 
     // Initial registration: try heartbeat first; if unregistered, attempt join.
-    let initial_supported_cids = runtime.supported_cids().await;
-    match do_heartbeat(&http, &heartbeat_url, &keypair_arc, &peer_s, &dial_owned, initial_supported_cids.clone()).await {
+    let initial_supported_cids = runtime.supported_cids_on_disk();
+    let initial_loaded_cids = runtime.loaded_cids().await;
+    match do_heartbeat(
+        &http,
+        &heartbeat_url,
+        &keypair_arc,
+        &peer_s,
+        initial_supported_cids.clone(),
+        initial_loaded_cids.clone(),
+    )
+    .await
+    {
         Ok(true) => {
             info!(peer_id = %local_peer_id, "worker already registered with registry");
         }
         Ok(false) => {
             // Not yet registered — join now.
             if let Some(ref token) = settings.join_token {
-                do_join(&http, &join_url, &keypair_arc, &peer_s, &dial_owned, initial_supported_cids, token)
-                    .await
-                    .context("initial worker registration failed")?;
+                do_join(
+                    &http,
+                    &join_url,
+                    &keypair_arc,
+                    &peer_s,
+                    initial_supported_cids,
+                    initial_loaded_cids,
+                    token,
+                )
+                .await
+                .context("initial worker registration failed")?;
             } else {
                 anyhow::bail!(
                     "worker is not registered with the registry and no join_token is configured; \
@@ -809,78 +1064,29 @@ async fn main() -> Result<()> {
         join_url,
         keypair_arc,
         peer_s,
-        dial_owned,
         runtime.clone(),
         period,
         join_token,
     ));
-
-    while let Some(event) = swarm.next().await {
-        match event {
-            SwarmEvent::NewListenAddr { address, .. } => {
-                let with_peer = address.with(Protocol::P2p(local_peer_id.into()));
-                info!("worker listening at {with_peer} (dial multiaddr for heartbeat: {dial_str})");
-            }
-            SwarmEvent::Behaviour(WorkerBehaviourEvent::RequestResponse(
-                request_response::Event::Message { peer, message, .. },
-            )) => match message {
-                request_response::Message::Request {
-                    request, channel, ..
-                } => {
-                    info!(from = %peer, cid = %request.cid, request_id = %request.request_id, "invoke");
-                    let runtime = runtime.clone();
-                    let response = runtime.execute(request).await;
-                    if let Err(resp) = swarm
-                        .behaviour_mut()
-                        .request_response
-                        .send_response(channel, response)
-                    {
-                        warn!("failed to send response: {:?}", resp);
-                    }
-                }
-                request_response::Message::Response { .. } => {}
-            },
-            SwarmEvent::Behaviour(WorkerBehaviourEvent::Identify(event)) => {
-                info!("identify: {:?}", event);
-            }
-            SwarmEvent::Behaviour(WorkerBehaviourEvent::Ping(_)) => {}
-            SwarmEvent::Behaviour(WorkerBehaviourEvent::RequestResponse(
-                request_response::Event::InboundFailure { peer, error, .. },
-            )) => {
-                warn!(%peer, ?error, "inbound failure");
-            }
-            SwarmEvent::Behaviour(WorkerBehaviourEvent::RequestResponse(
-                request_response::Event::OutboundFailure { peer, error, .. },
-            )) => {
-                warn!(%peer, ?error, "outbound failure");
-            }
-            SwarmEvent::Behaviour(WorkerBehaviourEvent::RequestResponse(
-                request_response::Event::ResponseSent { peer, .. },
-            )) => {
-                info!(%peer, "response sent");
-            }
-            other => {
-                info!("swarm event: {:?}", other);
-            }
-        }
-    }
-
-    error!("swarm ended unexpectedly");
+    tokio::signal::ctrl_c()
+        .await
+        .context("wait for worker shutdown signal")?;
+    info!("worker shutdown requested");
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::wasm_fetch_url;
+    use super::*;
     use beenet_common::BeenetCid;
     use std::str::FromStr;
 
     #[test]
     fn wasm_fetch_url_joins_base_and_cid() {
-        let cid = BeenetCid::from_str(
-            "bafkreigdvzf6jabcvbsyiqf27ew4zrqwxehehv7xg2tnfds4aq325jv4xu",
-        )
-        .unwrap();
+        let cid =
+            BeenetCid::from_str("bafkreigdvzf6jabcvbsyiqf27ew4zrqwxehehv7xg2tnfds4aq325jv4xu")
+                .unwrap();
         assert_eq!(
             wasm_fetch_url("https://example.com/wasm/", &cid),
             format!("https://example.com/wasm/{cid}")

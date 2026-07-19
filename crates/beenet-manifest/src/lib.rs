@@ -110,8 +110,8 @@ impl Manifest {
 ///
 /// Returns `Err` if the section is absent or the TOML is invalid.
 pub fn extract(wasm: &[u8]) -> Result<Manifest> {
-    let bytes = extract_raw(wasm)?
-        .ok_or_else(|| anyhow!("custom section `{SECTION_NAME}` not found"))?;
+    let bytes =
+        extract_raw(wasm)?.ok_or_else(|| anyhow!("custom section `{SECTION_NAME}` not found"))?;
     let s = std::str::from_utf8(&bytes).context("manifest section is not valid UTF-8")?;
     Manifest::from_toml(s)
 }

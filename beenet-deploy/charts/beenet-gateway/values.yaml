@@ -9,17 +9,27 @@ replicaCount: 1
 
 # ── Network ────────────────────────────────────────────────────────────────
 httpAddr: "0.0.0.0:8080"
+libp2pListenAddr: "/ip4/0.0.0.0/tcp/4001"
+publicAddr: ""
+# Persistent PeerId for workers to dial (reverse long connection).
+# Mounted read-only from Secret `identitySecretName` (key: identity.key).
+identityKeyPath: "/gateway_cache/identity.key"
+identitySecretName: "beenet-gateway-identity"
 
 service:
   # Use LoadBalancer or NodePort to expose the gateway externally.
-  type: ClusterIP
+  type: LoadBalancer
   port: 8080
+  libp2pPort: 4001
 
 # ── Registry ────────────────────────────────────────────────────────────────
 # URL of the beenet-registry service (in-cluster).
 # If deployed with the beenet-registry chart in the same namespace:
 #   http://<release-name>-beenet-registry:<port>
 registryUrl: "http://beenet-registry:3030"
+gatewayId: "gateway"
+region: ""
+capacity: 1000
 
 # How often (ms) the gateway polls the registry for live workers.
 registryPollMs: 2000

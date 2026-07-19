@@ -1,10 +1,8 @@
-# Build context: beenet/ workspace root.
-#   docker build -f docker/Dockerfile.registry -t beenet/registry:dev .
-#
-# beenet-registry only depends on beenet-common. Spin-dependent workspace
-# members are stripped so the sibling spin/ checkout is not required.
+# Build with local ACR base images (no Docker Hub pull):
+#   docker build --pull=false -f docker/Dockerfile.registry.acr \
+#     -t teethlink-global-registry.cn-hongkong.cr.aliyuncs.com/beenet/registry:latest .
 
-FROM rust:1-slim AS builder
+FROM teethlink-global-registry.cn-hongkong.cr.aliyuncs.com/beenet/base-rust:1-slim-amd64 AS builder
 
 WORKDIR /build
 
@@ -12,11 +10,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
-# Use the toolchain baked into rust:1-slim; do not copy rust-toolchain.toml
-# (it would trigger rustup to sync stable from the network inside the container).
 COPY Cargo.toml Cargo.lock ./
 
-# Remove spin-dependent members; they are not needed to build registry/gateway.
 RUN sed -i \
     -e '/"crates\/beenet-worker"/d' \
     -e '/"crates\/beenet-factors"/d' \
@@ -36,7 +31,7 @@ ENV CARGO_NET_RETRY=$CARGO_NET_RETRY \
 
 RUN cargo build --release -p beenet-registry
 
-FROM debian:bookworm-slim AS runtime
+FROM teethlink-global-registry.cn-hongkong.cr.aliyuncs.com/beenet/base-debian:bookworm-slim-amd64 AS runtime
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \

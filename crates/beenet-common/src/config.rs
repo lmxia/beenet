@@ -24,6 +24,10 @@ pub struct GatewaySection {
     pub registry_url: Option<String>,
     pub registry_poll_ms: Option<u64>,
     pub default_deadline_ms: Option<u32>,
+    pub libp2p_listen_addr: Option<String>,
+    pub public_addr: Option<String>,
+    /// Persistent Ed25519 identity key path (stable PeerId for workers to dial).
+    pub identity_key_path: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -56,7 +60,7 @@ pub struct OssSection {
 
 // —— defaults (match former clap defaults) —— //
 
-pub const DEFAULT_WORKER_LISTEN_ADDR: &str = "/ip4/127.0.0.1/tcp/4001";
+pub const DEFAULT_WORKER_LISTEN_ADDR: &str = "/ip4/0.0.0.0/tcp/0";
 pub const DEFAULT_WASM_CACHE_DIR: &str = "./wasm_cache";
 pub const DEFAULT_DEADLINE_MS: u32 = 10_000;
 pub const DEFAULT_MEMORY_MB: u32 = 64;
@@ -65,6 +69,8 @@ pub const DEFAULT_REGISTRY_HEARTBEAT_PATH: &str = "/v1/workers/heartbeat";
 pub const DEFAULT_REGISTRY_HEARTBEAT_SECS: u64 = 20;
 pub const DEFAULT_WASM_FETCH_TIMEOUT_SECS: u64 = 60;
 pub const DEFAULT_GATEWAY_HTTP_ADDR: &str = "127.0.0.1:8080";
+pub const DEFAULT_GATEWAY_LIBP2P_LISTEN_ADDR: &str = "/ip4/0.0.0.0/tcp/4001";
+pub const DEFAULT_GATEWAY_IDENTITY_KEY_PATH: &str = "gateway_cache/identity.key";
 pub const DEFAULT_REGISTRY_POLL_MS: u64 = 2000;
 pub const DEFAULT_REGISTRY_HTTP_ADDR: &str = "127.0.0.1:3030";
 pub const DEFAULT_OSS_REGION: &str = "oss-cn-hangzhou";
@@ -75,7 +81,8 @@ fn trim_nonempty(s: &str) -> Option<String> {
 }
 
 fn opt_merge(cli: Option<String>, file: Option<&String>) -> Option<String> {
-    cli.or_else(|| file.cloned()).and_then(|s| trim_nonempty(&s))
+    cli.or_else(|| file.cloned())
+        .and_then(|s| trim_nonempty(&s))
 }
 
 fn pick_u32(cli: Option<u32>, file: Option<u32>, default: u32) -> u32 {
@@ -169,8 +176,16 @@ pub fn resolve_worker_settings(
     Ok(WorkerSettings {
         listen_addr,
         wasm_cache_dir,
-        default_deadline_ms: pick_u32(cli.default_deadline_ms, w.default_deadline_ms, DEFAULT_DEADLINE_MS),
-        default_memory_mb: pick_u32(cli.default_memory_mb, w.default_memory_mb, DEFAULT_MEMORY_MB),
+        default_deadline_ms: pick_u32(
+            cli.default_deadline_ms,
+            w.default_deadline_ms,
+            DEFAULT_DEADLINE_MS,
+        ),
+        default_memory_mb: pick_u32(
+            cli.default_memory_mb,
+            w.default_memory_mb,
+            DEFAULT_MEMORY_MB,
+        ),
         max_instance_memory_mb: pick_u32(
             cli.max_instance_memory_mb,
             w.max_instance_memory_mb,
@@ -254,6 +269,9 @@ pub struct GatewaySettings {
     pub registry_url: String,
     pub registry_poll_ms: u64,
     pub default_deadline_ms: u32,
+    pub libp2p_listen_addr: String,
+    pub public_addr: Option<String>,
+    pub identity_key_path: PathBuf,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -262,6 +280,9 @@ pub struct GatewayCliOverrides {
     pub registry_url: Option<String>,
     pub registry_poll_ms: Option<u64>,
     pub default_deadline_ms: Option<u32>,
+    pub libp2p_listen_addr: Option<String>,
+    pub public_addr: Option<String>,
+    pub identity_key_path: Option<PathBuf>,
 }
 
 pub fn require_gateway_section(cfg: &BeenetConfigFile) -> Result<&GatewaySection> {
@@ -292,15 +313,36 @@ fn resolve_gateway_settings_merged(
     g: Option<&GatewaySection>,
     cli: &GatewayCliOverrides,
 ) -> Result<GatewaySettings> {
-    let registry_url = opt_merge(cli.registry_url.clone(), g.and_then(|s| s.registry_url.as_ref()))
-        .ok_or_else(|| {
-            anyhow!("missing registry_url: pass --registry-url or set [gateway].registry_url in config")
-        })?;
+    let registry_url = opt_merge(
+        cli.registry_url.clone(),
+        g.and_then(|s| s.registry_url.as_ref()),
+    )
+    .ok_or_else(|| {
+        anyhow!("missing registry_url: pass --registry-url or set [gateway].registry_url in config")
+    })?;
     let http_str = opt_merge(cli.http_addr.clone(), g.and_then(|s| s.http_addr.as_ref()))
         .unwrap_or_else(|| DEFAULT_GATEWAY_HTTP_ADDR.to_string());
     let http_addr: SocketAddr = http_str
         .parse()
         .with_context(|| format!("invalid gateway http_addr `{http_str}`"))?;
+    let libp2p_listen_addr = opt_merge(
+        cli.libp2p_listen_addr.clone(),
+        g.and_then(|s| s.libp2p_listen_addr.as_ref()),
+    )
+    .unwrap_or_else(|| DEFAULT_GATEWAY_LIBP2P_LISTEN_ADDR.to_string());
+    let public_addr = opt_merge(
+        cli.public_addr.clone(),
+        g.and_then(|s| s.public_addr.as_ref()),
+    );
+    let identity_key_path = cli
+        .identity_key_path
+        .clone()
+        .or_else(|| {
+            g.and_then(|s| s.identity_key_path.as_ref())
+                .and_then(|s| trim_nonempty(s))
+                .map(PathBuf::from)
+        })
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_GATEWAY_IDENTITY_KEY_PATH));
     Ok(GatewaySettings {
         http_addr,
         registry_url,
@@ -314,9 +356,11 @@ fn resolve_gateway_settings_merged(
             g.and_then(|s| s.default_deadline_ms),
             DEFAULT_DEADLINE_MS,
         ),
+        libp2p_listen_addr,
+        public_addr,
+        identity_key_path,
     })
 }
-
 
 /// Platform config dir + `beenet/config.toml`.
 pub fn default_config_path() -> PathBuf {
@@ -368,11 +412,7 @@ mod tests {
 
     #[test]
     fn resolves_config_flag_before_subcommand() {
-        let argv = vec![
-            "--config".into(),
-            "/a.toml".into(),
-            "upload".into(),
-        ];
+        let argv = vec!["--config".into(), "/a.toml".into(), "upload".into()];
         assert_eq!(
             resolve_config_path_from_argv(&argv),
             PathBuf::from("/a.toml")
@@ -380,13 +420,14 @@ mod tests {
     }
 
     #[test]
-    fn worker_merge_requires_registry_url() {
+    fn worker_merge_requires_registry_and_optional_gateway_addr() {
         let mut f = BeenetConfigFile::default();
         f.worker = Some(WorkerSection::default());
-        // registry_url is required; join_token is now optional.
         assert!(resolve_worker_settings(&f, &WorkerCliOverrides::default()).is_err());
         f.worker.as_mut().unwrap().registry_url = Some("http://localhost:3030".into());
         let s = resolve_worker_settings(&f, &WorkerCliOverrides::default()).unwrap();
+        assert_eq!(s.listen_addr, DEFAULT_WORKER_LISTEN_ADDR);
+        assert_eq!(s.wasm_cache_dir, PathBuf::from(DEFAULT_WASM_CACHE_DIR));
         assert!(s.join_token.is_none());
         f.worker.as_mut().unwrap().join_token = Some("t".into());
         let s = resolve_worker_settings(&f, &WorkerCliOverrides::default()).unwrap();

@@ -6,10 +6,11 @@ use aws_credential_types::provider::SharedCredentialsProvider;
 use aws_sdk_s3::config::{BehaviorVersion, Credentials, Region};
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Client;
-use beenet_common::BeenetCid;
+use aws_smithy_http_client::{proxy::ProxyConfig, tls, Builder as HttpClientBuilder, Connector};
 use beenet_common::config::{
     load_file, resolve_config_path_with_cli, resolve_oss_settings, OssCliOverrides, OssSettings,
 };
+use beenet_common::BeenetCid;
 use beenet_manifest::{embed, extract, Manifest};
 use clap::{Parser, Subcommand};
 
@@ -35,9 +36,7 @@ enum Command {
         out: PathBuf,
     },
     /// Print CID + embedded manifest from a packaged wasm file.
-    Inspect {
-        wasm: PathBuf,
-    },
+    Inspect { wasm: PathBuf },
     /// Upload packaged wasm (with embedded manifest) to S3-compatible storage (e.g. Aliyun OSS).
     Upload {
         #[arg(long)]
@@ -149,7 +148,8 @@ fn normalize_prefix(prefix: &str) -> String {
 async fn upload(wasm_path: PathBuf, oss: OssSettings) -> Result<()> {
     let bytes = fs::read(&wasm_path).with_context(|| format!("read `{}`", wasm_path.display()))?;
     let cid = BeenetCid::from_bytes(&bytes);
-    let _manifest = extract(&bytes).context("packaged wasm must contain beenet manifest (run `beenet-pack build` first)")?;
+    let _manifest = extract(&bytes)
+        .context("packaged wasm must contain beenet manifest (run `beenet-pack build` first)")?;
 
     let prefix = normalize_prefix(&oss.key_prefix);
     let key = format!("{prefix}{cid}");
@@ -162,11 +162,23 @@ async fn upload(wasm_path: PathBuf, oss: OssSettings) -> Result<()> {
         "beenet-pack",
     );
     let shared = SharedCredentialsProvider::new(credentials);
+    let http_client = HttpClientBuilder::new().build_with_connector_fn(|settings, _runtime| {
+        let mut connector = Connector::builder().proxy_config(ProxyConfig::from_env());
+        if let Some(settings) = settings.cloned() {
+            connector = connector.connector_settings(settings);
+        }
+        connector
+            .tls_provider(tls::Provider::rustls(
+                tls::rustls_provider::CryptoMode::Ring,
+            ))
+            .build()
+    });
     let conf = aws_sdk_s3::config::Builder::new()
         .behavior_version(BehaviorVersion::latest())
         .region(Region::new(oss.region))
         .endpoint_url(oss.endpoint.trim_end_matches('/'))
         .credentials_provider(shared)
+        .http_client(http_client)
         .force_path_style(oss.force_path_style)
         .build();
     let client = Client::from_conf(conf);

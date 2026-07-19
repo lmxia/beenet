@@ -13,9 +13,9 @@ use spin_factor_outbound_http::OutboundHttpFactor;
 use spin_factor_wasi::WasiFactor;
 use spin_factors_executor::FactorsExecutorApp;
 use wasmtime_wasi::p2::pipe::MemoryOutputPipe;
-use wasmtime_wasi_http::p2::body::{HyperIncomingBody, HyperOutgoingBody};
 use wasmtime_wasi_http::p2::bindings::http::types::{ErrorCode, Scheme};
 use wasmtime_wasi_http::p2::bindings::ProxyPre;
+use wasmtime_wasi_http::p2::body::{HyperIncomingBody, HyperOutgoingBody};
 
 /// Max stdout/stderr bytes shipped on `InvokeResponse` (M1.5 wire cap).
 pub const WIRE_LOG_CAP_BYTES: usize = 16 * 1024;
@@ -66,10 +66,9 @@ pub async fn invoke_prepared(
 
     let http_req = build_incoming_request(req)?;
 
-    let mut wasi_http = OutboundHttpFactor::get_wasi_http_impl(
-        store.data_mut().factors_instance_state_mut(),
-    )
-    .context("missing OutboundHttpFactor / wasi-http state")?;
+    let mut wasi_http =
+        OutboundHttpFactor::get_wasi_http_impl(store.data_mut().factors_instance_state_mut())
+            .context("missing OutboundHttpFactor / wasi-http state")?;
 
     let (sender, receiver) = tokio::sync::oneshot::channel();
     let incoming = wasi_http

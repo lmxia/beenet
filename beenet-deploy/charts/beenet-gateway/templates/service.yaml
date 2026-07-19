@@ -11,5 +11,9 @@ spec:
       targetPort: http
       protocol: TCP
       name: http
+    - port: {{ .Values.service.libp2pPort }}
+      targetPort: libp2p
+      protocol: TCP
+      name: libp2p
   selector:
     {{- include "beenet-gateway.selectorLabels" . | nindent 4 }}

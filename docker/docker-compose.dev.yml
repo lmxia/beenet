@@ -13,7 +13,7 @@
 # S3 API:         http://127.0.0.1:9000
 # Public wasm GET: http://127.0.0.1:9000/beenet/<cid>
 #
-# Then start worker on the host (see readme.md).
+# Then start worker on the host; it will discover gateways from the registry.
 
 services:
   redis:
@@ -63,6 +63,8 @@ services:
       - "0.0.0.0:3030"
       - "--redis-url"
       - "redis://redis:6379"
+      - "--admin-token"
+      - "beenet-dev-admin-token"
 
   beenet-gateway:
     image: beenet/beenet-gateway:dev
@@ -76,11 +78,21 @@ services:
       - beenet-registry
     ports:
       - "18080:8080"
+      - "14001:4001"
+    volumes:
+      - gateway-cache:/gateway_cache
     command:
       - "--http-addr"
       - "0.0.0.0:8080"
       - "--registry-url"
       - "http://beenet-registry:3030"
+      - "--libp2p-listen-addr"
+      - "/ip4/0.0.0.0/tcp/4001"
+      - "--public-addr"
+      - "/dns4/host.docker.internal/tcp/14001"
+      - "--identity-key-path"
+      - "/gateway_cache/identity.key"
 
 volumes:
   minio-data:
+  gateway-cache:

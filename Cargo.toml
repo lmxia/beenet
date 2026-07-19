@@ -61,6 +61,7 @@ libp2p = { version = "0.56", default-features = false, features = [
     "cbor",
     "identify",
     "ping",
+    "dns",
     "macros",
 ] }
 
@@ -90,6 +91,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 # Aliyun OSS via S3-compatible API (also works with AWS S3, MinIO).
 aws-sdk-s3 = { version = "1.132", default-features = false, features = ["rt-tokio", "rustls"] }
 aws-credential-types = "1.2"
+aws-smithy-http-client = { version = "1.1.12", features = ["default-client", "rustls-ring"] }
 
 # Spin host embedding (M1.5): checkout `spin` as sibling of `beenet` (see `beenet.code-workspace`).
 spin-app = { path = "../spin/crates/app" }

@@ -1,8 +1,8 @@
 # Beenet —— 基于 CID 的分布式 Agent 任务网络
 
-> 文档版本：**v2.20（AI factor + CID hint 路由 + 本地 compose E2E）**  
+> 文档版本：**v2.22（反向长连接：Worker dial Gateway）**  
 > 状态：M1 最短闭环已跑通（档 0 = Wasip2）；进入 M1.5 规划  
-> 说明：v2.20：AI factor 已接入 Beenet factors；`usage` 增加 `ai_*` 计量字段；Worker 通过 `supported_cids` 上报 CID hint，Gateway 先过滤再轮询；本地 Docker compose 已验证 `registry / gateway / worker` E2E。v2.19：`[worker].wasm_fetch_base` 在缓存未命中时 `GET {base}/{cid}` 拉取并 **CID 校验** 后写入 `wasm_cache`；**`beenet-pack upload`** 以 **S3 兼容 API** 上传至阿里云 OSS 等；manifest 仍 **内嵌 wasm**（与 v2.18 一致）。v2.18：`/v1/workers/heartbeat`。
+> 说明：v2.22：删除 `beenet-relay` / DCUtR；改为 **Worker 主动 dial 公网 Gateway 并保持长连接**，Gateway 仅对已连接 Worker 复用连接下发 invoke。Registry 仍独立负责 join/心跳/`supported_cids`；`dial_multiaddr` 仅作元数据。单 Gateway 副本假设。v2.21：曾引入独立 `beenet-relay` + circuit（已废弃）。v2.20：AI factor；`supported_cids` CID hint。v2.19：`wasm_fetch_base` + `beenet-pack upload`。v2.18：`/v1/workers/heartbeat`。
 
 ---
 
@@ -158,7 +158,7 @@ bill = base_fee + compute_fee + resource_fee
 
 ### 4.1 Worker 寻址与发现
 
-**当前工作区**：Gateway **仅** 通过 **`[gateway].registry_url`** 轮询 **`GET /v1/workers`** 获得可拨号的 Worker **dial_multiaddr**；Worker **必须** 对 Registry 的 **`POST /v1/workers/heartbeat`** 做 **周期性心跳**，以 **续租**（更新 `last_seen`，避免被当作离线剔除）。Worker 还会在注册信息里上报 `supported_cids`，Gateway 先做 CID hint 过滤，再在候选集里轮询。
+**当前工作区**：Gateway **仅** 通过 **`[gateway].registry_url`** 轮询 **`GET /v1/workers`** 获得可拨号的 Worker **dial_multiaddr**；Worker **必须** 对 Registry 的 **`POST /v1/workers/heartbeat`** 做 **周期性心跳**，以 **续租**（更新 `last_seen`，避免被当作离线剔除）。Worker 还会在注册信息里上报 `supported_cids`，Gateway 先做 CID hint 过滤，再在候选集里轮询。**v2.21 起**，该 `dial_multiaddr` 可以是 **`/p2p-circuit` 中继地址**，Worker 在上报 Registry 前需要先向公网 Relay 预约 reservation，确保地址可用。
 
 **术语**：**注册（入网）** 与 **心跳（续租）** 使用 **同一请求**；首次成功 POST 即完成入网，其后同 payload 的定时 POST 均为 **心跳**。
 
@@ -204,10 +204,20 @@ bill = base_fee + compute_fee + resource_fee
 | 组件 | 配置（`config.toml`） / 行为 |
 | --- | --- |
 | **Registry** | **`[registry]`**：`http_addr`（默认 `127.0.0.1:3030`）；`join_token`（必填）。`POST /v1/workers/heartbeat`：**心跳**载荷 `{ "join_token", "peer_id", "dial_multiaddr", "supported_cids" }`（upsert + 续租 `last_seen`；校验 dial 含 `/p2p/<peer_id>`）。`GET /v1/workers` 返回租约仍有效的 Worker（内存表；约 **60s** 无心跳则剔除）。`GET /health`。 |
-| **Worker** | **`[worker]`**：`registry_url`、`join_token` 必填；`registry_heartbeat_secs`（默认 **20**）；`registry_heartbeat_path`（默认 **`/v1/workers/heartbeat`**）。`listen_addr` 控制监听 multiaddr，心跳体携带 `listen + /p2p/<local_peer_id>`，并上报 `supported_cids`。 |
+| **Worker** | **`[worker]`**：`registry_url`、`join_token` 必填；`registry_heartbeat_secs`（默认 **20**）；`registry_heartbeat_path`（默认 **`/v1/workers/heartbeat`**）。`listen_addr`、`wasm_cache_dir` 走代码默认值；心跳体携带 `listen + /p2p/<local_peer_id>`，并上报 `supported_cids`。Worker 不再接受静态 `gateway_addr`，gateway 由 Registry 发现。 |
 | **Gateway** | **`[gateway]`**：`registry_url` 必填；`registry_poll_ms`（默认 **2000**）轮询 `GET …/v1/workers`，维护 dial 列表，先按 `supported_cids` 过滤，再以 **轮询** 选 Worker 发起 libp2p invoke。 |
 
-**尚未覆盖（仍归 M2/M3）**：一致性哈希 LB、Registry 持久化与高可用、临时 token 颁发/吊销服务、DHT 兜底。
+| **Dashboard** | 只读 Registry 的 `/v1/dashboard/status`，不再读取 Gateway 后端接口。Worker 的在线/离线状态直接来自 Registry 的 `connected` 字段。 |
+
+**尚未覆盖（仍归 M2/M3）**：一致性哈希 LB、多 Gateway 亲和、Registry 高可用、临时 token 颁发/吊销服务、DHT 兜底。
+
+### 4.4 反向长连接（v2.22）
+
+- **数据面**：Worker 只主动 dial Registry 发现到的 gateway；Gateway 在已有连接上 `send_request` 下发 invoke，**不再** `swarm.dial(worker)`。
+- **控制面**：Registry 负责 join / heartbeat / `GET /v1/workers`（`supported_cids` 过滤）；`dial_multiaddr` 仅为元数据。
+- Gateway 使用持久 `identity.key`，PeerId 稳定，Worker 不再配置静态 `gateway_addr`。
+- 已删除 `beenet-relay` 与 DCUtR（单边 NAT 不需要打洞）。
+- **规模假设**：单 Gateway 副本（反向连接天然 sticky；多副本需另做亲和）。
 
 ---
 

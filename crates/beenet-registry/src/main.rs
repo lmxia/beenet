@@ -41,8 +41,7 @@ use axum::{Json, Router};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use beenet_common::config::DEFAULT_REGISTRY_HTTP_ADDR;
 use clap::Parser;
-use libp2p::multiaddr::Protocol;
-use libp2p::{identity, Multiaddr, PeerId};
+use libp2p::{identity, PeerId};
 use redis::AsyncCommands;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
@@ -69,6 +68,11 @@ struct Args {
     /// Defaults to redis://127.0.0.1:6379.  In K8s, set to the Redis service URL.
     #[arg(long, default_value = "redis://127.0.0.1:6379")]
     redis_url: String,
+
+    /// Optional fixed admin token for local testing.
+    /// If omitted, a random token is generated at startup and still printed.
+    #[arg(long)]
+    admin_token: Option<String>,
 }
 
 // ── State ──────────────────────────────────────────────────────────────────
@@ -82,6 +86,7 @@ struct AppState {
     registered: Arc<RwLock<HashMap<PeerId, RegistrationRecord>>>,
     /// Active workers with a live heartbeat lease (in-memory only; rebuilt from heartbeats).
     active: Arc<RwLock<HashMap<PeerId, ActiveRecord>>>,
+    gateways: Arc<RwLock<HashMap<PeerId, ActiveGateway>>>,
     /// Async Redis connection (auto-reconnects; clone-safe).
     redis: redis::aio::ConnectionManager,
 }
@@ -93,10 +98,11 @@ struct AppState {
 struct RedisRegistration {
     /// base64(protobuf-encoded public key)
     public_key_b64: String,
-    dial_multiaddr: String,
     registered_at_unix_ms: u64,
     #[serde(default)]
     supported_cids: Vec<String>,
+    #[serde(default)]
+    loaded_cids: Vec<String>,
 }
 
 /// Upsert one registration into Redis (`HSET beenet:registrations <peer_id> <json>`).
@@ -107,9 +113,9 @@ async fn redis_put(
 ) {
     let value = RedisRegistration {
         public_key_b64: STANDARD.encode(rec.public_key.encode_protobuf()),
-        dial_multiaddr: rec.dial_multiaddr.clone(),
         registered_at_unix_ms: rec.registered_at_unix_ms,
         supported_cids: rec.supported_cids.clone(),
+        loaded_cids: rec.loaded_cids.clone(),
     };
     let json = match serde_json::to_string(&value) {
         Ok(j) => j,
@@ -181,9 +187,9 @@ async fn redis_load_all(
             pid,
             RegistrationRecord {
                 public_key,
-                dial_multiaddr: r.dial_multiaddr,
                 registered_at_unix_ms: r.registered_at_unix_ms,
                 supported_cids: r.supported_cids,
+                loaded_cids: r.loaded_cids,
             },
         );
     }
@@ -212,14 +218,25 @@ impl JoinTokenRecord {
 #[derive(Clone, Debug)]
 struct RegistrationRecord {
     public_key: identity::PublicKey,
-    dial_multiaddr: String,
     registered_at_unix_ms: u64,
     supported_cids: Vec<String>,
+    loaded_cids: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
 struct ActiveRecord {
-    dial_multiaddr: String,
+    last_seen: Instant,
+    supported_cids: Vec<String>,
+    loaded_cids: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+struct ActiveGateway {
+    gateway_id: String,
+    dial_addr: String,
+    region: Option<String>,
+    capacity: u32,
+    connected_workers: u32,
     last_seen: Instant,
 }
 
@@ -264,10 +281,11 @@ struct TokenListResponse {
 #[derive(Debug, Serialize)]
 struct RegistrationView {
     peer_id: String,
-    dial_multiaddr: String,
     registered_at_unix_ms: u64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     supported_cids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    loaded_cids: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -288,12 +306,13 @@ struct JoinBody {
     peer_id: String,
     /// Protobuf-encoded public key, base64-encoded.
     public_key: String,
-    dial_multiaddr: String,
     timestamp_secs: u64,
-    /// Ed25519 signature over `"{peer_id}\n{dial_multiaddr}\n{timestamp_secs}"`, base64-encoded.
+    /// Ed25519 signature over `"{peer_id}\n{timestamp_secs}"`, base64-encoded.
     signature: String,
     #[serde(default)]
     supported_cids: Vec<String>,
+    #[serde(default)]
+    loaded_cids: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -305,17 +324,55 @@ struct JoinResponse {
 #[derive(Debug, Deserialize)]
 struct HeartbeatBody {
     peer_id: String,
-    dial_multiaddr: String,
     timestamp_secs: u64,
-    /// Ed25519 signature over `"{peer_id}\n{dial_multiaddr}\n{timestamp_secs}"`, base64-encoded.
+    /// Ed25519 signature over `"{peer_id}\n{timestamp_secs}"`, base64-encoded.
     signature: String,
     #[serde(default)]
     supported_cids: Vec<String>,
+    #[serde(default)]
+    loaded_cids: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
 struct HeartbeatOkResponse {
     ok: bool,
+    gateways: Vec<GatewayView>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GatewayHeartbeatBody {
+    gateway_id: String,
+    peer_id: String,
+    public_key: String,
+    timestamp_secs: u64,
+    signature: String,
+    dial_addr: String,
+    region: Option<String>,
+    #[serde(default = "default_gateway_capacity")]
+    capacity: u32,
+    #[serde(default)]
+    connected_workers: u32,
+}
+
+fn default_gateway_capacity() -> u32 {
+    1_000
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct GatewayView {
+    gateway_id: String,
+    peer_id: String,
+    dial_addr: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    region: Option<String>,
+    capacity: u32,
+    connected_workers: u32,
+    last_seen_unix_ms: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct GatewaysResponse {
+    gateways: Vec<GatewayView>,
 }
 
 #[derive(Debug, Serialize)]
@@ -324,31 +381,41 @@ struct WorkersResponse {
 }
 
 #[derive(Debug, Serialize)]
+struct DashboardStatusResponse {
+    gateways: Vec<GatewayView>,
+    workers: Vec<WorkerView>,
+    gateway_count: usize,
+    worker_count: usize,
+    generated_at_unix_ms: u64,
+}
+
+#[derive(Debug, Serialize)]
 struct WorkerView {
     peer_id: String,
-    dial_multiaddr: String,
-    last_seen_unix_ms: u128,
+    connected: bool,
+    last_seen_unix_ms: u64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     supported_cids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    loaded_cids: Vec<String>,
 }
 
 // ── Signature helpers ──────────────────────────────────────────────────────
 
-fn signed_message(peer_id: &str, dial_multiaddr: &str, timestamp_secs: u64) -> Vec<u8> {
-    format!("{peer_id}\n{dial_multiaddr}\n{timestamp_secs}").into_bytes()
+fn signed_message(peer_id: &str, timestamp_secs: u64) -> Vec<u8> {
+    format!("{peer_id}\n{timestamp_secs}").into_bytes()
 }
 
 fn verify_signature(
     pubkey: &identity::PublicKey,
     peer_id: &str,
-    dial_multiaddr: &str,
     timestamp_secs: u64,
     sig_b64: &str,
 ) -> Result<()> {
     let sig = STANDARD
         .decode(sig_b64)
         .map_err(|_| anyhow!("signature is not valid base64"))?;
-    let msg = signed_message(peer_id, dial_multiaddr, timestamp_secs);
+    let msg = signed_message(peer_id, timestamp_secs);
     if pubkey.verify(&msg, &sig) {
         Ok(())
     } else {
@@ -428,10 +495,7 @@ async fn list_tokens(State(state): State<AppState>) -> impl IntoResponse {
     Json(TokenListResponse { tokens })
 }
 
-async fn delete_token(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> impl IntoResponse {
+async fn delete_token(State(state): State<AppState>, Path(id): Path<String>) -> impl IntoResponse {
     let deleted = state.join_tokens.write().await.remove(&id).is_some();
     if deleted {
         info!(%id, "join token revoked");
@@ -447,9 +511,9 @@ async fn list_registrations(State(state): State<AppState>) -> impl IntoResponse 
         .iter()
         .map(|(pid, rec)| RegistrationView {
             peer_id: pid.to_string(),
-            dial_multiaddr: rec.dial_multiaddr.clone(),
             registered_at_unix_ms: rec.registered_at_unix_ms,
             supported_cids: rec.supported_cids.clone(),
+            loaded_cids: rec.loaded_cids.clone(),
         })
         .collect();
     registrations.sort_by_key(|r| r.registered_at_unix_ms);
@@ -475,23 +539,6 @@ async fn delete_registration(
 
 // ── Worker handlers ────────────────────────────────────────────────────────
 
-fn validate_multiaddr(peer_id: &str, dial: &str) -> Result<(PeerId, Multiaddr)> {
-    let pid = PeerId::from_str(peer_id).map_err(|e| anyhow!("invalid peer_id: {e}"))?;
-    let ma: Multiaddr = dial.parse().map_err(|e| anyhow!("invalid dial_multiaddr: {e}"))?;
-    let mut found = None;
-    for p in ma.iter() {
-        if let Protocol::P2p(tail) = p {
-            found = Some(tail);
-            break;
-        }
-    }
-    let tail = found.ok_or_else(|| anyhow!("dial_multiaddr missing /p2p/<peer-id>"))?;
-    if tail != pid {
-        return Err(anyhow!("peer_id does not match /p2p record in dial_multiaddr"));
-    }
-    Ok((pid, ma))
-}
-
 async fn post_join(
     State(mut state): State<AppState>,
     Json(body): Json<JoinBody>,
@@ -509,11 +556,15 @@ async fn post_join(
     // 2. Decode public key and verify it matches the claimed peer_id.
     let pubkey_bytes = match STANDARD.decode(&body.public_key) {
         Ok(b) => b,
-        Err(_) => return (StatusCode::BAD_REQUEST, "public_key is not valid base64").into_response(),
+        Err(_) => {
+            return (StatusCode::BAD_REQUEST, "public_key is not valid base64").into_response()
+        }
     };
     let pubkey = match identity::PublicKey::try_decode_protobuf(&pubkey_bytes) {
         Ok(k) => k,
-        Err(e) => return (StatusCode::BAD_REQUEST, format!("invalid public_key: {e}")).into_response(),
+        Err(e) => {
+            return (StatusCode::BAD_REQUEST, format!("invalid public_key: {e}")).into_response()
+        }
     };
     let derived_peer_id = pubkey.to_peer_id();
     let claimed_peer_id = match PeerId::from_str(&body.peer_id) {
@@ -524,45 +575,42 @@ async fn post_join(
         return (StatusCode::BAD_REQUEST, "public_key does not match peer_id").into_response();
     }
 
-    // 3. Validate multiaddr format.
-    if let Err(e) = validate_multiaddr(&body.peer_id, &body.dial_multiaddr) {
-        return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
-    }
-
-    // 4. Check timestamp freshness.
+    // 3. Check timestamp freshness.
     if let Err(e) = check_timestamp(body.timestamp_secs) {
         return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
     }
 
-    // 5. Verify signature — proves worker owns the private key.
-    if let Err(e) = verify_signature(
-        &pubkey,
-        &body.peer_id,
-        &body.dial_multiaddr,
-        body.timestamp_secs,
-        &body.signature,
-    ) {
+    // 4. Verify signature — proves worker owns the private key.
+    if let Err(e) = verify_signature(&pubkey, &body.peer_id, body.timestamp_secs, &body.signature) {
         return (StatusCode::UNAUTHORIZED, e.to_string()).into_response();
     }
 
-    // 6. Upsert registration record (in-memory + Redis).
+    // 5. Upsert registration record (in-memory + Redis).
     let rec = RegistrationRecord {
         public_key: pubkey,
-        dial_multiaddr: body.dial_multiaddr.clone(),
         registered_at_unix_ms: unix_ms_now(),
         supported_cids: body.supported_cids.clone(),
+        loaded_cids: body.loaded_cids.clone(),
     };
     redis_put(&mut state.redis, &claimed_peer_id, &rec).await;
     state.registered.write().await.insert(claimed_peer_id, rec);
     state.active.write().await.insert(
         claimed_peer_id,
         ActiveRecord {
-            dial_multiaddr: body.dial_multiaddr,
             last_seen: Instant::now(),
+            supported_cids: body.supported_cids.clone(),
+            loaded_cids: body.loaded_cids.clone(),
         },
     );
     info!(peer_id = %claimed_peer_id, "worker registered");
-    (StatusCode::OK, Json(JoinResponse { ok: true, peer_id: body.peer_id })).into_response()
+    (
+        StatusCode::OK,
+        Json(JoinResponse {
+            ok: true,
+            peer_id: body.peer_id,
+        }),
+    )
+        .into_response()
 }
 
 async fn post_heartbeat(
@@ -592,56 +640,153 @@ async fn post_heartbeat(
         return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
     }
 
-    if let Err(e) = verify_signature(
-        &pubkey,
-        &body.peer_id,
-        &body.dial_multiaddr,
-        body.timestamp_secs,
-        &body.signature,
-    ) {
+    if let Err(e) = verify_signature(&pubkey, &body.peer_id, body.timestamp_secs, &body.signature) {
         return (StatusCode::UNAUTHORIZED, e.to_string()).into_response();
     }
 
     state.active.write().await.insert(
         pid,
         ActiveRecord {
-            dial_multiaddr: body.dial_multiaddr,
             last_seen: Instant::now(),
+            supported_cids: body.supported_cids.clone(),
+            loaded_cids: body.loaded_cids.clone(),
         },
     );
     if let Some(rec) = state.registered.write().await.get_mut(&pid) {
         rec.supported_cids = body.supported_cids.clone();
+        rec.loaded_cids = body.loaded_cids.clone();
     }
     info!(peer_id = %pid, "worker heartbeat ok (lease renewed)");
-    (StatusCode::OK, Json(HeartbeatOkResponse { ok: true })).into_response()
+    let gateways = gateway_views(&state).await;
+    (
+        StatusCode::OK,
+        Json(HeartbeatOkResponse { ok: true, gateways }),
+    )
+        .into_response()
 }
 
-async fn get_workers(State(state): State<AppState>) -> impl IntoResponse {
+async fn post_gateway_heartbeat(
+    State(state): State<AppState>,
+    Json(body): Json<GatewayHeartbeatBody>,
+) -> impl IntoResponse {
+    let peer_id = match PeerId::from_str(&body.peer_id) {
+        Ok(value) => value,
+        Err(_) => return (StatusCode::BAD_REQUEST, "invalid peer_id").into_response(),
+    };
+    let public_key = match STANDARD
+        .decode(&body.public_key)
+        .ok()
+        .and_then(|bytes| identity::PublicKey::try_decode_protobuf(&bytes).ok())
+    {
+        Some(value) if value.to_peer_id() == peer_id => value,
+        _ => return (StatusCode::BAD_REQUEST, "public_key does not match peer_id").into_response(),
+    };
+    if body.gateway_id.trim().is_empty() || body.dial_addr.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            "gateway_id and dial_addr are required",
+        )
+            .into_response();
+    }
+    if let Err(error) = check_timestamp(body.timestamp_secs).and_then(|_| {
+        verify_signature(
+            &public_key,
+            &body.peer_id,
+            body.timestamp_secs,
+            &body.signature,
+        )
+    }) {
+        return (StatusCode::UNAUTHORIZED, error.to_string()).into_response();
+    }
+    state.gateways.write().await.insert(
+        peer_id,
+        ActiveGateway {
+            gateway_id: body.gateway_id,
+            dial_addr: body.dial_addr,
+            region: body.region,
+            capacity: body.capacity.max(1),
+            connected_workers: body.connected_workers,
+            last_seen: Instant::now(),
+        },
+    );
+    Json(GatewaysResponse {
+        gateways: gateway_views(&state).await,
+    })
+    .into_response()
+}
+
+async fn gateway_views(state: &AppState) -> Vec<GatewayView> {
+    let now = Instant::now();
+    let now_ms = unix_ms_now();
+    let mut values: Vec<_> = state
+        .gateways
+        .read()
+        .await
+        .iter()
+        .filter_map(|(peer_id, gateway)| {
+            let age = now.duration_since(gateway.last_seen);
+            (age <= STALE_AFTER).then(|| GatewayView {
+                gateway_id: gateway.gateway_id.clone(),
+                peer_id: peer_id.to_string(),
+                dial_addr: gateway.dial_addr.clone(),
+                region: gateway.region.clone(),
+                capacity: gateway.capacity,
+                connected_workers: gateway.connected_workers,
+                last_seen_unix_ms: now_ms.saturating_sub(age.as_millis() as u64),
+            })
+        })
+        .collect();
+    values.sort_by_key(|gateway| {
+        gateway.connected_workers.saturating_mul(10_000) / gateway.capacity.max(1)
+    });
+    values
+}
+
+async fn worker_views(state: &AppState) -> Vec<WorkerView> {
     let map = state.active.read().await;
     let now = Instant::now();
     let mut workers = Vec::new();
     for (pid, rec) in map.iter() {
         if now.duration_since(rec.last_seen) <= STALE_AFTER {
-            let elapsed_ms = now.duration_since(rec.last_seen).as_millis();
+            let elapsed_ms = now.duration_since(rec.last_seen).as_millis() as u64;
             let last_seen_unix_ms = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_millis().saturating_sub(elapsed_ms))
-                .unwrap_or(0);
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0)
+                .saturating_sub(elapsed_ms);
             workers.push(WorkerView {
                 peer_id: pid.to_string(),
-                dial_multiaddr: rec.dial_multiaddr.clone(),
+                connected: true,
                 last_seen_unix_ms,
-                supported_cids: state
-                    .registered
-                    .read()
-                    .await
-                    .get(pid)
-                    .map(|r| r.supported_cids.clone())
-                    .unwrap_or_default(),
+                supported_cids: rec.supported_cids.clone(),
+                loaded_cids: rec.loaded_cids.clone(),
             });
         }
     }
+    workers
+}
+
+async fn get_gateways(State(state): State<AppState>) -> impl IntoResponse {
+    Json(GatewaysResponse {
+        gateways: gateway_views(&state).await,
+    })
+}
+
+async fn get_workers(State(state): State<AppState>) -> impl IntoResponse {
+    let workers = worker_views(&state).await;
     Json(WorkersResponse { workers })
+}
+
+async fn get_dashboard_status(State(state): State<AppState>) -> impl IntoResponse {
+    let gateways = gateway_views(&state).await;
+    let workers = worker_views(&state).await;
+    Json(DashboardStatusResponse {
+        gateway_count: gateways.len(),
+        worker_count: workers.len(),
+        generated_at_unix_ms: unix_ms_now(),
+        gateways,
+        workers,
+    })
 }
 
 async fn health() -> &'static str {
@@ -675,6 +820,11 @@ async fn purge_loop(state: AppState) {
                 warn!(removed, "purged expired join tokens");
             }
         }
+        state
+            .gateways
+            .write()
+            .await
+            .retain(|_, gateway| now.duration_since(gateway.last_seen) <= STALE_AFTER);
     }
 }
 
@@ -699,9 +849,9 @@ fn unix_secs_now() -> u64 {
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
+        .with_ansi(false)
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
 
@@ -723,13 +873,18 @@ async fn main() -> Result<()> {
 
     let registered_map = redis_load_all(&mut redis_conn).await;
 
-    let admin_token = Uuid::new_v4().to_string();
+    let (admin_token, admin_token_source) = cli
+        .admin_token
+        .filter(|s| !s.trim().is_empty())
+        .map(|token| (token, "configured"))
+        .unwrap_or_else(|| (Uuid::new_v4().to_string(), "generated"));
 
     let state = AppState {
         admin_token: admin_token.clone(),
         join_tokens: Arc::new(RwLock::new(HashMap::new())),
         registered: Arc::new(RwLock::new(registered_map)),
         active: Arc::new(RwLock::new(HashMap::new())),
+        gateways: Arc::new(RwLock::new(HashMap::new())),
         redis: redis_conn,
     };
 
@@ -739,7 +894,10 @@ async fn main() -> Result<()> {
         .route("/v1/admin/tokens", post(create_token).get(list_tokens))
         .route("/v1/admin/tokens/:id", delete(delete_token))
         .route("/v1/admin/registrations", get(list_registrations))
-        .route("/v1/admin/registrations/:peer_id", delete(delete_registration))
+        .route(
+            "/v1/admin/registrations/:peer_id",
+            delete(delete_registration),
+        )
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             admin_auth_middleware,
@@ -750,12 +908,15 @@ async fn main() -> Result<()> {
         .route("/v1/workers/join", post(post_join))
         .route("/v1/workers/heartbeat", post(post_heartbeat))
         .route("/v1/workers", get(get_workers))
+        .route("/v1/gateways/heartbeat", post(post_gateway_heartbeat))
+        .route("/v1/gateways", get(get_gateways))
+        .route("/v1/dashboard/status", get(get_dashboard_status))
         .merge(admin_routes)
         .with_state(state);
 
     println!();
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    println!("  beenet-registry ADMIN TOKEN (changes on every restart)");
+    println!("  beenet-registry ADMIN TOKEN ({admin_token_source})");
     println!("  {admin_token}");
     println!("  Authorization: Bearer <token>  →  /v1/admin/*");
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");

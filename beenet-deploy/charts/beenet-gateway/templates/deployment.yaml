@@ -35,10 +35,33 @@ spec:
             - "{{ .Values.registryPollMs }}"
             - "--default-deadline-ms"
             - "{{ .Values.defaultDeadlineMs }}"
+            - "--gateway-id"
+            - "{{ .Values.gatewayId }}"
+            {{- if .Values.region }}
+            - "--region"
+            - "{{ .Values.region }}"
+            {{- end }}
+            - "--capacity"
+            - "{{ .Values.capacity }}"
+            - "--libp2p-listen-addr"
+            - "{{ .Values.libp2pListenAddr }}"
+            {{- if .Values.publicAddr }}
+            - "--public-addr"
+            - "{{ .Values.publicAddr }}"
+            {{- end }}
+            - "--identity-key-path"
+            - "{{ .Values.identityKeyPath }}"
           ports:
             - name: http
               containerPort: {{ .Values.service.port }}
               protocol: TCP
+            - name: libp2p
+              containerPort: {{ .Values.service.libp2pPort }}
+              protocol: TCP
+          volumeMounts:
+            - name: gateway-identity
+              mountPath: /gateway_cache
+              readOnly: true
           livenessProbe:
             httpGet:
               path: /health
@@ -59,6 +82,13 @@ spec:
           securityContext:
             {{- toYaml . | nindent 12 }}
           {{- end }}
+      volumes:
+        - name: gateway-identity
+          secret:
+            secretName: {{ .Values.identitySecretName }}
+            items:
+              - key: identity.key
+                path: identity.key
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

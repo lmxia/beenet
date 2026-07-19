@@ -5,6 +5,8 @@ SHELL := /bin/bash
 # Override with: make docker-build REGISTRY=your.registry.io VERSION=v0.2.0
 REGISTRY ?= ghcr.io/beenet
 VERSION  ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
+HTTP_PROXY  ?= http://host.docker.internal:7890
+HTTPS_PROXY ?= http://host.docker.internal:7890
 
 REGISTRY_IMAGE := $(REGISTRY)/beenet-registry:$(VERSION)
 GATEWAY_IMAGE  := $(REGISTRY)/beenet-gateway:$(VERSION)
@@ -65,7 +67,7 @@ docker-build-gateway: ## Build beenet-gateway Docker image
 		$(DOCKER_CTX)
 
 .PHONY: docker-push
-docker-push: ## Push both images to the registry
+docker-push: ## Push images to the registry
 	docker push $(REGISTRY_IMAGE)
 	docker push $(GATEWAY_IMAGE)
 
@@ -87,12 +89,12 @@ docker-down: ## Stop docker compose dev stack
 
 # ── Kubernetes ───────────────────────────────────────────────────────────────
 .PHONY: deploy
-deploy: ## Apply all Kubernetes manifests (registry + gateway)
+deploy: ## Apply Kubernetes manifests (registry + gateway)
 	kubectl apply -f beenet-deploy/registry.yaml
 	kubectl apply -f beenet-deploy/gateway.yaml
 
 .PHONY: deploy-registry
-deploy-registry: ## Deploy only beenet-registry (includes Redis)
+deploy-registry: ## Deploy only beenet-registry
 	kubectl apply -f beenet-deploy/registry.yaml
 
 .PHONY: deploy-gateway

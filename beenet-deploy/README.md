@@ -15,9 +15,17 @@ Helm charts for deploying beenet on Kubernetes.
 # Install registry (Redis single-pod is included in the same chart)
 helm install beenet-registry ./charts/beenet-registry
 
-# Install gateway
+# Create gateway identity secret once (do not commit the key):
+#   kubectl -n beenet create secret generic beenet-gateway-identity \
+#     --from-file=identity.key=./identity.key
+
+# Install gateway (workers dial its public libp2p LoadBalancer address)
 helm install beenet-gateway ./charts/beenet-gateway \
   --set registryUrl=http://beenet-registry-beenet-registry:3030
+
+# Or plain manifests:
+#   kubectl apply -f registry.yaml
+#   kubectl apply -f gateway.yaml
 ```
 
 ## beenet-registry

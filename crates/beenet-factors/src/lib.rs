@@ -44,7 +44,9 @@ impl AiUsageSnapshot {
             infer_calls: self.infer_calls.saturating_sub(before.infer_calls),
             embedding_calls: self.embedding_calls.saturating_sub(before.embedding_calls),
             prompt_tokens: self.prompt_tokens.saturating_sub(before.prompt_tokens),
-            generated_tokens: self.generated_tokens.saturating_sub(before.generated_tokens),
+            generated_tokens: self
+                .generated_tokens
+                .saturating_sub(before.generated_tokens),
         }
     }
 }
@@ -306,17 +308,18 @@ fn token_count(s: &str) -> u32 {
 
 fn classify_prompt(model: &str, prompt: &str) -> String {
     let lower = prompt.to_ascii_lowercase();
-    let label = if lower.contains("refund") || lower.contains("billing") || lower.contains("invoice") {
-        "billing"
-    } else if lower.contains("urgent") || lower.contains("down") || lower.contains("outage") {
-        "incident"
-    } else if lower.contains("bug") || lower.contains("error") || lower.contains("crash") {
-        "bug"
-    } else if lower.contains("feature") || lower.contains("request") {
-        "feature"
-    } else {
-        "general"
-    };
+    let label =
+        if lower.contains("refund") || lower.contains("billing") || lower.contains("invoice") {
+            "billing"
+        } else if lower.contains("urgent") || lower.contains("down") || lower.contains("outage") {
+            "incident"
+        } else if lower.contains("bug") || lower.contains("error") || lower.contains("crash") {
+            "bug"
+        } else if lower.contains("feature") || lower.contains("request") {
+            "feature"
+        } else {
+            "general"
+        };
     format!("{model}:{label}")
 }
 

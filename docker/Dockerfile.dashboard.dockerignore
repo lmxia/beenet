@@ -1,0 +1,7 @@
+**
+!dashboard/
+!dashboard/**
+dashboard/node_modules
+dashboard/**/*.log
+!dashboard/dist
+!dashboard/dist/**

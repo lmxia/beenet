@@ -14,5 +14,6 @@ clap = { workspace = true }
 tokio = { workspace = true }
 aws-sdk-s3 = { workspace = true }
 aws-credential-types = { workspace = true }
+aws-smithy-http-client = { workspace = true }
 beenet-common = { workspace = true }
 beenet-manifest = { workspace = true }

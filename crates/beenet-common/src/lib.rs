@@ -92,6 +92,9 @@ mod tests {
         let s = c.to_string();
         let c2: BeenetCid = s.parse().unwrap();
         assert_eq!(c, c2);
-        assert!(s.starts_with("bafkrei"), "cidv1 raw sha256 -> bafkrei*: got {s}");
+        assert!(
+            s.starts_with("bafkrei"),
+            "cidv1 raw sha256 -> bafkrei*: got {s}"
+        );
     }
 }

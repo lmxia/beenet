@@ -1,20 +1,20 @@
 # 本地联调：配合 `docker/docker-compose.dev.yml`（Redis + MinIO + registry + gateway）。
 #
-# 宿主机进程：
-#   beenet-worker --config examples/local-dev-config.toml --join-token <token>
-#   beenet-pack upload --config examples/local-dev-config.toml --wasm dist/task.wasm
+# 宿主机 worker（反向长连接）：
+#   1) registry 发放 join_token
+#   2) beenet-worker --config examples/local-dev-config.toml --join-token <token>
 #
 # Gateway 在 Docker 内时，curl 用 http://127.0.0.1:18080/...（不是 8080）。
-# Worker 在宿主机、Gateway 在容器时，listen_addr 需改为宿主机局域网 IP（见 readme.md）。
 
 [gateway]
 http_addr = "127.0.0.1:8080"
 registry_url = "http://127.0.0.1:3030"
+libp2p_listen_addr = "/ip4/0.0.0.0/tcp/4001"
+# public_addr = "/ip4/127.0.0.1/tcp/4001"
+identity_key_path = "gateway_cache/identity.key"
 
 [worker]
-listen_addr = "/ip4/127.0.0.1/tcp/4001"
 registry_url = "http://127.0.0.1:3030"
-wasm_cache_dir = "wasm_cache"
 # MinIO public read (bucket `beenet`, path-style URL)
 wasm_fetch_base = "http://127.0.0.1:9000/beenet"
 

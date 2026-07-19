@@ -75,13 +75,13 @@ region = "oss-cn-hangzhou"
 | Redis | 6379 | Registry 持久化 Worker 注册信息 |
 | MinIO (S3 API) | 9000 | `beenet-pack upload` 目标 |
 | MinIO Console | 9001 | Web 控制台（`minioadmin` / `minioadmin`） |
-| beenet-registry | 3030 | 控制面 |
-| beenet-gateway | **18080** | HTTP 入口（映射容器 8080，避免与本地 8080 冲突） |
+| beenet-registry | 3030 | 控制面（join / heartbeat / worker 列表） |
+| beenet-gateway | **18080** / **14001** | HTTP 入口 + libp2p（Worker 主动 dial 保持反向长连接） |
 
 ```bash
 # 构建镜像（在仓库根目录）
 make docker-build
-# 若容器内 cargo 需走代理（例如本机 7890）：
+# 若需要显式指定代理（本机代理端口 7890）：
 #   HTTP_PROXY=http://host.docker.internal:7890 HTTPS_PROXY=http://host.docker.internal:7890 make docker-build
 
 # 启动 Redis + MinIO + registry + gateway
@@ -114,10 +114,16 @@ region = "us-east-1"
 force_path_style = true   # MinIO 必须
 ```
 
-Registry 启动时会打印 **Admin Token**。用它签发 Worker 入网用的 **join token**：
+本地 compose 里我把 registry 的 admin token 固定成了：
+
+```text
+beenet-dev-admin-token
+```
+
+用它签发 Worker 入网用的 **join token**：
 
 ```bash
-ADMIN_TOKEN="<registry 日志里的 admin token>"
+ADMIN_TOKEN="beenet-dev-admin-token"
 curl -s -X POST http://127.0.0.1:3030/v1/admin/tokens \
   -H "Authorization: Bearer $ADMIN_TOKEN" \
   -H "Content-Type: application/json" \
@@ -125,16 +131,15 @@ curl -s -X POST http://127.0.0.1:3030/v1/admin/tokens \
 # 响应 JSON 里的 token_value 即 join_token
 ```
 
-**Gateway 在 Docker 里、Worker 在宿主机时**：Worker 的 `listen_addr` 不能写 `127.0.0.1`（容器内无法拨号），需改成宿主机局域网 IP，例如：
+**Gateway 在 Docker 里、Worker 在宿主机时**：Worker 只需要 `registry_url` 和 `join-token`，会先向 Registry 领取 Worker 租约，再由 Registry 返回可用 Gateway 列表；Worker 自己不会再手工指定 `gateway_addr`：
 
 ```bash
-# macOS 若 en0 无地址，可用: ifconfig | grep "inet " | grep -v 127.0.0.1
-HOST_IP=$(ipconfig getifaddr en0 2>/dev/null || hostname -I | awk '{print $1}')
 ./target/release/beenet-worker \
   --config examples/local-dev-config.toml \
-  --listen-addr "/ip4/${HOST_IP}/tcp/4001" \
   --join-token "<token_value>"
 ```
+
+Dashboard 也同样只读 Registry 的 `/v1/dashboard/status`，不再依赖 Gateway 的状态接口；Worker 的在线状态由 Registry 快照里的 `connected` 字段直接呈现。
 
 然后通过 Docker Gateway 发起请求（注意端口 **18080**）：
 

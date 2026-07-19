@@ -1,0 +1,24 @@
+# Build context: beenet/ workspace root
+# 1) Produce static assets (arch-independent), e.g.:
+#    docker run --rm -v "$PWD/dashboard:/app" -w /app node:18-alpine \
+#      sh -c "npm install && npm run build"
+# 2) Runtime image (linux/amd64 for Aliyun ECI):
+#    docker build --pull=false --platform linux/amd64 \
+#      -f docker/Dockerfile.dashboard \
+#      -t teethlink-global-registry.cn-hongkong.cr.aliyuncs.com/beenet/dashboard:latest .
+
+FROM teethlink-global-registry.cn-hongkong.cr.aliyuncs.com/beenet/base-debian:bookworm-slim-amd64
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends nginx \
+    && rm -rf /var/lib/apt/lists/* \
+    && rm -f /etc/nginx/sites-enabled/default
+
+COPY dashboard/docker-entrypoint.sh /docker-entrypoint.sh
+RUN chmod +x /docker-entrypoint.sh
+
+COPY dashboard/dist /usr/share/nginx/html
+
+ENV REGISTRY_UPSTREAM=http://beenet-registry:3030
+EXPOSE 80
+ENTRYPOINT ["/docker-entrypoint.sh"]

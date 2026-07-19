@@ -1,0 +1,68 @@
+# beenet-dashboard (Vite/React SPA + nginx proxy to gateway)
+#
+#   kubectl apply -f dashboard.yaml
+#   kubectl -n beenet get svc beenet-dashboard
+#
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: beenet-dashboard
+  namespace: beenet
+  labels:
+    app: beenet-dashboard
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: beenet-dashboard
+  template:
+    metadata:
+      labels:
+        app: beenet-dashboard
+    spec:
+      containers:
+        - name: dashboard
+          image: teethlink-global-registry.cn-hongkong.cr.aliyuncs.com/beenet/dashboard:latest
+          imagePullPolicy: Always
+          env:
+            - name: REGISTRY_UPSTREAM
+              value: http://beenet-registry:3030
+          ports:
+            - name: http
+              containerPort: 80
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: 20m
+              memory: 32Mi
+            limits:
+              cpu: 200m
+              memory: 64Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: beenet-dashboard
+  namespace: beenet
+  labels:
+    app: beenet-dashboard
+spec:
+  type: LoadBalancer
+  selector:
+    app: beenet-dashboard
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
