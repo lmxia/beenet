@@ -230,23 +230,29 @@ async fn main() -> Result<()> {
     let (tx, rx) = mpsc::channel(32);
     let connected: Arc<RwLock<HashSet<PeerId>>> = Arc::new(RwLock::new(HashSet::new()));
 
-    if let Some(public_addr) = settings.public_addr.as_ref() {
-        let dial_addr = public_addr
+    let dial_addr = if let Some(public_addr) = settings.public_addr.as_ref() {
+        public_addr
             .parse::<Multiaddr>()?
             .with(Protocol::P2p(local_peer_id.into()))
-            .to_string();
-        tokio::spawn(gateway_heartbeat_loop(
-            settings.registry_url.clone(),
-            cli.gateway_id.clone(),
-            cli.region.clone(),
-            cli.capacity,
-            dial_addr,
-            local_key.clone(),
-            connected.clone(),
-        ));
+            .to_string()
     } else {
-        warn!("gateway public_addr is not set; running locally but not registering as a worker discovery candidate");
-    }
+        warn!("gateway public_addr is not set; using libp2p_listen_addr for registry heartbeat in local/test mode");
+        settings
+            .libp2p_listen_addr
+            .parse::<Multiaddr>()?
+            .with(Protocol::P2p(local_peer_id.into()))
+            .to_string()
+    };
+
+    tokio::spawn(gateway_heartbeat_loop(
+        settings.registry_url.clone(),
+        cli.gateway_id.clone(),
+        cli.region.clone(),
+        cli.capacity,
+        dial_addr,
+        local_key.clone(),
+        connected.clone(),
+    ));
 
     tokio::spawn(run_swarm_loop(
         worker_addrs.clone(),

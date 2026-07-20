@@ -54,6 +54,38 @@ code,
   padding: 22px 0 28px;
 }
 
+.login-shell {
+  min-height: calc(100vh - 60px);
+  display: grid;
+  place-items: center;
+}
+
+.login-panel {
+  width: min(520px, 100%);
+  display: grid;
+  gap: 14px;
+}
+
+.token-input,
+.primary {
+  border: 1px solid var(--line);
+  background: #0b1016;
+  color: var(--ink);
+  padding: 12px 14px;
+}
+
+.primary {
+  background: #123047;
+  border-color: rgba(55, 213, 255, 0.5);
+  font-weight: 650;
+}
+
+.head-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
 .console-head {
   display: grid;
   grid-template-columns: minmax(260px, 0.8fr) minmax(560px, 1.2fr);
@@ -127,7 +159,7 @@ code,
 
 .meta-grid {
   display: grid;
-  grid-template-columns: repeat(6, minmax(0, 1fr));
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   border: 1px solid var(--line);
   background: rgba(13, 17, 23, 0.86);
 }
@@ -189,6 +221,16 @@ code,
   grid-template-columns: minmax(0, 1.55fr) minmax(320px, 0.8fr);
   gap: 16px;
   align-items: stretch;
+}
+
+.admin-panel {
+  margin-top: 16px;
+}
+
+.admin-form {
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
 }
 
 .topo-shell {

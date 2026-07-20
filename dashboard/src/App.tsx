@@ -1,25 +1,26 @@
 import { useEffect, useMemo, useState } from "react";
-import { fetchStatus } from "./api";
+import { AuthError, createJoinToken, fetchStatus, listJoinTokens, listRegistrations } from "./api";
 import { Topology } from "./components/Topology";
 import { SidePanel } from "./components/SidePanel";
-import {
-  COPY,
-  detectLanguage,
-  formatTime,
-  LANGUAGE_LABEL,
-  LANGUAGE_STORAGE_KEY,
-  type Language,
-} from "./i18n";
+import { COPY, detectLanguage, formatTime, LANGUAGE_LABEL, LANGUAGE_STORAGE_KEY, type Language } from "./i18n";
 import type { DashboardStatus } from "./types";
 
 const POLL_MS = 3000;
+const ADMIN_TOKEN_KEY = "beenet-dashboard-admin-token";
 
 export default function App() {
   const [language, setLanguage] = useState<Language>(() => detectLanguage());
+  const [adminToken, setAdminToken] = useState<string>(() => window.localStorage.getItem(ADMIN_TOKEN_KEY) ?? "");
+  const [tokenInput, setTokenInput] = useState(adminToken);
+  const [authed, setAuthed] = useState<boolean>(() => Boolean(adminToken));
   const [status, setStatus] = useState<DashboardStatus | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [updatedAt, setUpdatedAt] = useState<string>("—");
   const [selectedPeer, setSelectedPeer] = useState<string | null>(null);
+  const [joinTokensCount, setJoinTokensCount] = useState<number | null>(null);
+  const [registrationsCount, setRegistrationsCount] = useState<number | null>(null);
+  const [busy, setBusy] = useState<string | null>(null);
+  const [loginError, setLoginError] = useState<string | null>(null);
 
   const copy = useMemo(() => COPY[language], [language]);
 
@@ -29,15 +30,16 @@ export default function App() {
   }, [language]);
 
   useEffect(() => {
-    let cancelled = false;
-    const ctrl = { current: null as AbortController | null };
+    if (adminToken) window.localStorage.setItem(ADMIN_TOKEN_KEY, adminToken);
+    else window.localStorage.removeItem(ADMIN_TOKEN_KEY);
+  }, [adminToken]);
 
+  useEffect(() => {
+    if (!authed || !adminToken) return;
+    let cancelled = false;
     const tick = async () => {
-      ctrl.current?.abort();
-      const ac = new AbortController();
-      ctrl.current = ac;
       try {
-        const data = await fetchStatus(ac.signal);
+        const data = await fetchStatus(adminToken);
         if (cancelled) return;
         setStatus(data);
         setError(null);
@@ -48,26 +50,89 @@ export default function App() {
           return data.gateways.some((g) => g.peer_id === prev) ? prev : null;
         });
       } catch (e) {
-        if (cancelled || (e instanceof DOMException && e.name === "AbortError")) return;
+        if (cancelled) return;
+        if (e instanceof AuthError) {
+          setAuthed(false);
+          setError(null);
+          return;
+        }
         setError(e instanceof Error ? e.message : String(e));
       }
     };
-
     void tick();
     const id = window.setInterval(() => void tick(), POLL_MS);
     return () => {
       cancelled = true;
-      ctrl.current?.abort();
       window.clearInterval(id);
     };
-  }, [language]);
+  }, [adminToken, authed, language]);
+
+  useEffect(() => {
+    if (!authed || !adminToken) return;
+    void (async () => {
+      try {
+        const [tokens, registrations] = await Promise.all([listJoinTokens(adminToken), listRegistrations(adminToken)]);
+        setJoinTokensCount(tokens.tokens.length);
+        setRegistrationsCount(registrations.registrations.length);
+      } catch {
+        setJoinTokensCount(null);
+        setRegistrationsCount(null);
+      }
+    })();
+  }, [adminToken, authed]);
+
+  const login = async () => {
+    const nextToken = tokenInput.trim();
+    if (!nextToken) {
+      setLoginError(language === "zh" ? "请输入 admin token" : "Enter the admin token");
+      return;
+    }
+    setBusy("login");
+    setLoginError(null);
+    try {
+      await fetchStatus(nextToken);
+      setAdminToken(nextToken);
+      setAuthed(true);
+      setError(null);
+    } catch (e) {
+      setLoginError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const logout = () => {
+    setAdminToken("");
+    setTokenInput("");
+    setAuthed(false);
+    setStatus(null);
+    setError(null);
+    setJoinTokensCount(null);
+    setRegistrationsCount(null);
+  };
 
   const online = status?.workers.filter((w) => w.connected).length ?? 0;
   const gateways = status?.gateways ?? [];
   const registryState = error ? "DEGRADED" : status ? "ONLINE" : "SYNCING";
-  const snapshotAt = status?.generated_at_unix_ms
-    ? formatTime(language, status.generated_at_unix_ms)
-    : "—";
+  const snapshotAt = status?.generated_at_unix_ms ? formatTime(language, status.generated_at_unix_ms) : "—";
+
+  if (!authed) {
+    return (
+      <div className="app">
+        <section className="login-shell">
+          <div className="panel login-panel">
+            <h1>{copy.brand}</h1>
+            <p>{language === "zh" ? "请输入管理员 token 进入控制台" : "Enter the admin token to access the console"}</p>
+            <input className="token-input" type="password" autoFocus value={tokenInput} onChange={(e) => setTokenInput(e.target.value)} placeholder="Bearer token" />
+            <button type="button" className="primary" onClick={() => void login()} disabled={busy === "login"}>
+              {busy === "login" ? (language === "zh" ? "登录中…" : "Signing in…") : (language === "zh" ? "登录" : "Sign in")}
+            </button>
+            {loginError && <p className="err">{loginError}</p>}
+          </div>
+        </section>
+      </div>
+    );
+  }
 
   return (
     <div className="app">
@@ -82,59 +147,41 @@ export default function App() {
               <span className="mono">{status ? copy.gatewayCountSuffix(status.gateway_count) : "—"}</span>
             </div>
           </div>
-          <button
-            type="button"
-            className="lang-switch"
-            onClick={() => setLanguage((prev) => (prev === "zh" ? "en" : "zh"))}
-            aria-label={copy.toggle}
-          >
-            {LANGUAGE_LABEL[language]}
-          </button>
+          <div className="head-actions">
+            <button type="button" className="lang-switch" onClick={() => setLanguage((prev) => (prev === "zh" ? "en" : "zh"))} aria-label={copy.toggle}>
+              {LANGUAGE_LABEL[language]}
+            </button>
+            <button type="button" className="lang-switch" onClick={logout}>
+              {language === "zh" ? "退出" : "Logout"}
+            </button>
+          </div>
         </div>
         <div className="meta-grid">
-          <div className="stat">
-            <span className="label">{copy.registryLabel}</span>
-            <span className={`value state ${error ? "bad" : "ok"}`}>{registryState}</span>
-          </div>
-          <div className="stat">
-            <span className="label">{copy.gatewaysLabel}</span>
-            <span className="value">{status?.gateway_count ?? 0}</span>
-          </div>
-          <div className="stat">
-            <span className="label">{copy.workersLabel}</span>
-            <span className="value">{online}/{status?.worker_count ?? 0}</span>
-          </div>
-          <div className="stat">
-            <span className="label">{copy.healthyGatewaysLabel}</span>
-            <span className="value">{gateways.length}</span>
-          </div>
-          <div className="stat">
-            <span className="label">{copy.snapshotLabel}</span>
-            <span className="value mono">{snapshotAt}</span>
-          </div>
-          <div className="stat">
-            <span className="label">{copy.lastSyncLabel}</span>
-            <span className="value mono">{updatedAt}</span>
-          </div>
+          <div className="stat"><span className="label">{copy.registryLabel}</span><span className={`value state ${error ? "bad" : "ok"}`}>{registryState}</span></div>
+          <div className="stat"><span className="label">{copy.gatewaysLabel}</span><span className="value">{status?.gateway_count ?? 0}</span></div>
+          <div className="stat"><span className="label">{copy.workersLabel}</span><span className="value">{online}/{status?.worker_count ?? 0}</span></div>
+          <div className="stat"><span className="label">{copy.healthyGatewaysLabel}</span><span className="value">{gateways.length}</span></div>
+          <div className="stat"><span className="label">{copy.snapshotLabel}</span><span className="value mono">{snapshotAt}</span></div>
+          <div className="stat"><span className="label">{copy.lastSyncLabel}</span><span className="value mono">{updatedAt}</span></div>
+          <div className="stat"><span className="label">Join Tokens</span><span className="value">{joinTokensCount ?? "—"}</span></div>
+          <div className="stat"><span className="label">Registrations</span><span className="value">{registrationsCount ?? "—"}</span></div>
         </div>
       </header>
 
       <div className="layout">
-        <Topology
-          status={status}
-          selectedPeer={selectedPeer}
-          onSelect={setSelectedPeer}
-          language={language}
-        />
-        <SidePanel
-          status={status}
-          selectedPeer={selectedPeer}
-          onSelect={setSelectedPeer}
-          language={language}
-        />
+        <Topology status={status} selectedPeer={selectedPeer} onSelect={setSelectedPeer} language={language} />
+        <SidePanel status={status} selectedPeer={selectedPeer} onSelect={setSelectedPeer} language={language} />
       </div>
 
       {error && <p className="err">{copy.statusFetchPrefix}{error}</p>}
+      <section className="panel admin-panel">
+        <h2>{language === "zh" ? "Admin" : "Admin"}</h2>
+        <div className="admin-form">
+          <button type="button" className="primary" onClick={() => void createJoinToken(adminToken, "dashboard", 86400)}>
+            {language === "zh" ? "创建 Join Token" : "Create Join Token"}
+          </button>
+        </div>
+      </section>
       <p className="footer">{copy.registryProxy} · poll {POLL_MS / 1000}s · source /v1/dashboard/status</p>
     </div>
   );

@@ -24,15 +24,18 @@
 //! | DELETE | `/v1/admin/tokens/:id` | admin | revoke join token |
 //! | GET  | `/v1/admin/registrations` | admin | list registered workers |
 //! | DELETE | `/v1/admin/registrations/:peer_id` | admin | revoke worker registration |
+//! | GET  | `/v1/gateways?peer_id=` | none | personalized Gateway tip for a worker |
+//! | GET  | `/v1/dashboard/status` | none | full gateway + worker snapshot |
 //! | GET  | `/health` | none | liveness probe |
 
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
-use axum::extract::{Path, Request, State};
+use axum::extract::{Path, Query, Request, State};
 use axum::http::StatusCode;
 use axum::middleware::Next;
 use axum::response::IntoResponse;
@@ -54,6 +57,10 @@ const STALE_AFTER: Duration = Duration::from_secs(60);
 const SIGNATURE_WINDOW_SECS: u64 = 60;
 /// Redis Hash key that stores all worker registrations.
 const REDIS_REG_KEY: &str = "beenet:registrations";
+/// Max gateways returned to a worker (primary + HA backups).
+const GATEWAY_TIP_SIZE: usize = 3;
+/// Modulus for sticky hash tie-break among equal-scoring gateways.
+const STICKY_MOD: u64 = 1_000_000;
 
 // ── CLI ────────────────────────────────────────────────────────────────────
 
@@ -103,6 +110,8 @@ struct RedisRegistration {
     supported_cids: Vec<String>,
     #[serde(default)]
     loaded_cids: Vec<String>,
+    #[serde(default)]
+    region: Option<String>,
 }
 
 /// Upsert one registration into Redis (`HSET beenet:registrations <peer_id> <json>`).
@@ -116,6 +125,7 @@ async fn redis_put(
         registered_at_unix_ms: rec.registered_at_unix_ms,
         supported_cids: rec.supported_cids.clone(),
         loaded_cids: rec.loaded_cids.clone(),
+        region: rec.region.clone(),
     };
     let json = match serde_json::to_string(&value) {
         Ok(j) => j,
@@ -190,6 +200,7 @@ async fn redis_load_all(
                 registered_at_unix_ms: r.registered_at_unix_ms,
                 supported_cids: r.supported_cids,
                 loaded_cids: r.loaded_cids,
+                region: r.region,
             },
         );
     }
@@ -221,6 +232,7 @@ struct RegistrationRecord {
     registered_at_unix_ms: u64,
     supported_cids: Vec<String>,
     loaded_cids: Vec<String>,
+    region: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -228,6 +240,7 @@ struct ActiveRecord {
     last_seen: Instant,
     supported_cids: Vec<String>,
     loaded_cids: Vec<String>,
+    region: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -313,6 +326,8 @@ struct JoinBody {
     supported_cids: Vec<String>,
     #[serde(default)]
     loaded_cids: Vec<String>,
+    #[serde(default)]
+    region: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -331,6 +346,8 @@ struct HeartbeatBody {
     supported_cids: Vec<String>,
     #[serde(default)]
     loaded_cids: Vec<String>,
+    #[serde(default)]
+    region: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -586,11 +603,13 @@ async fn post_join(
     }
 
     // 5. Upsert registration record (in-memory + Redis).
+    let region = normalize_region(body.region);
     let rec = RegistrationRecord {
         public_key: pubkey,
         registered_at_unix_ms: unix_ms_now(),
         supported_cids: body.supported_cids.clone(),
         loaded_cids: body.loaded_cids.clone(),
+        region: region.clone(),
     };
     redis_put(&mut state.redis, &claimed_peer_id, &rec).await;
     state.registered.write().await.insert(claimed_peer_id, rec);
@@ -600,6 +619,7 @@ async fn post_join(
             last_seen: Instant::now(),
             supported_cids: body.supported_cids.clone(),
             loaded_cids: body.loaded_cids.clone(),
+            region,
         },
     );
     info!(peer_id = %claimed_peer_id, "worker registered");
@@ -644,20 +664,35 @@ async fn post_heartbeat(
         return (StatusCode::UNAUTHORIZED, e.to_string()).into_response();
     }
 
+    let region_from_body = normalize_region(body.region.clone());
+    let worker_region = {
+        let mut map = state.registered.write().await;
+        if let Some(rec) = map.get_mut(&pid) {
+            rec.supported_cids = body.supported_cids.clone();
+            rec.loaded_cids = body.loaded_cids.clone();
+            if let Some(region) = region_from_body.clone() {
+                rec.region = Some(region);
+            }
+            let region = rec.region.clone();
+            let snapshot = rec.clone();
+            drop(map);
+            redis_put(&mut state.redis.clone(), &pid, &snapshot).await;
+            region
+        } else {
+            region_from_body
+        }
+    };
     state.active.write().await.insert(
         pid,
         ActiveRecord {
             last_seen: Instant::now(),
             supported_cids: body.supported_cids.clone(),
             loaded_cids: body.loaded_cids.clone(),
+            region: worker_region.clone(),
         },
     );
-    if let Some(rec) = state.registered.write().await.get_mut(&pid) {
-        rec.supported_cids = body.supported_cids.clone();
-        rec.loaded_cids = body.loaded_cids.clone();
-    }
     info!(peer_id = %pid, "worker heartbeat ok (lease renewed)");
-    let gateways = gateway_views(&state).await;
+    let gateways = gateway_tip_for(&state, &body.peer_id, worker_region.as_deref()).await;
     (
         StatusCode::OK,
         Json(HeartbeatOkResponse { ok: true, gateways }),
@@ -725,7 +760,7 @@ async fn gateway_views(state: &AppState) -> Vec<GatewayView> {
         .iter()
         .filter_map(|(peer_id, gateway)| {
             let age = now.duration_since(gateway.last_seen);
-            (age <= STALE_AFTER).then(|| GatewayView {
+            (age <= STALE_AFTER && gateway.capacity > 0).then(|| GatewayView {
                 gateway_id: gateway.gateway_id.clone(),
                 peer_id: peer_id.to_string(),
                 dial_addr: gateway.dial_addr.clone(),
@@ -736,10 +771,152 @@ async fn gateway_views(state: &AppState) -> Vec<GatewayView> {
             })
         })
         .collect();
-    values.sort_by_key(|gateway| {
-        gateway.connected_workers.saturating_mul(10_000) / gateway.capacity.max(1)
-    });
+    values.sort_by_key(|gateway| gateway_load(gateway));
     values
+}
+
+fn gateway_load(gateway: &GatewayView) -> u32 {
+    gateway
+        .connected_workers
+        .saturating_mul(10_000)
+        / gateway.capacity.max(1)
+}
+
+fn normalize_region(region: Option<String>) -> Option<String> {
+    region.and_then(|r| {
+        let t = r.trim();
+        (!t.is_empty()).then(|| t.to_string())
+    })
+}
+
+fn affinity_penalty(worker_region: Option<&str>, gateway_region: &Option<String>) -> u8 {
+    let wr = worker_region.map(str::trim).filter(|s| !s.is_empty());
+    let gr = gateway_region
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    match (wr, gr) {
+        (Some(wr), Some(gr)) if wr.eq_ignore_ascii_case(gr) => 0,
+        (Some(_), _) => 2,
+        (None, _) => 1,
+    }
+}
+
+fn sticky_key(worker_peer_id: &str, gateway_peer_id: &str) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    worker_peer_id.hash(&mut hasher);
+    gateway_peer_id.hash(&mut hasher);
+    hasher.finish() % STICKY_MOD
+}
+
+/// Pick a small, affinity-aware, diversified gateway tip for one worker.
+fn select_gateway_tip(
+    candidates: Vec<GatewayView>,
+    worker_peer_id: &str,
+    worker_region: Option<&str>,
+) -> Vec<GatewayView> {
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+
+    let mut scored: Vec<(u8, u32, u64, GatewayView)> = candidates
+        .into_iter()
+        .map(|gateway| {
+            let aff = affinity_penalty(worker_region, &gateway.region);
+            let load = gateway_load(&gateway);
+            let sticky = sticky_key(worker_peer_id, &gateway.peer_id);
+            (aff, load, sticky, gateway)
+        })
+        .collect();
+    scored.sort_by_key(|(aff, load, sticky, _)| (*aff, *load, *sticky));
+
+    let mut selected = Vec::with_capacity(GATEWAY_TIP_SIZE);
+    selected.push(scored.remove(0).3);
+
+    while selected.len() < GATEWAY_TIP_SIZE && !scored.is_empty() {
+        let selected_regions: Vec<String> = selected
+            .iter()
+            .filter_map(|g| normalize_region(g.region.clone()).map(|r| r.to_ascii_lowercase()))
+            .collect();
+        let selected_peers: std::collections::HashSet<&str> =
+            selected.iter().map(|g| g.peer_id.as_str()).collect();
+
+        let mut best_idx = None;
+        let mut best_key: Option<(bool, u32, u64)> = None;
+        for (idx, (_aff, load, sticky, gateway)) in scored.iter().enumerate() {
+            if selected_peers.contains(gateway.peer_id.as_str()) {
+                continue;
+            }
+            let region_diverse = gateway
+                .region
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|r| {
+                    let lower = r.to_ascii_lowercase();
+                    !selected_regions.iter().any(|sr| sr == &lower)
+                })
+                .unwrap_or(false);
+            // Prefer region-diverse first, then lower load, then sticky.
+            let key = (!region_diverse, *load, *sticky);
+            if best_key.map_or(true, |bk| key < bk) {
+                best_key = Some(key);
+                best_idx = Some(idx);
+            }
+        }
+        match best_idx {
+            Some(idx) => selected.push(scored.remove(idx).3),
+            None => break,
+        }
+    }
+    selected
+}
+
+async fn gateway_tip_for(
+    state: &AppState,
+    worker_peer_id: &str,
+    worker_region: Option<&str>,
+) -> Vec<GatewayView> {
+    let all = gateway_views(state).await;
+    select_gateway_tip(all, worker_peer_id, worker_region)
+}
+
+#[derive(Debug, Deserialize)]
+struct GatewaysQuery {
+    peer_id: String,
+    #[serde(default)]
+    region: Option<String>,
+}
+
+async fn get_gateways(
+    State(state): State<AppState>,
+    Query(query): Query<GatewaysQuery>,
+) -> impl IntoResponse {
+    let peer_id = query.peer_id.trim();
+    if peer_id.is_empty() {
+        return (StatusCode::BAD_REQUEST, "peer_id query parameter is required").into_response();
+    }
+    let pid = match PeerId::from_str(peer_id) {
+        Ok(p) => p,
+        Err(_) => return (StatusCode::BAD_REQUEST, "invalid peer_id").into_response(),
+    };
+
+    let region = match normalize_region(query.region) {
+        Some(r) => Some(r),
+        None => {
+            let registered = state.registered.read().await;
+            let active = state.active.read().await;
+            registered
+                .get(&pid)
+                .and_then(|r| r.region.clone())
+                .or_else(|| active.get(&pid).and_then(|r| r.region.clone()))
+        }
+    };
+
+    Json(GatewaysResponse {
+        gateways: gateway_tip_for(&state, peer_id, region.as_deref()).await,
+    })
+    .into_response()
 }
 
 async fn worker_views(state: &AppState) -> Vec<WorkerView> {
@@ -764,12 +941,6 @@ async fn worker_views(state: &AppState) -> Vec<WorkerView> {
         }
     }
     workers
-}
-
-async fn get_gateways(State(state): State<AppState>) -> impl IntoResponse {
-    Json(GatewaysResponse {
-        gateways: gateway_views(&state).await,
-    })
 }
 
 async fn get_workers(State(state): State<AppState>) -> impl IntoResponse {
@@ -931,4 +1102,90 @@ async fn main() -> Result<()> {
     let listener = tokio::net::TcpListener::bind(http_addr).await?;
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod gateway_tip_tests {
+    use super::*;
+
+    fn gw(
+        peer_id: &str,
+        region: Option<&str>,
+        connected: u32,
+        capacity: u32,
+    ) -> GatewayView {
+        GatewayView {
+            gateway_id: peer_id.to_string(),
+            peer_id: peer_id.to_string(),
+            dial_addr: format!("/ip4/127.0.0.1/tcp/4001/p2p/{peer_id}"),
+            region: region.map(str::to_string),
+            capacity,
+            connected_workers: connected,
+            last_seen_unix_ms: 0,
+        }
+    }
+
+    #[test]
+    fn prefers_same_region_as_primary() {
+        let tip = select_gateway_tip(
+            vec![
+                gw("g-remote", Some("us-west"), 0, 1000),
+                gw("g-local-busy", Some("cn-hangzhou"), 900, 1000),
+                gw("g-local-free", Some("cn-hangzhou"), 10, 1000),
+            ],
+            "worker-1",
+            Some("cn-hangzhou"),
+        );
+        assert_eq!(tip[0].peer_id, "g-local-free");
+        assert!(tip.iter().any(|g| g.peer_id == "g-remote"));
+        assert!(tip.len() <= GATEWAY_TIP_SIZE);
+    }
+
+    #[test]
+    fn backups_prefer_different_region() {
+        let tip = select_gateway_tip(
+            vec![
+                gw("a", Some("r1"), 0, 1000),
+                gw("b", Some("r1"), 1, 1000),
+                gw("c", Some("r2"), 50, 1000),
+                gw("d", Some("r3"), 50, 1000),
+            ],
+            "worker-x",
+            Some("r1"),
+        );
+        assert_eq!(tip[0].region.as_deref(), Some("r1"));
+        assert_eq!(tip.len(), 3);
+        let regions: Vec<_> = tip.iter().filter_map(|g| g.region.as_deref()).collect();
+        assert!(regions.contains(&"r2") || regions.contains(&"r3"));
+    }
+
+    #[test]
+    fn no_region_still_returns_diversified_tip() {
+        let tip = select_gateway_tip(
+            vec![
+                gw("a", Some("r1"), 0, 1000),
+                gw("b", Some("r2"), 0, 1000),
+                gw("c", Some("r3"), 0, 1000),
+                gw("d", Some("r4"), 0, 1000),
+            ],
+            "worker-y",
+            None,
+        );
+        assert_eq!(tip.len(), GATEWAY_TIP_SIZE);
+        let peers: std::collections::HashSet<_> =
+            tip.iter().map(|g| g.peer_id.as_str()).collect();
+        assert_eq!(peers.len(), GATEWAY_TIP_SIZE);
+    }
+
+    #[test]
+    fn sticky_is_stable_for_same_worker() {
+        let candidates = vec![
+            gw("g1", Some("r1"), 10, 1000),
+            gw("g2", Some("r1"), 10, 1000),
+            gw("g3", Some("r1"), 10, 1000),
+        ];
+        let a = select_gateway_tip(candidates.clone(), "worker-stable", Some("r1"));
+        let b = select_gateway_tip(candidates, "worker-stable", Some("r1"));
+        assert_eq!(a[0].peer_id, b[0].peer_id);
+    }
 }

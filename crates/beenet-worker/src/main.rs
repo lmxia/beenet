@@ -83,6 +83,10 @@ struct Args {
 
     #[arg(long)]
     wasm_fetch_timeout_secs: Option<u64>,
+
+    /// Optional region for Registry Gateway affinity (overrides `[worker].region`).
+    #[arg(long)]
+    region: Option<String>,
 }
 
 #[derive(NetworkBehaviour)]
@@ -544,6 +548,8 @@ struct JoinBody {
     signature: String,
     supported_cids: Vec<String>,
     loaded_cids: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    region: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -558,6 +564,14 @@ struct HeartbeatBody {
     signature: String,
     supported_cids: Vec<String>,
     loaded_cids: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    region: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct HeartbeatOkResponse {
+    #[serde(default)]
+    gateways: Vec<GatewayCandidate>,
 }
 
 // ── Registration & heartbeat logic ────────────────────────────────────────
@@ -571,6 +585,7 @@ async fn do_join(
     supported_cids: Vec<String>,
     loaded_cids: Vec<String>,
     join_token: &str,
+    region: Option<&str>,
 ) -> Result<()> {
     let ts = unix_secs_now();
     let sig = make_signature(keypair, peer_id, ts)?;
@@ -583,6 +598,7 @@ async fn do_join(
         signature: sig,
         supported_cids,
         loaded_cids,
+        region: region.map(str::to_owned),
     };
     let resp = http
         .post(join_url)
@@ -603,7 +619,7 @@ async fn do_join(
     anyhow::bail!("join rejected (HTTP {status}): {text}")
 }
 
-/// Send one heartbeat. Returns `true` if accepted (200), `false` if 401 (unregistered).
+/// Send one heartbeat. Returns `Ok(Some(tip))` if accepted, `Ok(None)` if 401 (unregistered).
 async fn do_heartbeat(
     http: &reqwest::Client,
     heartbeat_url: &str,
@@ -611,7 +627,8 @@ async fn do_heartbeat(
     peer_id: &str,
     supported_cids: Vec<String>,
     loaded_cids: Vec<String>,
-) -> Result<bool> {
+    region: Option<&str>,
+) -> Result<Option<Vec<GatewayCandidate>>> {
     let ts = unix_secs_now();
     let sig = make_signature(keypair, peer_id, ts)?;
     let body = HeartbeatBody {
@@ -620,6 +637,7 @@ async fn do_heartbeat(
         signature: sig,
         supported_cids,
         loaded_cids,
+        region: region.map(str::to_owned),
     };
     let resp = http
         .post(heartbeat_url)
@@ -629,13 +647,17 @@ async fn do_heartbeat(
         .with_context(|| format!("POST {heartbeat_url}"))?;
     let status = resp.status();
     if status == reqwest::StatusCode::UNAUTHORIZED {
-        return Ok(false);
+        return Ok(None);
     }
     if !status.is_success() {
         let text = resp.text().await.unwrap_or_default();
         anyhow::bail!("heartbeat failed (HTTP {status}): {text}");
     }
-    Ok(true)
+    let parsed: HeartbeatOkResponse = resp
+        .json()
+        .await
+        .context("parse heartbeat response")?;
+    Ok(Some(parsed.gateways))
 }
 
 async fn registry_heartbeat_loop(
@@ -647,6 +669,8 @@ async fn registry_heartbeat_loop(
     runtime: Arc<Runtime>,
     period: Duration,
     join_token: Option<String>,
+    region: Option<String>,
+    gateway_tx: watch::Sender<Vec<GatewayCandidate>>,
 ) {
     let mut interval = tokio::time::interval(period);
     loop {
@@ -660,13 +684,18 @@ async fn registry_heartbeat_loop(
             &peer_id,
             supported_cids.clone(),
             loaded_cids.clone(),
+            region.as_deref(),
         )
         .await
         {
-            Ok(true) => {
+            Ok(Some(tip)) => {
+                let merged = take_gateway_tip(tip, &[]);
+                if *gateway_tx.borrow() != merged {
+                    let _ = gateway_tx.send(merged);
+                }
                 info!("registry heartbeat ok");
             }
-            Ok(false) => {
+            Ok(None) => {
                 // Registry restarted or registration was revoked — attempt re-join.
                 warn!("heartbeat rejected (unregistered); attempting re-join");
                 if let Some(ref token) = join_token {
@@ -678,6 +707,7 @@ async fn registry_heartbeat_loop(
                         supported_cids,
                         loaded_cids,
                         token,
+                        region.as_deref(),
                     )
                     .await
                     {
@@ -738,13 +768,15 @@ struct GatewaysBody {
     gateways: Vec<GatewayCandidate>,
 }
 
-fn merge_gateway_candidates(
+const GATEWAY_TIP_SIZE: usize = 3;
+
+fn take_gateway_tip(
     discovered: Vec<GatewayCandidate>,
     fallback: &[GatewayCandidate],
 ) -> Vec<GatewayCandidate> {
     let mut merged = Vec::new();
     for candidate in discovered.into_iter() {
-        if merged.len() >= 2 {
+        if merged.len() >= GATEWAY_TIP_SIZE {
             break;
         }
         if candidate.peer_id.trim().is_empty() || candidate.dial_addr.trim().is_empty() {
@@ -766,7 +798,7 @@ fn merge_gateway_candidates(
     }
 
     for candidate in fallback {
-        if merged.len() >= 2 {
+        if merged.len() >= GATEWAY_TIP_SIZE {
             break;
         }
         if !merged
@@ -796,19 +828,29 @@ fn reconnect_jitter() -> Duration {
 
 async fn gateway_discovery_loop(
     registry_url: String,
+    peer_id: String,
+    region: Option<String>,
     fallback: Vec<GatewayCandidate>,
     tx: watch::Sender<Vec<GatewayCandidate>>,
 ) {
     let client = reqwest::Client::new();
-    let url = format!("{}/v1/gateways", registry_url.trim_end_matches('/'));
     let mut interval = tokio::time::interval(Duration::from_secs(10));
     loop {
         interval.tick().await;
+        let mut url = format!(
+            "{}/v1/gateways?peer_id={}",
+            registry_url.trim_end_matches('/'),
+            urlencoding_peer_id(&peer_id)
+        );
+        if let Some(ref region) = region {
+            url.push_str("&region=");
+            url.push_str(&urlencoding_peer_id(region));
+        }
         match client.get(&url).send().await {
             Ok(response) if response.status().is_success() => {
                 match response.json::<GatewaysBody>().await {
                     Ok(body) => {
-                        let merged = merge_gateway_candidates(body.gateways, &fallback);
+                        let merged = take_gateway_tip(body.gateways, &fallback);
                         if *tx.borrow() != merged {
                             let _ = tx.send(merged);
                         }
@@ -822,6 +864,23 @@ async fn gateway_discovery_loop(
             Err(error) => warn!(%error, "gateway discovery failed; retaining cached candidates"),
         }
     }
+}
+
+/// Minimal query escaping for peer_id / region path segments.
+fn urlencoding_peer_id(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for b in value.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => {
+                out.push('%');
+                out.push_str(&format!("{b:02X}"));
+            }
+        }
+    }
+    out
 }
 
 async fn run_swarm_loop(
@@ -970,6 +1029,7 @@ async fn main() -> Result<()> {
         wasm_fetch_base: cli.wasm_fetch_base.clone(),
         wasm_fetch_bearer: cli.wasm_fetch_bearer.clone(),
         wasm_fetch_timeout_secs: cli.wasm_fetch_timeout_secs,
+        region: cli.region.clone(),
     };
     let settings = beenet_common::config::resolve_worker_settings(&file_cfg, &overrides)?;
     let listen_addr: Multiaddr = settings
@@ -993,8 +1053,10 @@ async fn main() -> Result<()> {
     let (gateway_tx, gateway_rx) = watch::channel(fallback_gateways.clone());
     tokio::spawn(gateway_discovery_loop(
         settings.registry_url.clone(),
+        local_peer_id.to_string(),
+        settings.region.clone(),
         fallback_gateways,
-        gateway_tx,
+        gateway_tx.clone(),
     ));
     tokio::spawn(run_swarm_loop(runtime.clone(), gateway_rx, swarm));
 
@@ -1004,6 +1066,7 @@ async fn main() -> Result<()> {
         wasm_cache_dir = %settings.wasm_cache_dir.display(),
         max_concurrency = runtime.gate.available_permits(),
         max_instance_memory_mb = runtime.max_instance_memory_mb,
+        region = ?settings.region,
         "worker started (dials gateway; keeps reverse long connection)"
     );
 
@@ -1023,13 +1086,16 @@ async fn main() -> Result<()> {
         &peer_s,
         initial_supported_cids.clone(),
         initial_loaded_cids.clone(),
+        settings.region.as_deref(),
     )
     .await
     {
-        Ok(true) => {
+        Ok(Some(tip)) => {
+            let merged = take_gateway_tip(tip, &[]);
+            let _ = gateway_tx.send(merged);
             info!(peer_id = %local_peer_id, "worker already registered with registry");
         }
-        Ok(false) => {
+        Ok(None) => {
             // Not yet registered — join now.
             if let Some(ref token) = settings.join_token {
                 do_join(
@@ -1040,6 +1106,7 @@ async fn main() -> Result<()> {
                     initial_supported_cids,
                     initial_loaded_cids,
                     token,
+                    settings.region.as_deref(),
                 )
                 .await
                 .context("initial worker registration failed")?;
@@ -1058,6 +1125,7 @@ async fn main() -> Result<()> {
 
     let period = Duration::from_secs(settings.registry_heartbeat_secs);
     let join_token = settings.join_token.clone();
+    let region = settings.region.clone();
     tokio::spawn(registry_heartbeat_loop(
         http,
         heartbeat_url,
@@ -1067,6 +1135,8 @@ async fn main() -> Result<()> {
         runtime.clone(),
         period,
         join_token,
+        region,
+        gateway_tx,
     ));
     tokio::signal::ctrl_c()
         .await
