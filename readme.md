@@ -64,9 +64,9 @@ region = "oss-cn-hangzhou"
 
 也可直接使用 **`examples/local-dev-config.toml`**：已预置 **MinIO**（本地 S3）的 `[oss]` 与 `[worker].wasm_fetch_base`，配合 `docker/docker-compose.dev.yml` 做 upload 联调。
 
-## 容器化（Registry + Gateway + MinIO）
+## 容器化（Registry + Gateway + Dashboard + MinIO）
 
-`registry` 与 `gateway` 提供 Dockerfile；**worker 仍在宿主机运行**（依赖 Spin 宿主，暂不容器化）。
+`registry`、`gateway` 与 `dashboard` 提供普通 Dockerfile；**worker 仍在宿主机运行**（依赖 Spin 宿主，暂不容器化）。
 
 `docker/docker-compose.dev.yml` 会一并启动：
 
@@ -77,6 +77,7 @@ region = "oss-cn-hangzhou"
 | MinIO Console | 9001 | Web 控制台（`minioadmin` / `minioadmin`） |
 | beenet-registry | 3030 | 控制面（join / heartbeat / worker 列表） |
 | beenet-gateway | **18080** / **14001** | HTTP 入口 + libp2p（Worker 主动 dial 保持反向长连接） |
+| beenet-dashboard | 8081 | Registry 管理控制台，使用 admin token 登录 |
 
 ```bash
 # 构建镜像（在仓库根目录）
@@ -88,6 +89,27 @@ make docker-build
 docker compose -f docker/docker-compose.dev.yml up -d --no-build
 docker compose -f docker/docker-compose.dev.yml logs -f beenet-registry
 ```
+
+Dashboard 提供两套构建文件：
+
+```bash
+# 普通多阶段构建，自动执行 npm ci 与 npm run build
+docker build -f docker/Dockerfile.dashboard \
+  --build-arg HTTP_PROXY=http://host.docker.internal:7890 \
+  --build-arg HTTPS_PROXY=http://host.docker.internal:7890 \
+  -t beenet/dashboard:dev .
+
+# 阿里云 ACR/ECI：Node builder + ACR amd64 runtime 多阶段构建
+docker build --pull=false --platform linux/amd64 \
+  --build-arg HTTP_PROXY=http://host.docker.internal:7890 \
+  --build-arg HTTPS_PROXY=http://host.docker.internal:7890 \
+  -f docker/Dockerfile.dashboard.acr \
+  -t teethlink-global-registry.cn-hongkong.cr.aliyuncs.com/beenet/dashboard:latest .
+```
+
+两套 Dockerfile 都会在 builder 阶段执行 `npm ci` 与 `npm run build`，宿主机不需要安装 Node/npm。`Dockerfile.dashboard.acr` 使用 Node builder 与 ACR 中的 amd64 Debian runtime，适用于阿里云 ECI；普通 `Dockerfile.dashboard` 使用 Docker Hub 的 Node/nginx 多架构镜像，供本地和通用 CI 构建。
+
+上述 build args 用于镜像内部的 `npm`/`apt` 请求。如果失败发生在 `load metadata` 或 `fetch oauth token`，说明基础镜像拉取没有经过代理，需要在 Docker Desktop 的代理设置中将 HTTP/HTTPS proxy 指向宿主机 `127.0.0.1:7890` 后重启 Docker Desktop；Dockerfile build args 无法影响 daemon 拉取 `FROM` 镜像。
 
 MinIO 使用 `quay.io/minio/*` 镜像（避免 Docker Hub 拉取超时）。`minio-init` 会自动创建 bucket `beenet` 并开启匿名下载，Worker 可通过 `http://127.0.0.1:9000/beenet/<cid>` 拉取 wasm。
 
@@ -312,7 +334,7 @@ content-length: 27
 | `crates/beenet-gateway` | HTTP → libp2p；**必填** Registry URL，轮询 Worker 列表 |
 | `examples/hello-filter-http` | `#[http_component]` 工单分类示例任务 |
 | `examples/local-dev-config.toml` | 本地联调配置（MinIO `[oss]` + gateway / worker） |
-| `docker/` | Registry / Gateway Dockerfile、`docker-compose.dev.yml`（含 MinIO） |
+| `docker/` | Registry / Gateway / Dashboard Dockerfile、`docker-compose.dev.yml`（含 MinIO） |
 | `Makefile` | `make build`、`make docker-build`、`make docker-up` 等 |
 
 ## 许可

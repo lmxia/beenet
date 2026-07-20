@@ -10,6 +10,7 @@ HTTPS_PROXY ?= http://host.docker.internal:7890
 
 REGISTRY_IMAGE := $(REGISTRY)/beenet-registry:$(VERSION)
 GATEWAY_IMAGE  := $(REGISTRY)/beenet-gateway:$(VERSION)
+DASHBOARD_IMAGE := $(REGISTRY)/beenet-dashboard:$(VERSION)
 
 # Build context is the beenet/ workspace root.
 # spin/ is NOT needed: beenet-worker/beenet-factors (the spin users) are stripped
@@ -46,7 +47,7 @@ check: fmt-check lint ## Run all static checks (fmt + clippy)
 
 # ── Docker ───────────────────────────────────────────────────────────────────
 .PHONY: docker-build
-docker-build: docker-build-registry docker-build-gateway ## Build all Docker images
+docker-build: docker-build-registry docker-build-gateway docker-build-dashboard ## Build all Docker images
 
 .PHONY: docker-build-registry
 docker-build-registry: ## Build beenet-registry Docker image
@@ -66,15 +67,26 @@ docker-build-gateway: ## Build beenet-gateway Docker image
 		-t $(GATEWAY_IMAGE) \
 		$(DOCKER_CTX)
 
+.PHONY: docker-build-dashboard
+docker-build-dashboard: ## Build beenet-dashboard Docker image
+	docker build \
+		--build-arg HTTP_PROXY=$(HTTP_PROXY) \
+		--build-arg HTTPS_PROXY=$(HTTPS_PROXY) \
+		-f docker/Dockerfile.dashboard \
+		-t $(DASHBOARD_IMAGE) \
+		$(DOCKER_CTX)
+
 .PHONY: docker-push
 docker-push: ## Push images to the registry
 	docker push $(REGISTRY_IMAGE)
 	docker push $(GATEWAY_IMAGE)
+	docker push $(DASHBOARD_IMAGE)
 
 .PHONY: docker-tag-latest
 docker-tag-latest: ## Re-tag current VERSION as :latest
 	docker tag $(REGISTRY_IMAGE) $(REGISTRY)/beenet-registry:latest
 	docker tag $(GATEWAY_IMAGE)  $(REGISTRY)/beenet-gateway:latest
+	docker tag $(DASHBOARD_IMAGE) $(REGISTRY)/beenet-dashboard:latest
 
 .PHONY: docker-release
 docker-release: docker-build docker-push docker-tag-latest ## Build, push, and tag as latest

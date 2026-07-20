@@ -1,4 +1,4 @@
-# Local stack: Redis + MinIO + registry + gateway (worker runs on the host).
+# Local stack: Redis + MinIO + registry + gateway + dashboard (worker runs on the host).
 #
 #   docker compose -f docker/docker-compose.dev.yml up -d --build
 #   docker compose -f docker/docker-compose.dev.yml logs -f beenet-registry
@@ -12,6 +12,7 @@
 # MinIO console: http://127.0.0.1:9001  (minioadmin / minioadmin)
 # S3 API:         http://127.0.0.1:9000
 # Public wasm GET: http://127.0.0.1:9000/beenet/<cid>
+# Dashboard:      http://127.0.0.1:8081  (admin token: beenet-dev-admin-token)
 #
 # Then start worker on the host; it will discover gateways from the registry.
 
@@ -89,9 +90,26 @@ services:
       - "--libp2p-listen-addr"
       - "/ip4/0.0.0.0/tcp/4001"
       - "--public-addr"
-      - "/dns4/host.docker.internal/tcp/14001"
+      # Host workers dial the published libp2p port; avoid host.docker.internal
+      # (may fail DNS resolution on some macOS setups).
+      - "/ip4/127.0.0.1/tcp/14001"
       - "--identity-key-path"
       - "/gateway_cache/identity.key"
+
+  beenet-dashboard:
+    image: beenet/beenet-dashboard:dev
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.dashboard
+      args:
+        HTTP_PROXY: ${HTTP_PROXY:-}
+        HTTPS_PROXY: ${HTTPS_PROXY:-}
+    depends_on:
+      - beenet-registry
+    ports:
+      - "8081:80"
+    environment:
+      REGISTRY_UPSTREAM: http://beenet-registry:3030
 
 volumes:
   minio-data:

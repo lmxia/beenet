@@ -1,0 +1,43 @@
+# Build a linux/amd64 image for Aliyun ACR/ECI:
+#    docker build --pull=false --platform linux/amd64 \
+#      -f docker/Dockerfile.dashboard.acr \
+#      -t teethlink-global-registry.cn-hongkong.cr.aliyuncs.com/beenet/dashboard:latest .
+
+ARG BUILDPLATFORM=linux/amd64
+
+FROM --platform=$BUILDPLATFORM node:18-alpine AS builder
+
+WORKDIR /build
+
+COPY dashboard/package.json dashboard/package-lock.json ./
+
+ARG HTTP_PROXY
+ARG HTTPS_PROXY
+ARG NO_PROXY
+ENV HTTP_PROXY=$HTTP_PROXY \
+    HTTPS_PROXY=$HTTPS_PROXY \
+    NO_PROXY=$NO_PROXY \
+    http_proxy=$HTTP_PROXY \
+    https_proxy=$HTTPS_PROXY \
+    no_proxy=$NO_PROXY
+
+RUN npm ci
+
+COPY dashboard/ ./
+RUN npm run build
+
+FROM teethlink-global-registry.cn-hongkong.cr.aliyuncs.com/beenet/base-debian:bookworm-slim-amd64 AS runtime
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends nginx \
+    && rm -rf /var/lib/apt/lists/* \
+    && rm -f /etc/nginx/sites-enabled/default
+
+COPY dashboard/docker-entrypoint.sh /docker-entrypoint.sh
+RUN chmod +x /docker-entrypoint.sh
+
+COPY --from=builder /build/dist /usr/share/nginx/html
+
+ENV REGISTRY_UPSTREAM=http://beenet-registry:3030
+EXPOSE 80
+ENTRYPOINT ["/docker-entrypoint.sh"]
