@@ -3,9 +3,13 @@ import type { DashboardStatus } from "./types";
 export type JoinTokenView = {
   id: string;
   description: string;
-  token_value: string;
   created_at_unix_ms: number;
-  expires_at_unix_ms: number | null;
+  expires_at_unix_ms: number;
+  expired: boolean;
+};
+
+export type CreatedJoinTokenView = JoinTokenView & {
+  token_value: string;
 };
 
 export type RegistrationView = {
@@ -58,11 +62,21 @@ export async function createJoinToken(token: string, description: string, ttl_se
   });
   if (res.status === 401) throw new AuthError();
   if (!res.ok) throw new Error(`Registry HTTP ${res.status}`);
-  return (await res.json()) as JoinTokenView;
+  return (await res.json()) as CreatedJoinTokenView;
 }
 
 export async function listJoinTokens(token: string) {
   return requestJson<{ tokens: JoinTokenView[] }>("/v1/admin/tokens", token);
+}
+
+export async function deleteJoinToken(token: string, id: string) {
+  const res = await fetch(`${REGISTRY_BASE.replace(/\/$/, "")}/v1/admin/tokens/${encodeURIComponent(id)}`, {
+    method: "DELETE",
+    headers: tokenHeaders(token),
+  });
+  if (res.status === 401) throw new AuthError();
+  if (!res.ok) throw new Error(`Registry HTTP ${res.status}`);
+  return (await res.json()) as { deleted: boolean };
 }
 
 export async function listRegistrations(token: string) {

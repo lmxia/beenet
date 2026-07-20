@@ -233,6 +233,53 @@ code,
   flex-wrap: wrap;
 }
 
+.token-created {
+  margin-top: 14px;
+  padding: 12px;
+  border: 1px solid rgba(55, 213, 255, 0.48);
+  background: rgba(55, 213, 255, 0.06);
+}
+
+.token-created p {
+  margin: 0 0 10px;
+}
+
+.token-secret-row,
+.token-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.token-secret {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  color: var(--ok);
+}
+
+.token-list {
+  display: grid;
+  gap: 8px;
+  margin-top: 14px;
+}
+
+.token-row {
+  padding: 10px 0;
+  border-top: 1px solid var(--line);
+}
+
+.token-description {
+  color: var(--ink);
+}
+
+.token-expiry {
+  margin-top: 4px;
+  color: var(--muted);
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+
 .topo-shell {
   position: relative;
   min-height: 482px;

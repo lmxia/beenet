@@ -199,17 +199,17 @@ bill = base_fee + compute_fee + resource_fee
 
 ### 4.3 控制面：HTTP Registry（工作区已落地）
 
-对应 **§4.2 官方域名 + path + join token** 的最低实现：**运营方跑 `beenet-registry`**（可挂在 `https://官方域名/…` 反向代理后）；Worker 在 **`config.toml` 的 `[worker]`** 中配置 **`registry_url`** 与 **`registry_heartbeat_path`**（默认 **`/v1/workers/heartbeat`**）；**`join_token`** 须与 **`[registry].join_token`** 一致。
+对应 **§4.2 官方域名 + path + join token** 的最低实现：**运营方跑 `beenet-registry`**（可挂在 `https://官方域名/…` 反向代理后）；Worker 在 **`config.toml` 的 `[worker]`** 中配置 **`registry_url`** 与 **`registry_heartbeat_path`**（默认 **`/v1/workers/heartbeat`**）。新 Worker 使用管理员签发的短期 join token 调用 **`POST /v1/workers/join`**，成功后只依赖本地持久化 Ed25519 identity 签名 heartbeat。
 
 | 组件 | 配置（`config.toml`） / 行为 |
 | --- | --- |
-| **Registry** | **`[registry]`**：`http_addr`（默认 `127.0.0.1:3030`）；`join_token`（必填）。`POST /v1/workers/heartbeat`：**心跳**载荷 `{ "join_token", "peer_id", "dial_multiaddr", "supported_cids" }`（upsert + 续租 `last_seen`；校验 dial 含 `/p2p/<peer_id>`）。`GET /v1/workers` 返回租约仍有效的 Worker（内存表；约 **60s** 无心跳则剔除）。`GET /health`。 |
-| **Worker** | **`[worker]`**：`registry_url`、`join_token` 必填；`registry_heartbeat_secs`（默认 **20**）；`registry_heartbeat_path`（默认 **`/v1/workers/heartbeat`**）。`listen_addr`、`wasm_cache_dir` 走代码默认值；心跳体携带 `listen + /p2p/<local_peer_id>`，并上报 `supported_cids`。Worker 不再接受静态 `gateway_addr`，gateway 由 Registry 发现。 |
+| **Registry** | `--http-addr`（默认 `127.0.0.1:3030`）、`--redis-url`、`--admin-token`。Admin API 创建默认 **10 分钟**、最长 **60 分钟**的 join token；token 在有效期内可供任意数量 PeerId 使用，Registry 只保存摘要且列表不返回明文。`POST /v1/workers/join` 校验 token、PeerId、公钥与签名并持久化 registration；`POST /v1/workers/heartbeat` 只校验已登记公钥签名并续租。`GET /v1/workers` 返回租约仍有效的 Worker（约 **60s** 无心跳则剔除）。 |
+| **Worker** | **`[worker]`**：`registry_url` 必填；`registry_heartbeat_secs`（默认 **20**）；`registry_heartbeat_path`（默认 **`/v1/workers/heartbeat`**）。首次入网通过 `--join-token-file`、`--join-token-stdin` 或兼容的 `--join-token` 提供临时 token，成功后丢弃；重启复用 `wasm_cache_dir/identity.key`，无需 token。registration 被撤销后不会自动 re-join。Worker 不再接受静态 `gateway_addr`，gateway 由 Registry 发现。 |
 | **Gateway** | **`[gateway]`**：`registry_url` 必填；`registry_poll_ms`（默认 **2000**）轮询 `GET …/v1/workers`，维护 dial 列表，先按 `supported_cids` 过滤，再以 **轮询** 选 Worker 发起 libp2p invoke。 |
 
 | **Dashboard** | 只读 Registry 的 `/v1/dashboard/status`，不再读取 Gateway 后端接口。Worker 的在线/离线状态直接来自 Registry 的 `connected` 字段。 |
 
-**尚未覆盖（仍归 M2/M3）**：一致性哈希 LB、多 Gateway 亲和、Registry 高可用、临时 token 颁发/吊销服务、DHT 兜底。
+**尚未覆盖（仍归 M2/M3）**：一致性哈希 LB、多 Gateway 亲和、Registry 高可用、join token 持久化/多副本一致性、DHT 兜底。
 
 ### 4.4 反向长连接（v2.22）
 

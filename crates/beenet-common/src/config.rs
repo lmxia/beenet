@@ -42,6 +42,8 @@ pub struct WorkerSection {
     pub max_concurrency: Option<usize>,
     pub registry_url: Option<String>,
     pub registry_heartbeat_path: Option<String>,
+    /// Deprecated bootstrap token. New installations should provide it through
+    /// the worker CLI, stdin, or a temporary secret file instead of persisting it.
     pub join_token: Option<String>,
     pub registry_heartbeat_secs: Option<u64>,
     pub wasm_fetch_base: Option<String>,
@@ -116,9 +118,7 @@ pub struct WorkerSettings {
     pub max_concurrency: Option<usize>,
     pub registry_url: String,
     pub registry_heartbeat_path: String,
-    /// One-time join token used to register with the registry.
-    /// Optional: only required if the worker has never registered before
-    /// (i.e. no persistent identity key exists, or the registry was restarted).
+    /// Deprecated persisted bootstrap token retained for config compatibility.
     pub join_token: Option<String>,
     pub registry_heartbeat_secs: u64,
     pub wasm_fetch_base: Option<String>,

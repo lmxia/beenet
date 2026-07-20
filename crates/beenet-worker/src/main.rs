@@ -5,6 +5,7 @@ mod executor;
 
 use std::collections::HashMap;
 use std::fs;
+use std::io::{self, Read};
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -67,9 +68,18 @@ struct Args {
     #[arg(long)]
     registry_heartbeat_path: Option<String>,
 
-    /// Join token; overrides `[worker].join_token` (must match `[registry].join_token`).
+    /// Bootstrap join token. Prefer --join-token-stdin or --join-token-file so
+    /// the token is not exposed in shell history or the process list.
     #[arg(long)]
     join_token: Option<String>,
+
+    /// Read the bootstrap join token from a temporary secret file.
+    #[arg(long, value_name = "PATH")]
+    join_token_file: Option<PathBuf>,
+
+    /// Read the bootstrap join token from stdin.
+    #[arg(long)]
+    join_token_stdin: bool,
 
     #[arg(long)]
     registry_heartbeat_secs: Option<u64>,
@@ -94,6 +104,48 @@ struct WorkerBehaviour {
     request_response: request_response::cbor::Behaviour<InvokeRequest, InvokeResponse>,
     identify: identify::Behaviour,
     ping: ping::Behaviour,
+}
+
+fn trimmed_token(value: String) -> Option<String> {
+    let value = value.trim().to_string();
+    (!value.is_empty()).then_some(value)
+}
+
+fn bootstrap_token(
+    cli: &Args,
+    legacy_config_token: Option<String>,
+) -> Result<(Option<String>, bool)> {
+    let explicit_sources = cli.join_token.is_some() as usize
+        + cli.join_token_file.is_some() as usize
+        + cli.join_token_stdin as usize;
+    if explicit_sources > 1 {
+        anyhow::bail!("use only one of --join-token, --join-token-file, or --join-token-stdin");
+    }
+
+    if let Some(token) = cli.join_token.clone().and_then(trimmed_token) {
+        warn!("--join-token may expose the bootstrap token; prefer stdin or a secret file");
+        return Ok((Some(token), false));
+    }
+    if let Some(path) = cli.join_token_file.as_ref() {
+        let token = fs::read_to_string(path)
+            .with_context(|| format!("read join token file `{}`", path.display()))?;
+        return Ok((trimmed_token(token), false));
+    }
+    if cli.join_token_stdin {
+        let mut token = String::new();
+        io::stdin()
+            .read_to_string(&mut token)
+            .context("read join token from stdin")?;
+        return Ok((trimmed_token(token), false));
+    }
+    if let Some(token) = legacy_config_token.and_then(trimmed_token) {
+        warn!(
+            "[worker].join_token is deprecated and only bootstraps a brand-new identity; \
+             use --join-token-stdin or --join-token-file"
+        );
+        return Ok((Some(token), true));
+    }
+    Ok((None, false))
 }
 
 pub struct TaskEntry {
@@ -653,22 +705,17 @@ async fn do_heartbeat(
         let text = resp.text().await.unwrap_or_default();
         anyhow::bail!("heartbeat failed (HTTP {status}): {text}");
     }
-    let parsed: HeartbeatOkResponse = resp
-        .json()
-        .await
-        .context("parse heartbeat response")?;
+    let parsed: HeartbeatOkResponse = resp.json().await.context("parse heartbeat response")?;
     Ok(Some(parsed.gateways))
 }
 
 async fn registry_heartbeat_loop(
     http: reqwest::Client,
     heartbeat_url: String,
-    join_url: String,
     keypair: Arc<identity::Keypair>,
     peer_id: String,
     runtime: Arc<Runtime>,
     period: Duration,
-    join_token: Option<String>,
     region: Option<String>,
     gateway_tx: watch::Sender<Vec<GatewayCandidate>>,
 ) {
@@ -696,29 +743,13 @@ async fn registry_heartbeat_loop(
                 info!("registry heartbeat ok");
             }
             Ok(None) => {
-                // Registry restarted or registration was revoked — attempt re-join.
-                warn!("heartbeat rejected (unregistered); attempting re-join");
-                if let Some(ref token) = join_token {
-                    if let Err(e) = do_join(
-                        &http,
-                        &join_url,
-                        &keypair,
-                        &peer_id,
-                        supported_cids,
-                        loaded_cids,
-                        token,
-                        region.as_deref(),
-                    )
-                    .await
-                    {
-                        warn!(error = %e, "re-join failed");
-                    }
-                } else {
-                    warn!(
-                        "worker is not registered and no join_token is configured; \
-                        worker will be invisible to the gateway until manually re-registered"
-                    );
+                if !gateway_tx.borrow().is_empty() {
+                    let _ = gateway_tx.send(Vec::new());
                 }
+                warn!(
+                    "worker registration rejected; gateway connections disabled and \
+                     re-enrollment with a fresh join token is required"
+                );
             }
             Err(e) => {
                 warn!(error = %e, "registry heartbeat request error");
@@ -859,6 +890,12 @@ async fn gateway_discovery_loop(
                         warn!(%error, "gateway discovery JSON decode failed; retaining cached candidates")
                     }
                 }
+            }
+            Ok(response) if response.status() == reqwest::StatusCode::UNAUTHORIZED => {
+                if !tx.borrow().is_empty() {
+                    let _ = tx.send(Vec::new());
+                }
+                warn!("gateway discovery rejected because worker registration is missing");
             }
             Ok(response) => warn!(status = %response.status(), "gateway discovery rejected"),
             Err(error) => warn!(%error, "gateway discovery failed; retaining cached candidates"),
@@ -1014,7 +1051,13 @@ async fn main() -> Result<()> {
             path.display()
         );
     }
-    let file_cfg = beenet_common::config::load_file(&path)?;
+    let mut file_cfg = beenet_common::config::load_file(&path)?;
+    let legacy_config_token = file_cfg
+        .worker
+        .as_mut()
+        .and_then(|worker| worker.join_token.take());
+    let (mut bootstrap_token, token_from_legacy_config) =
+        bootstrap_token(&cli, legacy_config_token)?;
     let overrides = WorkerCliOverrides {
         listen_addr: cli.listen_addr.clone(),
         wasm_cache_dir: cli.wasm_cache_dir.clone(),
@@ -1024,7 +1067,7 @@ async fn main() -> Result<()> {
         max_concurrency: cli.max_concurrency,
         registry_url: cli.registry_url.clone(),
         registry_heartbeat_path: cli.registry_heartbeat_path.clone(),
-        join_token: cli.join_token.clone(),
+        join_token: None,
         registry_heartbeat_secs: cli.registry_heartbeat_secs,
         wasm_fetch_base: cli.wasm_fetch_base.clone(),
         wasm_fetch_bearer: cli.wasm_fetch_bearer.clone(),
@@ -1039,6 +1082,15 @@ async fn main() -> Result<()> {
     fs::create_dir_all(&settings.wasm_cache_dir)
         .with_context(|| format!("create `{}`", settings.wasm_cache_dir.display()))?;
 
+    let identity_key_path = settings.wasm_cache_dir.join("identity.key");
+    if token_from_legacy_config && identity_key_path.exists() {
+        warn!(
+            path = %identity_key_path.display(),
+            "ignoring deprecated config join token because this worker already has an identity"
+        );
+        bootstrap_token = None;
+    }
+
     let factors = BeenetFactors::new();
     let engine_builder = spin_core::Engine::builder(&spin_core::Config::default())?;
     let factors_executor = Arc::new(FactorsExecutor::new(engine_builder, factors)?);
@@ -1047,10 +1099,73 @@ async fn main() -> Result<()> {
     // Load or generate a persistent Ed25519 keypair from wasm_cache_dir/identity.key.
     let local_key = load_or_create_keypair(&settings.wasm_cache_dir)?;
     let local_peer_id = PeerId::from(local_key.public());
-    let mut swarm = build_swarm(local_key.clone())?;
+    let heartbeat_url = registry_url(&settings.registry_url, &settings.registry_heartbeat_path);
+    let join_url = registry_url(&settings.registry_url, "/v1/workers/join");
+    let http = reqwest::Client::new();
+    let keypair_arc = Arc::new(local_key);
+    let peer_s = local_peer_id.to_string();
+
+    // Initial registration: try heartbeat first; if unregistered, attempt join.
+    let initial_supported_cids = runtime.supported_cids_on_disk();
+    let initial_loaded_cids = runtime.loaded_cids().await;
+    let initial_gateways = match do_heartbeat(
+        &http,
+        &heartbeat_url,
+        &keypair_arc,
+        &peer_s,
+        initial_supported_cids.clone(),
+        initial_loaded_cids.clone(),
+        settings.region.as_deref(),
+    )
+    .await
+    {
+        Ok(Some(tip)) => {
+            info!(peer_id = %local_peer_id, "worker already registered with registry");
+            tip
+        }
+        Ok(None) => {
+            if let Some(ref token) = bootstrap_token {
+                do_join(
+                    &http,
+                    &join_url,
+                    &keypair_arc,
+                    &peer_s,
+                    initial_supported_cids,
+                    initial_loaded_cids,
+                    token,
+                    settings.region.as_deref(),
+                )
+                .await
+                .context("initial worker registration failed")?;
+                do_heartbeat(
+                    &http,
+                    &heartbeat_url,
+                    &keypair_arc,
+                    &peer_s,
+                    runtime.supported_cids_on_disk(),
+                    runtime.loaded_cids().await,
+                    settings.region.as_deref(),
+                )
+                .await?
+                .context("worker joined but heartbeat still reports it as unregistered")?
+            } else {
+                anyhow::bail!(
+                    "worker is not registered; provide a fresh bootstrap token through \
+                     --join-token-stdin, --join-token-file, or --join-token"
+                );
+            }
+        }
+        Err(e) => {
+            return Err(e).context("registry is not reachable during worker enrollment");
+        }
+    };
+    drop(bootstrap_token);
+
+    let mut swarm = build_swarm((*keypair_arc).clone())?;
     swarm.listen_on(listen_addr.clone())?;
     let fallback_gateways: Vec<GatewayCandidate> = Vec::new();
-    let (gateway_tx, gateway_rx) = watch::channel(fallback_gateways.clone());
+    let initial_gateways = take_gateway_tip(initial_gateways, &fallback_gateways);
+    let (gateway_tx, gateway_rx) = watch::channel(initial_gateways);
     tokio::spawn(gateway_discovery_loop(
         settings.registry_url.clone(),
         local_peer_id.to_string(),
@@ -1070,71 +1185,15 @@ async fn main() -> Result<()> {
         "worker started (dials gateway; keeps reverse long connection)"
     );
 
-    let heartbeat_url = registry_url(&settings.registry_url, &settings.registry_heartbeat_path);
-    let join_url = registry_url(&settings.registry_url, "/v1/workers/join");
-    let http = reqwest::Client::new();
-    let keypair_arc = Arc::new(local_key);
-    let peer_s = local_peer_id.to_string();
-
-    // Initial registration: try heartbeat first; if unregistered, attempt join.
-    let initial_supported_cids = runtime.supported_cids_on_disk();
-    let initial_loaded_cids = runtime.loaded_cids().await;
-    match do_heartbeat(
-        &http,
-        &heartbeat_url,
-        &keypair_arc,
-        &peer_s,
-        initial_supported_cids.clone(),
-        initial_loaded_cids.clone(),
-        settings.region.as_deref(),
-    )
-    .await
-    {
-        Ok(Some(tip)) => {
-            let merged = take_gateway_tip(tip, &[]);
-            let _ = gateway_tx.send(merged);
-            info!(peer_id = %local_peer_id, "worker already registered with registry");
-        }
-        Ok(None) => {
-            // Not yet registered — join now.
-            if let Some(ref token) = settings.join_token {
-                do_join(
-                    &http,
-                    &join_url,
-                    &keypair_arc,
-                    &peer_s,
-                    initial_supported_cids,
-                    initial_loaded_cids,
-                    token,
-                    settings.region.as_deref(),
-                )
-                .await
-                .context("initial worker registration failed")?;
-            } else {
-                anyhow::bail!(
-                    "worker is not registered with the registry and no join_token is configured; \
-                    set [worker].join_token in config or pass --join-token"
-                );
-            }
-        }
-        Err(e) => {
-            // Registry not reachable yet — log a warning and let the heartbeat loop retry.
-            warn!(error = %e, "registry not reachable at startup; will retry in heartbeat loop");
-        }
-    }
-
     let period = Duration::from_secs(settings.registry_heartbeat_secs);
-    let join_token = settings.join_token.clone();
     let region = settings.region.clone();
     tokio::spawn(registry_heartbeat_loop(
         http,
         heartbeat_url,
-        join_url,
         keypair_arc,
         peer_s,
         runtime.clone(),
         period,
-        join_token,
         region,
         gateway_tx,
     ));
@@ -1148,7 +1207,6 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::wasm_fetch_url;
-    use super::*;
     use beenet_common::BeenetCid;
     use std::str::FromStr;
 

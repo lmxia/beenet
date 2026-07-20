@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { AuthError, createJoinToken, fetchStatus, listJoinTokens, listRegistrations } from "./api";
+import { AuthError, createJoinToken, deleteJoinToken, fetchStatus, listJoinTokens, listRegistrations, type CreatedJoinTokenView, type JoinTokenView } from "./api";
 import { Topology } from "./components/Topology";
 import { SidePanel } from "./components/SidePanel";
 import { COPY, detectLanguage, formatTime, LANGUAGE_LABEL, LANGUAGE_STORAGE_KEY, type Language } from "./i18n";
@@ -18,9 +18,12 @@ export default function App() {
   const [updatedAt, setUpdatedAt] = useState<string>("—");
   const [selectedPeer, setSelectedPeer] = useState<string | null>(null);
   const [joinTokensCount, setJoinTokensCount] = useState<number | null>(null);
+  const [joinTokens, setJoinTokens] = useState<JoinTokenView[]>([]);
+  const [createdJoinToken, setCreatedJoinToken] = useState<CreatedJoinTokenView | null>(null);
   const [registrationsCount, setRegistrationsCount] = useState<number | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [loginError, setLoginError] = useState<string | null>(null);
+  const [adminError, setAdminError] = useState<string | null>(null);
 
   const copy = useMemo(() => COPY[language], [language]);
 
@@ -72,9 +75,11 @@ export default function App() {
     void (async () => {
       try {
         const [tokens, registrations] = await Promise.all([listJoinTokens(adminToken), listRegistrations(adminToken)]);
+        setJoinTokens(tokens.tokens);
         setJoinTokensCount(tokens.tokens.length);
         setRegistrationsCount(registrations.registrations.length);
       } catch {
+        setJoinTokens([]);
         setJoinTokensCount(null);
         setRegistrationsCount(null);
       }
@@ -108,7 +113,54 @@ export default function App() {
     setStatus(null);
     setError(null);
     setJoinTokensCount(null);
+    setJoinTokens([]);
+    setCreatedJoinToken(null);
     setRegistrationsCount(null);
+    setAdminError(null);
+  };
+
+  const refreshJoinTokens = async () => {
+    const response = await listJoinTokens(adminToken);
+    setJoinTokens(response.tokens);
+    setJoinTokensCount(response.tokens.length);
+  };
+
+  const createBootstrapToken = async () => {
+    setBusy("create-token");
+    setAdminError(null);
+    try {
+      const token = await createJoinToken(adminToken, "dashboard", 600);
+      setCreatedJoinToken(token);
+      await refreshJoinTokens();
+    } catch (e) {
+      setAdminError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const revokeBootstrapToken = async (id: string) => {
+    setBusy(`revoke-${id}`);
+    setAdminError(null);
+    try {
+      await deleteJoinToken(adminToken, id);
+      if (createdJoinToken?.id === id) setCreatedJoinToken(null);
+      await refreshJoinTokens();
+    } catch (e) {
+      setAdminError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const copyCreatedToken = async () => {
+    if (!createdJoinToken) return;
+    try {
+      await navigator.clipboard.writeText(createdJoinToken.token_value);
+      setAdminError(null);
+    } catch (e) {
+      setAdminError(e instanceof Error ? e.message : String(e));
+    }
   };
 
   const online = status?.workers.filter((w) => w.connected).length ?? 0;
@@ -177,10 +229,37 @@ export default function App() {
       <section className="panel admin-panel">
         <h2>{language === "zh" ? "Admin" : "Admin"}</h2>
         <div className="admin-form">
-          <button type="button" className="primary" onClick={() => void createJoinToken(adminToken, "dashboard", 86400)}>
-            {language === "zh" ? "创建 Join Token" : "Create Join Token"}
+          <button type="button" className="primary" onClick={() => void createBootstrapToken()} disabled={busy === "create-token"}>
+            {busy === "create-token" ? (language === "zh" ? "创建中…" : "Creating…") : (language === "zh" ? "创建 10 分钟 Join Token" : "Create 10-minute Join Token")}
           </button>
         </div>
+        {createdJoinToken && (
+          <div className="token-created">
+            <p>{language === "zh" ? "此 token 只显示一次，请立即复制。" : "This token is shown once. Copy it now."}</p>
+            <div className="token-secret-row">
+              <code className="token-secret">{createdJoinToken.token_value}</code>
+              <button type="button" className="lang-switch" onClick={() => void copyCreatedToken()}>
+                {language === "zh" ? "复制" : "Copy"}
+              </button>
+            </div>
+            <p className="token-expiry">{language === "zh" ? "过期时间" : "Expires"}: {formatTime(language, createdJoinToken.expires_at_unix_ms)}</p>
+          </div>
+        )}
+        <div className="token-list">
+          {joinTokens.length === 0 && <p className="empty-line">{language === "zh" ? "暂无有效 Join Token" : "No active join tokens"}</p>}
+          {joinTokens.map((token) => (
+            <div className="token-row" key={token.id}>
+              <div>
+                <div className="token-description">{token.description || "—"}</div>
+                <div className="token-expiry">{formatTime(language, token.expires_at_unix_ms)}</div>
+              </div>
+              <button type="button" className="lang-switch" onClick={() => void revokeBootstrapToken(token.id)} disabled={busy === `revoke-${token.id}`}>
+                {language === "zh" ? "撤销" : "Revoke"}
+              </button>
+            </div>
+          ))}
+        </div>
+        {adminError && <p className="err">{adminError}</p>}
       </section>
       <p className="footer">{copy.registryProxy} · poll {POLL_MS / 1000}s · source /v1/dashboard/status</p>
     </div>

@@ -43,8 +43,10 @@ for i in $(seq 1 50); do curl -sf http://127.0.0.1:8080/health >/dev/null && bre
 TOKEN=$(curl -sS -X POST http://127.0.0.1:3030/v1/admin/tokens \
   -H "Authorization: Bearer beenet-local-admin" \
   -H "Content-Type: application/json" \
-  -d '{"description":"local-e2e","ttl_secs":86400}' \
+  -d '{"description":"local-e2e","ttl_secs":600}' \
   | python3 -c 'import sys,json; print(json.load(sys.stdin)["token_value"])')
+printf '%s\n' "$TOKEN" >/tmp/beenet-join-token
+chmod 600 /tmp/beenet-join-token
 
 cat >/tmp/worker1.toml <<EOF
 [worker]
@@ -55,9 +57,9 @@ cat >/tmp/worker2.toml <<EOF
 registry_url = "http://127.0.0.1:3030"
 EOF
 
-(cd /tmp/beenet-w1 && "$ROOT/target/release/beenet-worker" --config /tmp/worker1.toml --join-token "$TOKEN") >/tmp/worker1.log 2>&1 &
+(cd /tmp/beenet-w1 && "$ROOT/target/release/beenet-worker" --config /tmp/worker1.toml --join-token-file /tmp/beenet-join-token) >/tmp/worker1.log 2>&1 &
 W1_PID=$!
-(cd /tmp/beenet-w2 && "$ROOT/target/release/beenet-worker" --config /tmp/worker2.toml --join-token "$TOKEN") >/tmp/worker2.log 2>&1 &
+(cd /tmp/beenet-w2 && "$ROOT/target/release/beenet-worker" --config /tmp/worker2.toml --join-token-file /tmp/beenet-join-token) >/tmp/worker2.log 2>&1 &
 W2_PID=$!
 
 ok=0

@@ -5,7 +5,7 @@
 //! | Layer | Secret | Purpose |
 //! |-------|--------|---------|
 //! | Admin token | random UUID printed at startup | protect `/v1/admin/*` CRUD |
-//! | Join token | admin-issued UUID with optional TTL | one-time gate for worker registration |
+//! | Join token | short-lived admin-issued bearer token | reusable bootstrap gate for worker registration |
 //! | Ed25519 keypair | worker-held private key | sign every heartbeat; registry verifies with stored pubkey |
 //!
 //! ## Persistence
@@ -47,6 +47,7 @@ use clap::Parser;
 use libp2p::{identity, PeerId};
 use redis::AsyncCommands;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -55,6 +56,10 @@ use uuid::Uuid;
 const STALE_AFTER: Duration = Duration::from_secs(60);
 /// Tolerance for clock skew between worker and registry when validating signed timestamps.
 const SIGNATURE_WINDOW_SECS: u64 = 60;
+/// Default lifetime for reusable worker bootstrap tokens.
+const DEFAULT_JOIN_TOKEN_TTL_SECS: u64 = 10 * 60;
+/// Administrators cannot create bootstrap tokens that live longer than one hour.
+const MAX_JOIN_TOKEN_TTL_SECS: u64 = 60 * 60;
 /// Redis Hash key that stores all worker registrations.
 const REDIS_REG_KEY: &str = "beenet:registrations";
 /// Max gateways returned to a worker (primary + HA backups).
@@ -214,15 +219,19 @@ async fn redis_load_all(
 struct JoinTokenRecord {
     id: String,
     description: String,
-    token_value: String,
+    token_hash: [u8; 32],
     created_at_unix_ms: u64,
-    expires_at: Option<Instant>,
-    expires_at_unix_ms: Option<u64>,
+    expires_at: Instant,
+    expires_at_unix_ms: u64,
 }
 
 impl JoinTokenRecord {
     fn is_expired(&self) -> bool {
-        self.expires_at.map_or(false, |exp| Instant::now() > exp)
+        Instant::now() > self.expires_at
+    }
+
+    fn matches(&self, token_value: &str) -> bool {
+        constant_time_eq(&self.token_hash, &hash_join_token(token_value))
     }
 }
 
@@ -240,7 +249,6 @@ struct ActiveRecord {
     last_seen: Instant,
     supported_cids: Vec<String>,
     loaded_cids: Vec<String>,
-    region: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -266,10 +274,10 @@ struct CreateTokenBody {
 struct TokenView {
     id: String,
     description: String,
-    token_value: String,
-    created_at_unix_ms: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
-    expires_at_unix_ms: Option<u64>,
+    token_value: Option<String>,
+    created_at_unix_ms: u64,
+    expires_at_unix_ms: u64,
     expired: bool,
 }
 
@@ -278,7 +286,7 @@ impl From<&JoinTokenRecord> for TokenView {
         TokenView {
             id: r.id.clone(),
             description: r.description.clone(),
-            token_value: r.token_value.clone(),
+            token_value: None,
             created_at_unix_ms: r.created_at_unix_ms,
             expires_at_unix_ms: r.expires_at_unix_ms,
             expired: r.is_expired(),
@@ -480,28 +488,26 @@ async fn create_token(
 ) -> impl IntoResponse {
     let now_instant = Instant::now();
     let now_unix_ms = unix_ms_now();
-    let ttl_secs = body.ttl_secs.filter(|&t| t > 0);
-
-    let (expires_at, expires_at_unix_ms) = match ttl_secs {
-        Some(ttl) => (
-            Some(now_instant + Duration::from_secs(ttl)),
-            Some(now_unix_ms + ttl * 1000),
-        ),
-        None => (None, None),
+    let ttl_secs = match resolve_join_token_ttl(body.ttl_secs) {
+        Ok(ttl_secs) => ttl_secs,
+        Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
     };
+
+    let token_value = format!("{}.{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
 
     let record = JoinTokenRecord {
         id: Uuid::new_v4().to_string(),
         description: body.description,
-        token_value: Uuid::new_v4().to_string(),
+        token_hash: hash_join_token(&token_value),
         created_at_unix_ms: now_unix_ms,
-        expires_at,
-        expires_at_unix_ms,
+        expires_at: now_instant + Duration::from_secs(ttl_secs),
+        expires_at_unix_ms: now_unix_ms + ttl_secs * 1000,
     };
-    let view = TokenView::from(&record);
+    let mut view = TokenView::from(&record);
+    view.token_value = Some(token_value);
     let id = record.id.clone();
     state.join_tokens.write().await.insert(id.clone(), record);
-    info!(%id, ?ttl_secs, "join token created");
+    info!(%id, ttl_secs, "join token created");
     (StatusCode::CREATED, Json(view)).into_response()
 }
 
@@ -564,7 +570,7 @@ async fn post_join(
     let token_valid = {
         let map = state.join_tokens.read().await;
         map.values()
-            .any(|t| t.token_value == body.join_token && !t.is_expired())
+            .any(|t| !t.is_expired() && t.matches(&body.join_token))
     };
     if !token_valid {
         return (StatusCode::UNAUTHORIZED, "invalid or expired join_token").into_response();
@@ -619,7 +625,6 @@ async fn post_join(
             last_seen: Instant::now(),
             supported_cids: body.supported_cids.clone(),
             loaded_cids: body.loaded_cids.clone(),
-            region,
         },
     );
     info!(peer_id = %claimed_peer_id, "worker registered");
@@ -688,7 +693,6 @@ async fn post_heartbeat(
             last_seen: Instant::now(),
             supported_cids: body.supported_cids.clone(),
             loaded_cids: body.loaded_cids.clone(),
-            region: worker_region.clone(),
         },
     );
     info!(peer_id = %pid, "worker heartbeat ok (lease renewed)");
@@ -776,10 +780,7 @@ async fn gateway_views(state: &AppState) -> Vec<GatewayView> {
 }
 
 fn gateway_load(gateway: &GatewayView) -> u32 {
-    gateway
-        .connected_workers
-        .saturating_mul(10_000)
-        / gateway.capacity.max(1)
+    gateway.connected_workers.saturating_mul(10_000) / gateway.capacity.max(1)
 }
 
 fn normalize_region(region: Option<String>) -> Option<String> {
@@ -894,23 +895,28 @@ async fn get_gateways(
 ) -> impl IntoResponse {
     let peer_id = query.peer_id.trim();
     if peer_id.is_empty() {
-        return (StatusCode::BAD_REQUEST, "peer_id query parameter is required").into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            "peer_id query parameter is required",
+        )
+            .into_response();
     }
     let pid = match PeerId::from_str(peer_id) {
         Ok(p) => p,
         Err(_) => return (StatusCode::BAD_REQUEST, "invalid peer_id").into_response(),
     };
 
+    let registered_region = {
+        let registered = state.registered.read().await;
+        match registered.get(&pid) {
+            Some(record) => record.region.clone(),
+            None => return (StatusCode::UNAUTHORIZED, "worker is not registered").into_response(),
+        }
+    };
+
     let region = match normalize_region(query.region) {
         Some(r) => Some(r),
-        None => {
-            let registered = state.registered.read().await;
-            let active = state.active.read().await;
-            registered
-                .get(&pid)
-                .and_then(|r| r.region.clone())
-                .or_else(|| active.get(&pid).and_then(|r| r.region.clone()))
-        }
+        None => registered_region,
     };
 
     Json(GatewaysResponse {
@@ -1006,6 +1012,27 @@ fn unix_ms_now() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+fn hash_join_token(token_value: &str) -> [u8; 32] {
+    Sha256::digest(token_value.as_bytes()).into()
+}
+
+fn constant_time_eq(left: &[u8; 32], right: &[u8; 32]) -> bool {
+    left.iter()
+        .zip(right.iter())
+        .fold(0u8, |difference, (left, right)| difference | (left ^ right))
+        == 0
+}
+
+fn resolve_join_token_ttl(ttl_secs: Option<u64>) -> std::result::Result<u64, String> {
+    let ttl_secs = ttl_secs.unwrap_or(DEFAULT_JOIN_TOKEN_TTL_SECS);
+    if ttl_secs == 0 || ttl_secs > MAX_JOIN_TOKEN_TTL_SECS {
+        return Err(format!(
+            "ttl_secs must be between 1 and {MAX_JOIN_TOKEN_TTL_SECS}"
+        ));
+    }
+    Ok(ttl_secs)
 }
 
 fn unix_secs_now() -> u64 {
@@ -1108,12 +1135,7 @@ async fn main() -> Result<()> {
 mod gateway_tip_tests {
     use super::*;
 
-    fn gw(
-        peer_id: &str,
-        region: Option<&str>,
-        connected: u32,
-        capacity: u32,
-    ) -> GatewayView {
+    fn gw(peer_id: &str, region: Option<&str>, connected: u32, capacity: u32) -> GatewayView {
         GatewayView {
             gateway_id: peer_id.to_string(),
             peer_id: peer_id.to_string(),
@@ -1172,8 +1194,7 @@ mod gateway_tip_tests {
             None,
         );
         assert_eq!(tip.len(), GATEWAY_TIP_SIZE);
-        let peers: std::collections::HashSet<_> =
-            tip.iter().map(|g| g.peer_id.as_str()).collect();
+        let peers: std::collections::HashSet<_> = tip.iter().map(|g| g.peer_id.as_str()).collect();
         assert_eq!(peers.len(), GATEWAY_TIP_SIZE);
     }
 
@@ -1187,5 +1208,48 @@ mod gateway_tip_tests {
         let a = select_gateway_tip(candidates.clone(), "worker-stable", Some("r1"));
         let b = select_gateway_tip(candidates, "worker-stable", Some("r1"));
         assert_eq!(a[0].peer_id, b[0].peer_id);
+    }
+}
+
+#[cfg(test)]
+mod join_token_tests {
+    use super::*;
+
+    fn token_record(token_value: &str) -> JoinTokenRecord {
+        JoinTokenRecord {
+            id: "token-id".to_string(),
+            description: "test".to_string(),
+            token_hash: hash_join_token(token_value),
+            created_at_unix_ms: 1,
+            expires_at: Instant::now() + Duration::from_secs(60),
+            expires_at_unix_ms: 61_000,
+        }
+    }
+
+    #[test]
+    fn reusable_token_matches_only_its_secret() {
+        let record = token_record("shared-bootstrap-token");
+        assert!(record.matches("shared-bootstrap-token"));
+        assert!(!record.matches("different-token"));
+    }
+
+    #[test]
+    fn token_list_view_does_not_expose_secret() {
+        let view = TokenView::from(&token_record("secret"));
+        assert!(view.token_value.is_none());
+    }
+
+    #[test]
+    fn token_ttl_defaults_to_ten_minutes_and_caps_at_one_hour() {
+        assert_eq!(
+            resolve_join_token_ttl(None).unwrap(),
+            DEFAULT_JOIN_TOKEN_TTL_SECS
+        );
+        assert_eq!(
+            resolve_join_token_ttl(Some(MAX_JOIN_TOKEN_TTL_SECS)).unwrap(),
+            MAX_JOIN_TOKEN_TTL_SECS
+        );
+        assert!(resolve_join_token_ttl(Some(0)).is_err());
+        assert!(resolve_join_token_ttl(Some(MAX_JOIN_TOKEN_TTL_SECS + 1)).is_err());
     }
 }

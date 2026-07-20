@@ -16,7 +16,7 @@
 curl → Gateway(HTTP) → libp2p → Worker → wasi:http/incoming-handler@0.2 → body 回传
 ```
 
-**必须** 运行 **`beenet-registry`**：Worker 持 **join token** 对默认路径 **`POST /v1/workers/heartbeat`** 发送 **心跳**（首次即入网，后续为 **续租** / 保活；详见 [`target.md` §4.1 / §4.3](./target.md)）。Worker 会把 `supported_cids` 一并上报，Gateway 轮询 **`GET /v1/workers`** 后先做 CID hint 过滤，再选择可拨号列表。
+**必须** 运行 **`beenet-registry`**：新 Worker 使用短期 **join token** 调用 **`POST /v1/workers/join`** 完成首次入网；之后只使用本地持久化的 Ed25519 identity 对 **`POST /v1/workers/heartbeat`** 签名续租，不再依赖 join token（详见 [`target.md` §4.1 / §4.3](./target.md)）。Worker 会把 `supported_cids` 一并上报，Gateway 轮询 **`GET /v1/workers`** 后先做 CID hint 过滤，再选择可拨号列表。
 
 **Wasm 分发（推荐）**：`beenet-pack build` 后使用 **`beenet-pack upload`** 推到 **阿里云 OSS**（S3 兼容 API）；在 **`config.toml` 的 `[worker]`** 中配置 **`wasm_fetch_base`**，在 **`wasm_cache` 未命中** 时 **`GET {base}/{cid}`** 拉取并 **校验 CID** 后缓存（见 [`target.md` §3.1](./target.md)）。
 
@@ -47,7 +47,6 @@ registry_url = "http://127.0.0.1:3030"
 [worker]
 listen_addr = "/ip4/127.0.0.1/tcp/4001"
 registry_url = "http://127.0.0.1:3030"
-# join_token 由 registry Admin API 签发，见下文端到端示例
 wasm_cache_dir = "wasm_cache"
 # wasm_fetch_base = "https://my-bucket.oss-cn-hangzhou.aliyuncs.com/beenet"
 
@@ -149,17 +148,21 @@ ADMIN_TOKEN="beenet-dev-admin-token"
 curl -s -X POST http://127.0.0.1:3030/v1/admin/tokens \
   -H "Authorization: Bearer $ADMIN_TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"description":"dev","ttl_secs":86400}'
+  -d '{"description":"dev","ttl_secs":600}'
 # 响应 JSON 里的 token_value 即 join_token
 ```
+
+Join token 默认有效期为 10 分钟，管理员可设置的最大有效期为 60 分钟；有效期内同一个 token 可用于批量接入多个不同 PeerId。Registry 只保存 token 的 SHA-256 摘要，管理列表不会再次返回明文。
 
 **Gateway 在 Docker 里、Worker 在宿主机时**：Worker 只需要 `registry_url` 和 `join-token`，会先向 Registry 领取 Worker 租约，再由 Registry 返回可用 Gateway 列表；Worker 自己不会再手工指定 `gateway_addr`：
 
 ```bash
 ./target/release/beenet-worker \
   --config examples/local-dev-config.toml \
-  --join-token "<token_value>"
+  --join-token-file /path/to/temporary-join-token
 ```
+
+也可以用 `--join-token-stdin` 交互输入或通过管道传入。`--join-token` 仍兼容，但可能把 token 暴露在 shell history 或进程列表中；`[worker].join_token` 仅保留旧配置兼容，新部署不要持久化它。首次 join 成功后可以立即删除临时 token 文件。Worker 重启时会复用 `wasm_cache_dir/identity.key`，直接签名 heartbeat；若管理员撤销该 registration，则必须显式提供新的有效 join token 才能重新入网。
 
 Dashboard 也同样只读 Registry 的 `/v1/dashboard/status`，不再依赖 Gateway 的状态接口；Worker 的在线状态由 Registry 快照里的 `connected` 字段直接呈现。
 
@@ -278,7 +281,7 @@ RUST_LOG=info ./target/release/beenet-registry --http-addr 127.0.0.1:3030
 ```bash
 RUST_LOG=info ./target/release/beenet-worker \
   --config examples/local-dev-config.toml \
-  --join-token "<token_value>"
+  --join-token-file /path/to/temporary-join-token
 ```
 
 确认入网：

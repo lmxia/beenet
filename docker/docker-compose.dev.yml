@@ -7,7 +7,7 @@
 #   curl -s -X POST http://127.0.0.1:3030/v1/admin/tokens \
 #     -H "Authorization: Bearer <admin_token>" \
 #     -H "Content-Type: application/json" \
-#     -d '{"description":"dev","ttl_secs":86400}'
+#     -d '{"description":"dev","ttl_secs":600}'
 #
 # MinIO console: http://127.0.0.1:9001  (minioadmin / minioadmin)
 # S3 API:         http://127.0.0.1:9000
