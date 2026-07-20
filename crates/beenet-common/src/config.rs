@@ -25,6 +25,8 @@ pub struct GatewaySection {
     pub registry_poll_ms: Option<u64>,
     pub default_deadline_ms: Option<u32>,
     pub libp2p_listen_addr: Option<String>,
+    /// Worker-visible gateway address to advertise to the registry.
+    /// This can be private, LAN-local, or public as long as workers can dial it.
     pub public_addr: Option<String>,
     /// Persistent Ed25519 identity key path (stable PeerId for workers to dial).
     pub identity_key_path: Option<String>,
@@ -45,6 +47,8 @@ pub struct WorkerSection {
     pub wasm_fetch_base: Option<String>,
     pub wasm_fetch_bearer: Option<String>,
     pub wasm_fetch_timeout_secs: Option<u64>,
+    /// Optional region label for Gateway affinity (e.g. `cn-hangzhou`).
+    pub region: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -120,6 +124,8 @@ pub struct WorkerSettings {
     pub wasm_fetch_base: Option<String>,
     pub wasm_fetch_bearer: Option<String>,
     pub wasm_fetch_timeout_secs: u64,
+    /// Optional region for Registry Gateway tip affinity.
+    pub region: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -137,6 +143,7 @@ pub struct WorkerCliOverrides {
     pub wasm_fetch_base: Option<String>,
     pub wasm_fetch_bearer: Option<String>,
     pub wasm_fetch_timeout_secs: Option<u64>,
+    pub region: Option<String>,
 }
 
 pub fn require_worker_section(cfg: &BeenetConfigFile) -> Result<&WorkerSection> {
@@ -208,6 +215,7 @@ pub fn resolve_worker_settings(
             DEFAULT_WASM_FETCH_TIMEOUT_SECS,
         )
         .max(1),
+        region: opt_merge(cli.region.clone(), w.region.as_ref()),
     })
 }
 
@@ -432,5 +440,8 @@ mod tests {
         f.worker.as_mut().unwrap().join_token = Some("t".into());
         let s = resolve_worker_settings(&f, &WorkerCliOverrides::default()).unwrap();
         assert_eq!(s.join_token.as_deref(), Some("t"));
+        f.worker.as_mut().unwrap().region = Some("cn-hangzhou".into());
+        let s = resolve_worker_settings(&f, &WorkerCliOverrides::default()).unwrap();
+        assert_eq!(s.region.as_deref(), Some("cn-hangzhou"));
     }
 }
