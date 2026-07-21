@@ -1,10 +1,9 @@
-# 本地联调：配合 `docker/docker-compose.dev.yml`（Redis + MinIO + registry + gateway）。
+# Local / host-side config used by:
+#   beenet-worker --config examples/local-dev-config.toml
+#   beenet-pack upload --config examples/local-dev-config.toml
+#   beenet-gateway --config examples/local-dev-config.toml   (native only)
 #
-# 宿主机 worker（反向长连接）：
-#   1) registry 发放 join_token
-#   2) beenet-worker --config examples/local-dev-config.toml --join-token <token>
-#
-# Gateway 在 Docker 内时，curl 用 http://127.0.0.1:18080/...（不是 8080）。
+# Docker Compose gateway/registry do NOT read this file (they use CLI flags).
 
 [gateway]
 http_addr = "127.0.0.1:8080"
@@ -12,9 +11,15 @@ registry_url = "http://127.0.0.1:3030"
 libp2p_listen_addr = "/ip4/0.0.0.0/tcp/4001"
 # public_addr = "/ip4/127.0.0.1/tcp/4001"
 identity_key_path = "gateway_cache/identity.key"
+# Display name (duplicates ok). CLI: --gateway-id / --name
+# If omitted, a Docker-style name is generated and saved next to identity.key.
+# gateway_id = "local-gw"
 
 [worker]
 registry_url = "http://127.0.0.1:3030"
+# Display name (duplicates ok; PeerId is the identity). Override with --name.
+# If omitted, a Docker-style name is generated and saved as wasm_cache/display_name.
+# name = "dev-worker"
 # MinIO public read (bucket `beenet`, path-style URL)
 wasm_fetch_base = "http://127.0.0.1:9000/beenet"
 

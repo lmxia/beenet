@@ -15,6 +15,7 @@ export type CreatedJoinTokenView = JoinTokenView & {
 export type RegistrationView = {
   peer_id: string;
   registered_at_unix_ms: number;
+  name?: string;
   supported_cids: string[];
   loaded_cids: string[];
 };
@@ -54,8 +55,13 @@ export async function fetchStatus(token: string): Promise<DashboardStatus> {
   return requestJson<DashboardStatus>("/v1/dashboard/status", token);
 }
 
-export async function createJoinToken(token: string, description: string, ttl_secs?: number | null) {
-  const res = await fetch(`${REGISTRY_BASE.replace(/\/$/, "")}/v1/admin/tokens`, {
+async function createTokenAt(
+  path: string,
+  token: string,
+  description: string,
+  ttl_secs?: number | null,
+) {
+  const res = await fetch(`${REGISTRY_BASE.replace(/\/$/, "")}${path}`, {
     method: "POST",
     headers: { ...tokenHeaders(token), "Content-Type": "application/json" },
     body: JSON.stringify({ description, ttl_secs }),
@@ -65,12 +71,8 @@ export async function createJoinToken(token: string, description: string, ttl_se
   return (await res.json()) as CreatedJoinTokenView;
 }
 
-export async function listJoinTokens(token: string) {
-  return requestJson<{ tokens: JoinTokenView[] }>("/v1/admin/tokens", token);
-}
-
-export async function deleteJoinToken(token: string, id: string) {
-  const res = await fetch(`${REGISTRY_BASE.replace(/\/$/, "")}/v1/admin/tokens/${encodeURIComponent(id)}`, {
+async function deleteTokenAt(path: string, token: string, id: string) {
+  const res = await fetch(`${REGISTRY_BASE.replace(/\/$/, "")}${path}/${encodeURIComponent(id)}`, {
     method: "DELETE",
     headers: tokenHeaders(token),
   });
@@ -79,6 +81,67 @@ export async function deleteJoinToken(token: string, id: string) {
   return (await res.json()) as { deleted: boolean };
 }
 
+export async function createJoinToken(token: string, description: string, ttl_secs?: number | null) {
+  return createTokenAt("/v1/admin/tokens", token, description, ttl_secs);
+}
+
+export async function listJoinTokens(token: string) {
+  return requestJson<{ tokens: JoinTokenView[] }>("/v1/admin/tokens", token);
+}
+
+export async function deleteJoinToken(token: string, id: string) {
+  return deleteTokenAt("/v1/admin/tokens", token, id);
+}
+
+export async function createGatewayJoinToken(token: string, description: string, ttl_secs?: number | null) {
+  return createTokenAt("/v1/admin/gateway-tokens", token, description, ttl_secs);
+}
+
+export async function listGatewayJoinTokens(token: string) {
+  return requestJson<{ tokens: JoinTokenView[] }>("/v1/admin/gateway-tokens", token);
+}
+
+export async function deleteGatewayJoinToken(token: string, id: string) {
+  return deleteTokenAt("/v1/admin/gateway-tokens", token, id);
+}
+
 export async function listRegistrations(token: string) {
   return requestJson<{ registrations: RegistrationView[] }>("/v1/admin/registrations", token);
+}
+
+export async function deleteRegistration(token: string, peerId: string) {
+  const res = await fetch(
+    `${REGISTRY_BASE.replace(/\/$/, "")}/v1/admin/registrations/${encodeURIComponent(peerId)}`,
+    {
+      method: "DELETE",
+      headers: tokenHeaders(token),
+    },
+  );
+  if (res.status === 401) throw new AuthError();
+  if (!res.ok) throw new Error(`Registry HTTP ${res.status}`);
+  return (await res.json()) as { deleted: boolean };
+}
+
+export type GatewayRegistrationView = {
+  peer_id: string;
+  gateway_id: string;
+  registered_at_unix_ms: number;
+  region?: string;
+};
+
+export async function listGatewayRegistrations(token: string) {
+  return requestJson<{ registrations: GatewayRegistrationView[] }>("/v1/admin/gateway-registrations", token);
+}
+
+export async function deleteGatewayRegistration(token: string, peerId: string) {
+  const res = await fetch(
+    `${REGISTRY_BASE.replace(/\/$/, "")}/v1/admin/gateway-registrations/${encodeURIComponent(peerId)}`,
+    {
+      method: "DELETE",
+      headers: tokenHeaders(token),
+    },
+  );
+  if (res.status === 401) throw new AuthError();
+  if (!res.ok) throw new Error(`Registry HTTP ${res.status}`);
+  return (await res.json()) as { deleted: boolean };
 }

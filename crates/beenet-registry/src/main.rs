@@ -5,8 +5,9 @@
 //! | Layer | Secret | Purpose |
 //! |-------|--------|---------|
 //! | Admin token | random UUID printed at startup | protect `/v1/admin/*` CRUD |
-//! | Join token | short-lived admin-issued bearer token | reusable bootstrap gate for worker registration |
-//! | Ed25519 keypair | worker-held private key | sign every heartbeat; registry verifies with stored pubkey |
+//! | Worker join token | short-lived admin-issued bearer token | bootstrap gate for worker registration |
+//! | Gateway join token | short-lived admin-issued bearer token | bootstrap gate for gateway registration |
+//! | Ed25519 keypair | worker/gateway-held private key | sign heartbeats/lookups; registry verifies with stored pubkey |
 //!
 //! ## Persistence
 //! Worker registrations are stored in Redis (`beenet:registrations` Hash).
@@ -16,16 +17,22 @@
 //! ## Endpoints
 //! | Method | Path | Auth | Description |
 //! |--------|------|------|-------------|
-//! | POST | `/v1/workers/join` | join token + sig | register a new worker |
-//! | POST | `/v1/workers/heartbeat` | sig | renew lease |
-//! | GET  | `/v1/workers` | none | gateway discovery |
-//! | POST | `/v1/admin/tokens` | admin | create join token |
-//! | GET  | `/v1/admin/tokens` | admin | list join tokens |
-//! | DELETE | `/v1/admin/tokens/:id` | admin | revoke join token |
+//! | POST | `/v1/workers/join` | worker join token + sig | register a new worker |
+//! | POST | `/v1/workers/heartbeat` | worker sig | renew worker lease |
+//! | POST | `/v1/workers/lookup` | gateway sig | batch lookup by peer_ids (active lease only) |
+//! | POST | `/v1/gateways/join` | gateway join token + sig | register a new gateway |
+//! | POST | `/v1/gateways/heartbeat` | gateway sig | renew gateway lease |
+//! | POST | `/v1/admin/tokens` | admin | create worker join token |
+//! | GET  | `/v1/admin/tokens` | admin | list worker join tokens |
+//! | DELETE | `/v1/admin/tokens/:id` | admin | revoke worker join token |
+//! | POST | `/v1/admin/gateway-tokens` | admin | create gateway join token |
+//! | GET  | `/v1/admin/gateway-tokens` | admin | list gateway join tokens |
+//! | DELETE | `/v1/admin/gateway-tokens/:id` | admin | revoke gateway join token |
 //! | GET  | `/v1/admin/registrations` | admin | list registered workers |
 //! | DELETE | `/v1/admin/registrations/:peer_id` | admin | revoke worker registration |
-//! | GET  | `/v1/gateways?peer_id=` | none | personalized Gateway tip for a worker |
-//! | GET  | `/v1/dashboard/status` | none | full gateway + worker snapshot |
+//! | GET  | `/v1/admin/gateway-registrations` | admin | list registered gateways |
+//! | DELETE | `/v1/admin/gateway-registrations/:peer_id` | admin | revoke gateway registration |
+//! | GET  | `/v1/dashboard/status` | admin | full gateway + worker snapshot |
 //! | GET  | `/health` | none | liveness probe |
 
 use std::collections::HashMap;
@@ -35,7 +42,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
-use axum::extract::{Path, Query, Request, State};
+use axum::extract::{Path, Request, State};
 use axum::http::StatusCode;
 use axum::middleware::Next;
 use axum::response::IntoResponse;
@@ -62,10 +69,14 @@ const DEFAULT_JOIN_TOKEN_TTL_SECS: u64 = 10 * 60;
 const MAX_JOIN_TOKEN_TTL_SECS: u64 = 60 * 60;
 /// Redis Hash key that stores all worker registrations.
 const REDIS_REG_KEY: &str = "beenet:registrations";
+/// Redis Hash key that stores all gateway registrations.
+const REDIS_GW_REG_KEY: &str = "beenet:gateway_registrations";
 /// Max gateways returned to a worker (primary + HA backups).
 const GATEWAY_TIP_SIZE: usize = 3;
 /// Modulus for sticky hash tie-break among equal-scoring gateways.
 const STICKY_MOD: u64 = 1_000_000;
+/// Max peer_ids accepted by `POST /v1/workers/lookup`.
+const MAX_LOOKUP_PEER_IDS: usize = 256;
 
 // ── CLI ────────────────────────────────────────────────────────────────────
 
@@ -93,11 +104,15 @@ struct Args {
 struct AppState {
     admin_token: String,
     join_tokens: Arc<RwLock<HashMap<String, JoinTokenRecord>>>,
+    gateway_join_tokens: Arc<RwLock<HashMap<String, JoinTokenRecord>>>,
     /// Workers that have successfully joined (public key stored here for sig verification).
     /// In-memory mirror of the Redis Hash — always kept in sync.
     registered: Arc<RwLock<HashMap<PeerId, RegistrationRecord>>>,
+    /// Gateways that have successfully joined (public key stored for sig verification).
+    registered_gateways: Arc<RwLock<HashMap<PeerId, GatewayRegistrationRecord>>>,
     /// Active workers with a live heartbeat lease (in-memory only; rebuilt from heartbeats).
     active: Arc<RwLock<HashMap<PeerId, ActiveRecord>>>,
+    /// Active gateways with a live heartbeat lease (in-memory only; rebuilt from heartbeats).
     gateways: Arc<RwLock<HashMap<PeerId, ActiveGateway>>>,
     /// Async Redis connection (auto-reconnects; clone-safe).
     redis: redis::aio::ConnectionManager,
@@ -117,6 +132,8 @@ struct RedisRegistration {
     loaded_cids: Vec<String>,
     #[serde(default)]
     region: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
 }
 
 /// Upsert one registration into Redis (`HSET beenet:registrations <peer_id> <json>`).
@@ -131,6 +148,7 @@ async fn redis_put(
         supported_cids: rec.supported_cids.clone(),
         loaded_cids: rec.loaded_cids.clone(),
         region: rec.region.clone(),
+        name: rec.name.clone(),
     };
     let json = match serde_json::to_string(&value) {
         Ok(j) => j,
@@ -206,10 +224,109 @@ async fn redis_load_all(
                 supported_cids: r.supported_cids,
                 loaded_cids: r.loaded_cids,
                 region: r.region,
+                name: r.name,
             },
         );
     }
     info!(count = out.len(), "loaded worker registrations from Redis");
+    out
+}
+
+#[derive(Serialize, Deserialize)]
+struct RedisGatewayRegistration {
+    public_key_b64: String,
+    registered_at_unix_ms: u64,
+    gateway_id: String,
+    #[serde(default)]
+    region: Option<String>,
+}
+
+async fn redis_gateway_put(
+    redis: &mut redis::aio::ConnectionManager,
+    peer_id: &PeerId,
+    rec: &GatewayRegistrationRecord,
+) {
+    let value = RedisGatewayRegistration {
+        public_key_b64: STANDARD.encode(rec.public_key.encode_protobuf()),
+        registered_at_unix_ms: rec.registered_at_unix_ms,
+        gateway_id: rec.gateway_id.clone(),
+        region: rec.region.clone(),
+    };
+    let json = match serde_json::to_string(&value) {
+        Ok(j) => j,
+        Err(e) => {
+            warn!(peer_id = %peer_id, error = %e, "failed to serialize gateway registration for Redis");
+            return;
+        }
+    };
+    if let Err(e) = redis
+        .hset::<_, _, _, ()>(REDIS_GW_REG_KEY, peer_id.to_string(), json)
+        .await
+    {
+        warn!(peer_id = %peer_id, error = %e, "Redis HSET gateway registration failed");
+    }
+}
+
+async fn redis_gateway_del(redis: &mut redis::aio::ConnectionManager, peer_id: &PeerId) {
+    if let Err(e) = redis
+        .hdel::<_, _, ()>(REDIS_GW_REG_KEY, peer_id.to_string())
+        .await
+    {
+        warn!(peer_id = %peer_id, error = %e, "Redis HDEL gateway registration failed");
+    }
+}
+
+async fn redis_gateway_load_all(
+    redis: &mut redis::aio::ConnectionManager,
+) -> HashMap<PeerId, GatewayRegistrationRecord> {
+    let raw: HashMap<String, String> = match redis.hgetall(REDIS_GW_REG_KEY).await {
+        Ok(m) => m,
+        Err(e) => {
+            warn!(error = %e, "Redis HGETALL gateway registrations failed; starting empty");
+            return HashMap::new();
+        }
+    };
+    let mut out = HashMap::new();
+    for (peer_id_str, json) in raw {
+        let pid = match PeerId::from_str(&peer_id_str) {
+            Ok(p) => p,
+            Err(e) => {
+                warn!(peer_id = %peer_id_str, error = %e, "skipping corrupt gateway registration");
+                continue;
+            }
+        };
+        let r: RedisGatewayRegistration = match serde_json::from_str(&json) {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(peer_id = %peer_id_str, error = %e, "skipping undeserializable gateway registration");
+                continue;
+            }
+        };
+        let pk_bytes = match STANDARD.decode(&r.public_key_b64) {
+            Ok(b) => b,
+            Err(e) => {
+                warn!(peer_id = %peer_id_str, error = %e, "skipping gateway registration with invalid base64 key");
+                continue;
+            }
+        };
+        let public_key = match identity::PublicKey::try_decode_protobuf(&pk_bytes) {
+            Ok(k) => k,
+            Err(e) => {
+                warn!(peer_id = %peer_id_str, error = %e, "skipping gateway registration with undecodable key");
+                continue;
+            }
+        };
+        out.insert(
+            pid,
+            GatewayRegistrationRecord {
+                public_key,
+                registered_at_unix_ms: r.registered_at_unix_ms,
+                gateway_id: r.gateway_id,
+                region: r.region,
+            },
+        );
+    }
+    info!(count = out.len(), "loaded gateway registrations from Redis");
     out
 }
 
@@ -242,6 +359,7 @@ struct RegistrationRecord {
     supported_cids: Vec<String>,
     loaded_cids: Vec<String>,
     region: Option<String>,
+    name: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -249,6 +367,15 @@ struct ActiveRecord {
     last_seen: Instant,
     supported_cids: Vec<String>,
     loaded_cids: Vec<String>,
+    name: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct GatewayRegistrationRecord {
+    public_key: identity::PublicKey,
+    registered_at_unix_ms: u64,
+    gateway_id: String,
+    region: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -303,6 +430,8 @@ struct TokenListResponse {
 struct RegistrationView {
     peer_id: String,
     registered_at_unix_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     supported_cids: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -312,6 +441,20 @@ struct RegistrationView {
 #[derive(Debug, Serialize)]
 struct RegistrationListResponse {
     registrations: Vec<RegistrationView>,
+}
+
+#[derive(Debug, Serialize)]
+struct GatewayRegistrationView {
+    peer_id: String,
+    gateway_id: String,
+    registered_at_unix_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    region: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct GatewayRegistrationListResponse {
+    registrations: Vec<GatewayRegistrationView>,
 }
 
 #[derive(Debug, Serialize)]
@@ -336,6 +479,9 @@ struct JoinBody {
     loaded_cids: Vec<String>,
     #[serde(default)]
     region: Option<String>,
+    /// Display name; duplicates allowed (PeerId is the unique identity).
+    #[serde(default)]
+    name: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -356,6 +502,8 @@ struct HeartbeatBody {
     loaded_cids: Vec<String>,
     #[serde(default)]
     region: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -365,10 +513,27 @@ struct HeartbeatOkResponse {
 }
 
 #[derive(Debug, Deserialize)]
+struct GatewayJoinBody {
+    join_token: String,
+    peer_id: String,
+    public_key: String,
+    timestamp_secs: u64,
+    signature: String,
+    gateway_id: String,
+    #[serde(default)]
+    region: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct GatewayJoinResponse {
+    ok: bool,
+    peer_id: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct GatewayHeartbeatBody {
     gateway_id: String,
     peer_id: String,
-    public_key: String,
     timestamp_secs: u64,
     signature: String,
     dial_addr: String,
@@ -405,6 +570,15 @@ struct WorkersResponse {
     workers: Vec<WorkerView>,
 }
 
+#[derive(Debug, Deserialize)]
+struct WorkersLookupBody {
+    /// Registered gateway peer id authenticating this lookup.
+    peer_id: String,
+    timestamp_secs: u64,
+    signature: String,
+    peer_ids: Vec<String>,
+}
+
 #[derive(Debug, Serialize)]
 struct DashboardStatusResponse {
     gateways: Vec<GatewayView>,
@@ -419,6 +593,8 @@ struct WorkerView {
     peer_id: String,
     connected: bool,
     last_seen_unix_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     supported_cids: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -482,32 +658,35 @@ async fn admin_auth_middleware(
 
 // ── Admin: join token CRUD ─────────────────────────────────────────────────
 
-async fn create_token(
-    State(state): State<AppState>,
-    Json(body): Json<CreateTokenBody>,
-) -> impl IntoResponse {
+fn mint_join_token(description: String, ttl_secs: u64) -> (JoinTokenRecord, String) {
     let now_instant = Instant::now();
     let now_unix_ms = unix_ms_now();
-    let ttl_secs = match resolve_join_token_ttl(body.ttl_secs) {
-        Ok(ttl_secs) => ttl_secs,
-        Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
-    };
-
     let token_value = format!("{}.{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
-
     let record = JoinTokenRecord {
         id: Uuid::new_v4().to_string(),
-        description: body.description,
+        description,
         token_hash: hash_join_token(&token_value),
         created_at_unix_ms: now_unix_ms,
         expires_at: now_instant + Duration::from_secs(ttl_secs),
         expires_at_unix_ms: now_unix_ms + ttl_secs * 1000,
     };
+    (record, token_value)
+}
+
+async fn create_token(
+    State(state): State<AppState>,
+    Json(body): Json<CreateTokenBody>,
+) -> impl IntoResponse {
+    let ttl_secs = match resolve_join_token_ttl(body.ttl_secs) {
+        Ok(ttl_secs) => ttl_secs,
+        Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
+    };
+    let (record, token_value) = mint_join_token(body.description, ttl_secs);
     let mut view = TokenView::from(&record);
     view.token_value = Some(token_value);
     let id = record.id.clone();
     state.join_tokens.write().await.insert(id.clone(), record);
-    info!(%id, ttl_secs, "join token created");
+    info!(%id, ttl_secs, "worker join token created");
     (StatusCode::CREATED, Json(view)).into_response()
 }
 
@@ -521,7 +700,46 @@ async fn list_tokens(State(state): State<AppState>) -> impl IntoResponse {
 async fn delete_token(State(state): State<AppState>, Path(id): Path<String>) -> impl IntoResponse {
     let deleted = state.join_tokens.write().await.remove(&id).is_some();
     if deleted {
-        info!(%id, "join token revoked");
+        info!(%id, "worker join token revoked");
+    }
+    Json(DeleteResponse { deleted })
+}
+
+async fn create_gateway_token(
+    State(state): State<AppState>,
+    Json(body): Json<CreateTokenBody>,
+) -> impl IntoResponse {
+    let ttl_secs = match resolve_join_token_ttl(body.ttl_secs) {
+        Ok(ttl_secs) => ttl_secs,
+        Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
+    };
+    let (record, token_value) = mint_join_token(body.description, ttl_secs);
+    let mut view = TokenView::from(&record);
+    view.token_value = Some(token_value);
+    let id = record.id.clone();
+    state
+        .gateway_join_tokens
+        .write()
+        .await
+        .insert(id.clone(), record);
+    info!(%id, ttl_secs, "gateway join token created");
+    (StatusCode::CREATED, Json(view)).into_response()
+}
+
+async fn list_gateway_tokens(State(state): State<AppState>) -> impl IntoResponse {
+    let map = state.gateway_join_tokens.read().await;
+    let mut tokens: Vec<TokenView> = map.values().map(TokenView::from).collect();
+    tokens.sort_by_key(|t| t.created_at_unix_ms);
+    Json(TokenListResponse { tokens })
+}
+
+async fn delete_gateway_token(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let deleted = state.gateway_join_tokens.write().await.remove(&id).is_some();
+    if deleted {
+        info!(%id, "gateway join token revoked");
     }
     Json(DeleteResponse { deleted })
 }
@@ -535,6 +753,7 @@ async fn list_registrations(State(state): State<AppState>) -> impl IntoResponse 
         .map(|(pid, rec)| RegistrationView {
             peer_id: pid.to_string(),
             registered_at_unix_ms: rec.registered_at_unix_ms,
+            name: rec.name.clone(),
             supported_cids: rec.supported_cids.clone(),
             loaded_cids: rec.loaded_cids.clone(),
         })
@@ -556,6 +775,38 @@ async fn delete_registration(
         state.active.write().await.remove(&pid);
         redis_del(&mut state.redis, &pid).await;
         info!(peer_id = %pid, "worker registration revoked");
+    }
+    Json(DeleteResponse { deleted }).into_response()
+}
+
+async fn list_gateway_registrations(State(state): State<AppState>) -> impl IntoResponse {
+    let map = state.registered_gateways.read().await;
+    let mut registrations: Vec<GatewayRegistrationView> = map
+        .iter()
+        .map(|(pid, rec)| GatewayRegistrationView {
+            peer_id: pid.to_string(),
+            gateway_id: rec.gateway_id.clone(),
+            registered_at_unix_ms: rec.registered_at_unix_ms,
+            region: rec.region.clone(),
+        })
+        .collect();
+    registrations.sort_by_key(|r| r.registered_at_unix_ms);
+    Json(GatewayRegistrationListResponse { registrations })
+}
+
+async fn delete_gateway_registration(
+    State(mut state): State<AppState>,
+    Path(peer_id_str): Path<String>,
+) -> impl IntoResponse {
+    let pid = match PeerId::from_str(&peer_id_str) {
+        Ok(p) => p,
+        Err(_) => return (StatusCode::BAD_REQUEST, "invalid peer_id").into_response(),
+    };
+    let deleted = state.registered_gateways.write().await.remove(&pid).is_some();
+    if deleted {
+        state.gateways.write().await.remove(&pid);
+        redis_gateway_del(&mut state.redis, &pid).await;
+        info!(peer_id = %pid, "gateway registration revoked");
     }
     Json(DeleteResponse { deleted }).into_response()
 }
@@ -610,12 +861,14 @@ async fn post_join(
 
     // 5. Upsert registration record (in-memory + Redis).
     let region = normalize_region(body.region);
+    let name = normalize_worker_name(body.name);
     let rec = RegistrationRecord {
         public_key: pubkey,
         registered_at_unix_ms: unix_ms_now(),
         supported_cids: body.supported_cids.clone(),
         loaded_cids: body.loaded_cids.clone(),
         region: region.clone(),
+        name: name.clone(),
     };
     redis_put(&mut state.redis, &claimed_peer_id, &rec).await;
     state.registered.write().await.insert(claimed_peer_id, rec);
@@ -625,6 +878,7 @@ async fn post_join(
             last_seen: Instant::now(),
             supported_cids: body.supported_cids.clone(),
             loaded_cids: body.loaded_cids.clone(),
+            name,
         },
     );
     info!(peer_id = %claimed_peer_id, "worker registered");
@@ -670,6 +924,7 @@ async fn post_heartbeat(
     }
 
     let region_from_body = normalize_region(body.region.clone());
+    let name_from_body = normalize_worker_name(body.name.clone());
     let worker_region = {
         let mut map = state.registered.write().await;
         if let Some(rec) = map.get_mut(&pid) {
@@ -678,13 +933,17 @@ async fn post_heartbeat(
             if let Some(region) = region_from_body.clone() {
                 rec.region = Some(region);
             }
+            if let Some(name) = name_from_body.clone() {
+                rec.name = Some(name);
+            }
             let region = rec.region.clone();
+            let name = rec.name.clone();
             let snapshot = rec.clone();
             drop(map);
             redis_put(&mut state.redis.clone(), &pid, &snapshot).await;
-            region
+            (region, name)
         } else {
-            region_from_body
+            (region_from_body, name_from_body)
         }
     };
     state.active.write().await.insert(
@@ -693,13 +952,80 @@ async fn post_heartbeat(
             last_seen: Instant::now(),
             supported_cids: body.supported_cids.clone(),
             loaded_cids: body.loaded_cids.clone(),
+            name: worker_region.1,
         },
     );
     info!(peer_id = %pid, "worker heartbeat ok (lease renewed)");
-    let gateways = gateway_tip_for(&state, &body.peer_id, worker_region.as_deref()).await;
+    let gateways = gateway_tip_for(&state, &body.peer_id, worker_region.0.as_deref()).await;
     (
         StatusCode::OK,
         Json(HeartbeatOkResponse { ok: true, gateways }),
+    )
+        .into_response()
+}
+
+async fn post_gateway_join(
+    State(mut state): State<AppState>,
+    Json(body): Json<GatewayJoinBody>,
+) -> impl IntoResponse {
+    let token_valid = {
+        let map = state.gateway_join_tokens.read().await;
+        map.values()
+            .any(|t| !t.is_expired() && t.matches(&body.join_token))
+    };
+    if !token_valid {
+        return (StatusCode::UNAUTHORIZED, "invalid or expired join_token").into_response();
+    }
+    if body.gateway_id.trim().is_empty() {
+        return (StatusCode::BAD_REQUEST, "gateway_id is required").into_response();
+    }
+
+    let pubkey_bytes = match STANDARD.decode(&body.public_key) {
+        Ok(b) => b,
+        Err(_) => {
+            return (StatusCode::BAD_REQUEST, "public_key is not valid base64").into_response()
+        }
+    };
+    let pubkey = match identity::PublicKey::try_decode_protobuf(&pubkey_bytes) {
+        Ok(k) => k,
+        Err(e) => {
+            return (StatusCode::BAD_REQUEST, format!("invalid public_key: {e}")).into_response()
+        }
+    };
+    let claimed_peer_id = match PeerId::from_str(&body.peer_id) {
+        Ok(p) => p,
+        Err(_) => return (StatusCode::BAD_REQUEST, "invalid peer_id").into_response(),
+    };
+    if pubkey.to_peer_id() != claimed_peer_id {
+        return (StatusCode::BAD_REQUEST, "public_key does not match peer_id").into_response();
+    }
+    if let Err(e) = check_timestamp(body.timestamp_secs) {
+        return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
+    }
+    if let Err(e) = verify_signature(&pubkey, &body.peer_id, body.timestamp_secs, &body.signature) {
+        return (StatusCode::UNAUTHORIZED, e.to_string()).into_response();
+    }
+
+    let region = normalize_region(body.region);
+    let rec = GatewayRegistrationRecord {
+        public_key: pubkey,
+        registered_at_unix_ms: unix_ms_now(),
+        gateway_id: body.gateway_id.trim().to_string(),
+        region,
+    };
+    redis_gateway_put(&mut state.redis, &claimed_peer_id, &rec).await;
+    state
+        .registered_gateways
+        .write()
+        .await
+        .insert(claimed_peer_id, rec);
+    info!(peer_id = %claimed_peer_id, "gateway registered");
+    (
+        StatusCode::OK,
+        Json(GatewayJoinResponse {
+            ok: true,
+            peer_id: body.peer_id,
+        }),
     )
         .into_response()
 }
@@ -712,14 +1038,6 @@ async fn post_gateway_heartbeat(
         Ok(value) => value,
         Err(_) => return (StatusCode::BAD_REQUEST, "invalid peer_id").into_response(),
     };
-    let public_key = match STANDARD
-        .decode(&body.public_key)
-        .ok()
-        .and_then(|bytes| identity::PublicKey::try_decode_protobuf(&bytes).ok())
-    {
-        Some(value) if value.to_peer_id() == peer_id => value,
-        _ => return (StatusCode::BAD_REQUEST, "public_key does not match peer_id").into_response(),
-    };
     if body.gateway_id.trim().is_empty() || body.dial_addr.trim().is_empty() {
         return (
             StatusCode::BAD_REQUEST,
@@ -727,9 +1045,22 @@ async fn post_gateway_heartbeat(
         )
             .into_response();
     }
+    let pubkey = {
+        let map = state.registered_gateways.read().await;
+        match map.get(&peer_id) {
+            Some(r) => r.public_key.clone(),
+            None => {
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    "gateway not registered; call /v1/gateways/join first",
+                )
+                    .into_response()
+            }
+        }
+    };
     if let Err(error) = check_timestamp(body.timestamp_secs).and_then(|_| {
         verify_signature(
-            &public_key,
+            &pubkey,
             &body.peer_id,
             body.timestamp_secs,
             &body.signature,
@@ -737,12 +1068,32 @@ async fn post_gateway_heartbeat(
     }) {
         return (StatusCode::UNAUTHORIZED, error.to_string()).into_response();
     }
+    let region = normalize_region(body.region);
+    let gateway_id = {
+        let t = body.gateway_id.trim();
+        if t.is_empty() {
+            return (StatusCode::BAD_REQUEST, "gateway_id is required").into_response();
+        }
+        t.chars().take(64).collect::<String>()
+    };
+    {
+        let mut map = state.registered_gateways.write().await;
+        if let Some(rec) = map.get_mut(&peer_id) {
+            rec.gateway_id = gateway_id.clone();
+            if let Some(region) = region.clone() {
+                rec.region = Some(region);
+            }
+            let snapshot = rec.clone();
+            drop(map);
+            redis_gateway_put(&mut state.redis.clone(), &peer_id, &snapshot).await;
+        }
+    }
     state.gateways.write().await.insert(
         peer_id,
         ActiveGateway {
-            gateway_id: body.gateway_id,
+            gateway_id,
             dial_addr: body.dial_addr,
-            region: body.region,
+            region,
             capacity: body.capacity.max(1),
             connected_workers: body.connected_workers,
             last_seen: Instant::now(),
@@ -787,6 +1138,18 @@ fn normalize_region(region: Option<String>) -> Option<String> {
     region.and_then(|r| {
         let t = r.trim();
         (!t.is_empty()).then(|| t.to_string())
+    })
+}
+
+/// Trim and cap display names (duplicates allowed across workers).
+fn normalize_worker_name(name: Option<String>) -> Option<String> {
+    name.and_then(|n| {
+        let t = n.trim();
+        if t.is_empty() {
+            return None;
+        }
+        let capped: String = t.chars().take(64).collect();
+        Some(capped)
     })
 }
 
@@ -882,76 +1245,94 @@ async fn gateway_tip_for(
     select_gateway_tip(all, worker_peer_id, worker_region)
 }
 
-#[derive(Debug, Deserialize)]
-struct GatewaysQuery {
-    peer_id: String,
-    #[serde(default)]
-    region: Option<String>,
-}
-
-async fn get_gateways(
-    State(state): State<AppState>,
-    Query(query): Query<GatewaysQuery>,
-) -> impl IntoResponse {
-    let peer_id = query.peer_id.trim();
-    if peer_id.is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            "peer_id query parameter is required",
-        )
-            .into_response();
-    }
-    let pid = match PeerId::from_str(peer_id) {
-        Ok(p) => p,
-        Err(_) => return (StatusCode::BAD_REQUEST, "invalid peer_id").into_response(),
-    };
-
-    let registered_region = {
-        let registered = state.registered.read().await;
-        match registered.get(&pid) {
-            Some(record) => record.region.clone(),
-            None => return (StatusCode::UNAUTHORIZED, "worker is not registered").into_response(),
-        }
-    };
-
-    let region = match normalize_region(query.region) {
-        Some(r) => Some(r),
-        None => registered_region,
-    };
-
-    Json(GatewaysResponse {
-        gateways: gateway_tip_for(&state, peer_id, region.as_deref()).await,
-    })
-    .into_response()
-}
-
 async fn worker_views(state: &AppState) -> Vec<WorkerView> {
     let map = state.active.read().await;
     let now = Instant::now();
-    let mut workers = Vec::new();
-    for (pid, rec) in map.iter() {
-        if now.duration_since(rec.last_seen) <= STALE_AFTER {
-            let elapsed_ms = now.duration_since(rec.last_seen).as_millis() as u64;
-            let last_seen_unix_ms = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0)
-                .saturating_sub(elapsed_ms);
-            workers.push(WorkerView {
-                peer_id: pid.to_string(),
-                connected: true,
-                last_seen_unix_ms,
-                supported_cids: rec.supported_cids.clone(),
-                loaded_cids: rec.loaded_cids.clone(),
-            });
-        }
-    }
-    workers
+    map.iter()
+        .filter_map(|(pid, rec)| worker_view_if_active(pid, rec, now))
+        .collect()
 }
 
-async fn get_workers(State(state): State<AppState>) -> impl IntoResponse {
-    let workers = worker_views(&state).await;
-    Json(WorkersResponse { workers })
+/// Point-lookup active workers by peer id. Unknown / stale peers are omitted.
+fn select_active_workers_by_peers(
+    active: &HashMap<PeerId, ActiveRecord>,
+    peer_ids: &[PeerId],
+    now: Instant,
+) -> Vec<WorkerView> {
+    peer_ids
+        .iter()
+        .filter_map(|pid| active.get(pid).and_then(|rec| worker_view_if_active(pid, rec, now)))
+        .collect()
+}
+
+fn worker_view_if_active(pid: &PeerId, rec: &ActiveRecord, now: Instant) -> Option<WorkerView> {
+    if now.duration_since(rec.last_seen) > STALE_AFTER {
+        return None;
+    }
+    let elapsed_ms = now.duration_since(rec.last_seen).as_millis() as u64;
+    let last_seen_unix_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+        .saturating_sub(elapsed_ms);
+    Some(WorkerView {
+        peer_id: pid.to_string(),
+        connected: true,
+        last_seen_unix_ms,
+        name: rec.name.clone(),
+        supported_cids: rec.supported_cids.clone(),
+        loaded_cids: rec.loaded_cids.clone(),
+    })
+}
+
+async fn post_workers_lookup(
+    State(state): State<AppState>,
+    Json(body): Json<WorkersLookupBody>,
+) -> impl IntoResponse {
+    if body.peer_ids.len() > MAX_LOOKUP_PEER_IDS {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!("peer_ids must contain at most {MAX_LOOKUP_PEER_IDS} entries"),
+        )
+            .into_response();
+    }
+    let gateway_pid = match PeerId::from_str(body.peer_id.trim()) {
+        Ok(p) => p,
+        Err(_) => return (StatusCode::BAD_REQUEST, "invalid peer_id").into_response(),
+    };
+    let pubkey = {
+        let map = state.registered_gateways.read().await;
+        match map.get(&gateway_pid) {
+            Some(r) => r.public_key.clone(),
+            None => {
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    "gateway not registered; call /v1/gateways/join first",
+                )
+                    .into_response()
+            }
+        }
+    };
+    if let Err(e) = check_timestamp(body.timestamp_secs) {
+        return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
+    }
+    if let Err(e) = verify_signature(
+        &pubkey,
+        &body.peer_id,
+        body.timestamp_secs,
+        &body.signature,
+    ) {
+        return (StatusCode::UNAUTHORIZED, e.to_string()).into_response();
+    }
+
+    let peer_ids: Vec<PeerId> = body
+        .peer_ids
+        .iter()
+        .filter_map(|s| PeerId::from_str(s.trim()).ok())
+        .collect();
+    let map = state.active.read().await;
+    let workers = select_active_workers_by_peers(&map, &peer_ids, Instant::now());
+    Json(WorkersResponse { workers }).into_response()
 }
 
 async fn get_dashboard_status(State(state): State<AppState>) -> impl IntoResponse {
@@ -994,14 +1375,27 @@ async fn purge_loop(state: AppState) {
             map.retain(|_, t| !t.is_expired());
             let removed = before.saturating_sub(map.len());
             if removed > 0 {
-                warn!(removed, "purged expired join tokens");
+                warn!(removed, "purged expired worker join tokens");
             }
         }
-        state
-            .gateways
-            .write()
-            .await
-            .retain(|_, gateway| now.duration_since(gateway.last_seen) <= STALE_AFTER);
+        {
+            let mut map = state.gateway_join_tokens.write().await;
+            let before = map.len();
+            map.retain(|_, t| !t.is_expired());
+            let removed = before.saturating_sub(map.len());
+            if removed > 0 {
+                warn!(removed, "purged expired gateway join tokens");
+            }
+        }
+        {
+            let mut map = state.gateways.write().await;
+            let before = map.len();
+            map.retain(|_, gateway| now.duration_since(gateway.last_seen) <= STALE_AFTER);
+            let removed = before.saturating_sub(map.len());
+            if removed > 0 {
+                warn!(removed, "purged gateways with expired heartbeat lease");
+            }
+        }
     }
 }
 
@@ -1070,6 +1464,7 @@ async fn main() -> Result<()> {
         .with_context(|| format!("connect to Redis at `{}`", cli.redis_url))?;
 
     let registered_map = redis_load_all(&mut redis_conn).await;
+    let registered_gateways = redis_gateway_load_all(&mut redis_conn).await;
 
     let (admin_token, admin_token_source) = cli
         .admin_token
@@ -1080,7 +1475,9 @@ async fn main() -> Result<()> {
     let state = AppState {
         admin_token: admin_token.clone(),
         join_tokens: Arc::new(RwLock::new(HashMap::new())),
+        gateway_join_tokens: Arc::new(RwLock::new(HashMap::new())),
         registered: Arc::new(RwLock::new(registered_map)),
+        registered_gateways: Arc::new(RwLock::new(registered_gateways)),
         active: Arc::new(RwLock::new(HashMap::new())),
         gateways: Arc::new(RwLock::new(HashMap::new())),
         redis: redis_conn,
@@ -1091,11 +1488,25 @@ async fn main() -> Result<()> {
     let admin_routes = Router::new()
         .route("/v1/admin/tokens", post(create_token).get(list_tokens))
         .route("/v1/admin/tokens/:id", delete(delete_token))
+        .route(
+            "/v1/admin/gateway-tokens",
+            post(create_gateway_token).get(list_gateway_tokens),
+        )
+        .route("/v1/admin/gateway-tokens/:id", delete(delete_gateway_token))
         .route("/v1/admin/registrations", get(list_registrations))
         .route(
             "/v1/admin/registrations/:peer_id",
             delete(delete_registration),
         )
+        .route(
+            "/v1/admin/gateway-registrations",
+            get(list_gateway_registrations),
+        )
+        .route(
+            "/v1/admin/gateway-registrations/:peer_id",
+            delete(delete_gateway_registration),
+        )
+        .route("/v1/dashboard/status", get(get_dashboard_status))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             admin_auth_middleware,
@@ -1105,10 +1516,9 @@ async fn main() -> Result<()> {
         .route("/health", get(health))
         .route("/v1/workers/join", post(post_join))
         .route("/v1/workers/heartbeat", post(post_heartbeat))
-        .route("/v1/workers", get(get_workers))
+        .route("/v1/workers/lookup", post(post_workers_lookup))
+        .route("/v1/gateways/join", post(post_gateway_join))
         .route("/v1/gateways/heartbeat", post(post_gateway_heartbeat))
-        .route("/v1/gateways", get(get_gateways))
-        .route("/v1/dashboard/status", get(get_dashboard_status))
         .merge(admin_routes)
         .with_state(state);
 
@@ -1116,7 +1526,7 @@ async fn main() -> Result<()> {
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     println!("  beenet-registry ADMIN TOKEN ({admin_token_source})");
     println!("  {admin_token}");
-    println!("  Authorization: Bearer <token>  →  /v1/admin/*");
+    println!("  Authorization: Bearer <token>  →  /v1/admin/*  /v1/dashboard/*");
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     println!();
 
@@ -1132,124 +1542,4 @@ async fn main() -> Result<()> {
 }
 
 #[cfg(test)]
-mod gateway_tip_tests {
-    use super::*;
-
-    fn gw(peer_id: &str, region: Option<&str>, connected: u32, capacity: u32) -> GatewayView {
-        GatewayView {
-            gateway_id: peer_id.to_string(),
-            peer_id: peer_id.to_string(),
-            dial_addr: format!("/ip4/127.0.0.1/tcp/4001/p2p/{peer_id}"),
-            region: region.map(str::to_string),
-            capacity,
-            connected_workers: connected,
-            last_seen_unix_ms: 0,
-        }
-    }
-
-    #[test]
-    fn prefers_same_region_as_primary() {
-        let tip = select_gateway_tip(
-            vec![
-                gw("g-remote", Some("us-west"), 0, 1000),
-                gw("g-local-busy", Some("cn-hangzhou"), 900, 1000),
-                gw("g-local-free", Some("cn-hangzhou"), 10, 1000),
-            ],
-            "worker-1",
-            Some("cn-hangzhou"),
-        );
-        assert_eq!(tip[0].peer_id, "g-local-free");
-        assert!(tip.iter().any(|g| g.peer_id == "g-remote"));
-        assert!(tip.len() <= GATEWAY_TIP_SIZE);
-    }
-
-    #[test]
-    fn backups_prefer_different_region() {
-        let tip = select_gateway_tip(
-            vec![
-                gw("a", Some("r1"), 0, 1000),
-                gw("b", Some("r1"), 1, 1000),
-                gw("c", Some("r2"), 50, 1000),
-                gw("d", Some("r3"), 50, 1000),
-            ],
-            "worker-x",
-            Some("r1"),
-        );
-        assert_eq!(tip[0].region.as_deref(), Some("r1"));
-        assert_eq!(tip.len(), 3);
-        let regions: Vec<_> = tip.iter().filter_map(|g| g.region.as_deref()).collect();
-        assert!(regions.contains(&"r2") || regions.contains(&"r3"));
-    }
-
-    #[test]
-    fn no_region_still_returns_diversified_tip() {
-        let tip = select_gateway_tip(
-            vec![
-                gw("a", Some("r1"), 0, 1000),
-                gw("b", Some("r2"), 0, 1000),
-                gw("c", Some("r3"), 0, 1000),
-                gw("d", Some("r4"), 0, 1000),
-            ],
-            "worker-y",
-            None,
-        );
-        assert_eq!(tip.len(), GATEWAY_TIP_SIZE);
-        let peers: std::collections::HashSet<_> = tip.iter().map(|g| g.peer_id.as_str()).collect();
-        assert_eq!(peers.len(), GATEWAY_TIP_SIZE);
-    }
-
-    #[test]
-    fn sticky_is_stable_for_same_worker() {
-        let candidates = vec![
-            gw("g1", Some("r1"), 10, 1000),
-            gw("g2", Some("r1"), 10, 1000),
-            gw("g3", Some("r1"), 10, 1000),
-        ];
-        let a = select_gateway_tip(candidates.clone(), "worker-stable", Some("r1"));
-        let b = select_gateway_tip(candidates, "worker-stable", Some("r1"));
-        assert_eq!(a[0].peer_id, b[0].peer_id);
-    }
-}
-
-#[cfg(test)]
-mod join_token_tests {
-    use super::*;
-
-    fn token_record(token_value: &str) -> JoinTokenRecord {
-        JoinTokenRecord {
-            id: "token-id".to_string(),
-            description: "test".to_string(),
-            token_hash: hash_join_token(token_value),
-            created_at_unix_ms: 1,
-            expires_at: Instant::now() + Duration::from_secs(60),
-            expires_at_unix_ms: 61_000,
-        }
-    }
-
-    #[test]
-    fn reusable_token_matches_only_its_secret() {
-        let record = token_record("shared-bootstrap-token");
-        assert!(record.matches("shared-bootstrap-token"));
-        assert!(!record.matches("different-token"));
-    }
-
-    #[test]
-    fn token_list_view_does_not_expose_secret() {
-        let view = TokenView::from(&token_record("secret"));
-        assert!(view.token_value.is_none());
-    }
-
-    #[test]
-    fn token_ttl_defaults_to_ten_minutes_and_caps_at_one_hour() {
-        assert_eq!(
-            resolve_join_token_ttl(None).unwrap(),
-            DEFAULT_JOIN_TOKEN_TTL_SECS
-        );
-        assert_eq!(
-            resolve_join_token_ttl(Some(MAX_JOIN_TOKEN_TTL_SECS)).unwrap(),
-            MAX_JOIN_TOKEN_TTL_SECS
-        );
-        assert!(resolve_join_token_ttl(Some(0)).is_err());
-        assert!(resolve_join_token_ttl(Some(MAX_JOIN_TOKEN_TTL_SECS + 1)).is_err());
-    }
-}
+mod tests;

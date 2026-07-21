@@ -22,6 +22,7 @@ pub struct BeenetConfigFile {
 pub struct GatewaySection {
     pub http_addr: Option<String>,
     pub registry_url: Option<String>,
+    /// Interval for refreshing connected-peer metadata via `POST /v1/workers/lookup`.
     pub registry_poll_ms: Option<u64>,
     pub default_deadline_ms: Option<u32>,
     pub libp2p_listen_addr: Option<String>,
@@ -30,6 +31,10 @@ pub struct GatewaySection {
     pub public_addr: Option<String>,
     /// Persistent Ed25519 identity key path (stable PeerId for workers to dial).
     pub identity_key_path: Option<String>,
+    /// Human-readable gateway id / display name (duplicates allowed; PeerId is identity).
+    pub gateway_id: Option<String>,
+    pub region: Option<String>,
+    pub capacity: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -51,6 +56,8 @@ pub struct WorkerSection {
     pub wasm_fetch_timeout_secs: Option<u64>,
     /// Optional region label for Gateway affinity (e.g. `cn-hangzhou`).
     pub region: Option<String>,
+    /// Human-readable display name (duplicates allowed; PeerId is the identity).
+    pub name: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -72,11 +79,12 @@ pub const DEFAULT_DEADLINE_MS: u32 = 10_000;
 pub const DEFAULT_MEMORY_MB: u32 = 64;
 pub const DEFAULT_MAX_INSTANCE_MEMORY_MB: u32 = 256;
 pub const DEFAULT_REGISTRY_HEARTBEAT_PATH: &str = "/v1/workers/heartbeat";
-pub const DEFAULT_REGISTRY_HEARTBEAT_SECS: u64 = 20;
+pub const DEFAULT_REGISTRY_HEARTBEAT_SECS: u64 = 30;
 pub const DEFAULT_WASM_FETCH_TIMEOUT_SECS: u64 = 60;
 pub const DEFAULT_GATEWAY_HTTP_ADDR: &str = "127.0.0.1:8080";
 pub const DEFAULT_GATEWAY_LIBP2P_LISTEN_ADDR: &str = "/ip4/0.0.0.0/tcp/4001";
 pub const DEFAULT_GATEWAY_IDENTITY_KEY_PATH: &str = "gateway_cache/identity.key";
+pub const DEFAULT_GATEWAY_CAPACITY: u32 = 1_000;
 pub const DEFAULT_REGISTRY_POLL_MS: u64 = 2000;
 pub const DEFAULT_REGISTRY_HTTP_ADDR: &str = "127.0.0.1:3030";
 pub const DEFAULT_OSS_REGION: &str = "oss-cn-hangzhou";
@@ -126,6 +134,8 @@ pub struct WorkerSettings {
     pub wasm_fetch_timeout_secs: u64,
     /// Optional region for Registry Gateway tip affinity.
     pub region: Option<String>,
+    /// Human-readable display name (duplicates allowed; PeerId is the identity).
+    pub name: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -144,6 +154,7 @@ pub struct WorkerCliOverrides {
     pub wasm_fetch_bearer: Option<String>,
     pub wasm_fetch_timeout_secs: Option<u64>,
     pub region: Option<String>,
+    pub name: Option<String>,
 }
 
 pub fn require_worker_section(cfg: &BeenetConfigFile) -> Result<&WorkerSection> {
@@ -216,6 +227,7 @@ pub fn resolve_worker_settings(
         )
         .max(1),
         region: opt_merge(cli.region.clone(), w.region.as_ref()),
+        name: opt_merge(cli.name.clone(), w.name.as_ref()),
     })
 }
 
@@ -275,11 +287,17 @@ pub fn resolve_oss_settings(cfg: &BeenetConfigFile, cli: &OssCliOverrides) -> Re
 pub struct GatewaySettings {
     pub http_addr: SocketAddr,
     pub registry_url: String,
+    /// Connected-peer metadata refresh interval (ms) via Registry lookup.
     pub registry_poll_ms: u64,
     pub default_deadline_ms: u32,
     pub libp2p_listen_addr: String,
     pub public_addr: Option<String>,
     pub identity_key_path: PathBuf,
+    /// Display name sent to Registry (duplicates allowed).
+    /// `None` means the binary should auto-generate a Docker-style name.
+    pub gateway_id: Option<String>,
+    pub region: Option<String>,
+    pub capacity: u32,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -291,6 +309,9 @@ pub struct GatewayCliOverrides {
     pub libp2p_listen_addr: Option<String>,
     pub public_addr: Option<String>,
     pub identity_key_path: Option<PathBuf>,
+    pub gateway_id: Option<String>,
+    pub region: Option<String>,
+    pub capacity: Option<u32>,
 }
 
 pub fn require_gateway_section(cfg: &BeenetConfigFile) -> Result<&GatewaySection> {
@@ -351,6 +372,15 @@ fn resolve_gateway_settings_merged(
                 .map(PathBuf::from)
         })
         .unwrap_or_else(|| PathBuf::from(DEFAULT_GATEWAY_IDENTITY_KEY_PATH));
+    let gateway_id = opt_merge(
+        cli.gateway_id.clone(),
+        g.and_then(|s| s.gateway_id.as_ref()),
+    )
+    .and_then(|s| {
+        let t = s.trim();
+        (!t.is_empty()).then(|| t.chars().take(64).collect::<String>())
+    });
+    let region = opt_merge(cli.region.clone(), g.and_then(|s| s.region.as_ref()));
     Ok(GatewaySettings {
         http_addr,
         registry_url,
@@ -367,6 +397,9 @@ fn resolve_gateway_settings_merged(
         libp2p_listen_addr,
         public_addr,
         identity_key_path,
+        gateway_id,
+        region,
+        capacity: pick_u32(cli.capacity, g.and_then(|s| s.capacity), DEFAULT_GATEWAY_CAPACITY).max(1),
     })
 }
 

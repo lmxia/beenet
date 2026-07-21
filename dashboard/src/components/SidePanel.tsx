@@ -67,7 +67,7 @@ export function SidePanel({ status, selectedPeer, onSelect, language }: Props) {
               <div className="row">
                 <span>
                   <span className={`dot ${w.connected ? "on" : "off"}`} />
-                  {copy.workerLabel(i)}
+                  {copy.workerLabel(w.name, i)}
                 </span>
                 <span className="badge">{w.connected ? copy.online : copy.offline}</span>
               </div>
@@ -81,9 +81,7 @@ export function SidePanel({ status, selectedPeer, onSelect, language }: Props) {
         <h2>{copy.detail}</h2>
         {!selectedPeer && <p className="empty-line">{copy.noSelection}</p>}
         {selectedPeer && !hasSelection && (
-          <p className="empty-line">
-            {language === "zh" ? "所选节点已不在当前快照中" : "Selected node is no longer in the snapshot"}
-          </p>
+          <p className="empty-line">{copy.selectionGone}</p>
         )}
         {selectedGateway && (
           <div className="detail-grid">
@@ -122,6 +120,10 @@ export function SidePanel({ status, selectedPeer, onSelect, language }: Props) {
             <div className="field">
               <span className="k">{copy.role}</span>
               <span className="v">{copy.workerRole}</span>
+            </div>
+            <div className="field">
+              <span className="k">{copy.workerName}</span>
+              <span className="v">{selected.name?.trim() || copy.unnamedWorker}</span>
             </div>
             <div className="field">
               <span className="k">{copy.workerStatus}</span>

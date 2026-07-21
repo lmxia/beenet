@@ -158,7 +158,7 @@ bill = base_fee + compute_fee + resource_fee
 
 ### 4.1 Worker 寻址与发现
 
-**当前工作区**：Gateway **仅** 通过 **`[gateway].registry_url`** 轮询 **`GET /v1/workers`** 获得可拨号的 Worker **dial_multiaddr**；Worker **必须** 对 Registry 的 **`POST /v1/workers/heartbeat`** 做 **周期性心跳**，以 **续租**（更新 `last_seen`，避免被当作离线剔除）。Worker 还会在注册信息里上报 `supported_cids`，Gateway 先做 CID hint 过滤，再在候选集里轮询。**v2.21 起**，该 `dial_multiaddr` 可以是 **`/p2p-circuit` 中继地址**，Worker 在上报 Registry 前需要先向公网 Relay 预约 reservation，确保地址可用。
+**当前工作区**：Gateway 通过 **`[gateway].registry_url`** 对**已连接** Worker 调用 **`POST /v1/workers/lookup`** 刷新本地 peer cache（`registry_poll_ms`）；invoke 热路径只读 cache，并用 `supported_cids` 做 CID hint。Worker **必须** 对 Registry 的 **`POST /v1/workers/heartbeat`** 做 **周期性心跳**，以 **续租**（更新 `last_seen`，避免被当作离线剔除）。**v2.21 起**，该 `dial_multiaddr` 可以是 **`/p2p-circuit` 中继地址**，Worker 在上报 Registry 前需要先向公网 Relay 预约 reservation，确保地址可用。
 
 **术语**：**注册（入网）** 与 **心跳（续租）** 使用 **同一请求**；首次成功 POST 即完成入网，其后同 payload 的定时 POST 均为 **心跳**。
 
@@ -173,7 +173,7 @@ bill = base_fee + compute_fee + resource_fee
 
 | 阶段 | 目标 | 机制概要 | Gateway 侧行为 |
 | --- | --- | --- | --- |
-| **当前** | 官方控制面 + 多 Worker | **HTTP Registry**（§4.3）：Worker **心跳**；Gateway **轮询** Worker 列表 | 按轮询结果选择 Worker（当前实现为简单轮询） |
+| **当前** | 官方控制面 + 多 Worker | **HTTP Registry**（§4.3）：Worker **心跳**；Gateway **按已连接 peer lookup** 缓存元数据 | 按本地 cache + CID hint 选择已连接 Worker |
 | **后续** | 纯 P2P 辅助发现 | **Bootstrap / mDNS / gossip**（与 libp2p 组网） | 可与 Registry 并存，作兜底或内网发现 |
 | **M2** | 生产级选路 | **CID→Workers** 索引、**DHT** 冷路径、§5 **一致性哈希 + least-inflight** | 按 CID 查询 Registry → 候选集 → libp2p 重试策略 |
 
@@ -203,9 +203,9 @@ bill = base_fee + compute_fee + resource_fee
 
 | 组件 | 配置（`config.toml`） / 行为 |
 | --- | --- |
-| **Registry** | `--http-addr`（默认 `127.0.0.1:3030`）、`--redis-url`、`--admin-token`。Admin API 创建默认 **10 分钟**、最长 **60 分钟**的 join token；token 在有效期内可供任意数量 PeerId 使用，Registry 只保存摘要且列表不返回明文。`POST /v1/workers/join` 校验 token、PeerId、公钥与签名并持久化 registration；`POST /v1/workers/heartbeat` 只校验已登记公钥签名并续租。`GET /v1/workers` 返回租约仍有效的 Worker（约 **60s** 无心跳则剔除）。 |
-| **Worker** | **`[worker]`**：`registry_url` 必填；`registry_heartbeat_secs`（默认 **20**）；`registry_heartbeat_path`（默认 **`/v1/workers/heartbeat`**）。首次入网通过 `--join-token-file`、`--join-token-stdin` 或兼容的 `--join-token` 提供临时 token，成功后丢弃；重启复用 `wasm_cache_dir/identity.key`，无需 token。registration 被撤销后不会自动 re-join。Worker 不再接受静态 `gateway_addr`，gateway 由 Registry 发现。 |
-| **Gateway** | **`[gateway]`**：`registry_url` 必填；`registry_poll_ms`（默认 **2000**）轮询 `GET …/v1/workers`，维护 dial 列表，先按 `supported_cids` 过滤，再以 **轮询** 选 Worker 发起 libp2p invoke。 |
+| **Registry** | `--http-addr`（默认 `127.0.0.1:3030`）、`--redis-url`、`--admin-token`。Admin API 创建默认 **10 分钟**、最长 **60 分钟**的 join token；token 在有效期内可供任意数量 PeerId 使用，Registry 只保存摘要且列表不返回明文。`POST /v1/workers/join` 校验 token、PeerId、公钥与签名并持久化 registration；`POST /v1/workers/heartbeat` 只校验已登记公钥签名并续租。`POST /v1/workers/lookup` 按 peer_ids 返回租约仍有效的 Worker（约 **60s** 无心跳则剔除）。 |
+| **Worker** | **`[worker]`**：`registry_url` 必填；`registry_heartbeat_secs`（默认 **30**）；`registry_heartbeat_path`（默认 **`/v1/workers/heartbeat`**）。首次入网通过 `--join-token-file`、`--join-token-stdin` 或兼容的 `--join-token` 提供临时 token，成功后丢弃；重启复用 `wasm_cache_dir/identity.key`，无需 token。registration 被撤销后不会自动 re-join。Worker 不再接受静态 `gateway_addr`，gateway tip 由 heartbeat 响应下发。 |
+| **Gateway** | **`[gateway]`**：`registry_url` 必填；首次入网用 admin 签发的 **gateway join token**（`--join-token-file` 等）调用 `POST /v1/gateways/join`；之后用持久 identity 签名 `POST /v1/gateways/heartbeat` 与 `POST /v1/workers/lookup`。`registry_poll_ms`（默认 **2000**）刷新已连接 peer 元数据；本地 cache 供 invoke 做 `supported_cids` hint。 |
 
 | **Dashboard** | 只读 Registry 的 `/v1/dashboard/status`，不再读取 Gateway 后端接口。Worker 的在线/离线状态直接来自 Registry 的 `connected` 字段。 |
 
@@ -214,7 +214,7 @@ bill = base_fee + compute_fee + resource_fee
 ### 4.4 反向长连接（v2.22）
 
 - **数据面**：Worker 只主动 dial Registry 发现到的 gateway；Gateway 在已有连接上 `send_request` 下发 invoke，**不再** `swarm.dial(worker)`。
-- **控制面**：Registry 负责 join / heartbeat / `GET /v1/workers`（`supported_cids` 过滤）；`dial_multiaddr` 仅为元数据。
+- **控制面**：Registry 负责 join / heartbeat / `POST /v1/workers/lookup`（按已连接 peer 拉取 `supported_cids`）；`dial_multiaddr` 仅为元数据。
 - Gateway 使用持久 `identity.key`，PeerId 稳定，Worker 不再配置静态 `gateway_addr`。
 - 已删除 `beenet-relay` 与 DCUtR（单边 NAT 不需要打洞）。
 - **规模假设**：单 Gateway 副本（反向连接天然 sticky；多副本需另做亲和）。
@@ -268,8 +268,8 @@ bill = base_fee + compute_fee + resource_fee
 - `crates/beenet-pack`：`build` / `inspect` / **`upload`**（S3 兼容，含阿里云 OSS）。
 - `crates/beenet-factors`：扁平 `BeenetFactors`（Wasi/Variables/OutboundNetworking/OutboundHttp/Audit/AI）。
 - `crates/beenet-worker`：libp2p invoke + FactorsExecutor；Registry **心跳**；可选 **HTTP 拉取 wasm**（`[worker].wasm_fetch_base`）写本地缓存。
-- `crates/beenet-gateway`：HTTP `POST /run/ipfs/:cid` → libp2p；**轮询 Registry** 动态 Worker 列表（§4.3）。
-- `crates/beenet-registry`：HTTP 控制面 `POST /v1/workers/heartbeat`、`GET /v1/workers`、内存表 + 心跳剔除。
+- `crates/beenet-gateway`：HTTP `POST /run/ipfs/:cid` → libp2p；**按已连接 peer lookup** Registry 元数据并本地缓存（§4.3）。
+- `crates/beenet-registry`：HTTP 控制面 `POST /v1/workers/heartbeat`、`POST /v1/workers/lookup`、内存表 + 心跳剔除。
 - `examples/hello-filter-http`：`spin-sdk` 的 `#[http_component]` 支持工单分类示例任务。
 
 规划中：
@@ -300,7 +300,7 @@ bill = base_fee + compute_fee + resource_fee
 
 ## 10. 里程碑
 
-- **M1（已闭环）**：最短闭环已端到端跑通（`POST /run/ipfs/<cid>` → gateway → libp2p → worker → wasi:http proxy → spin-sdk guest → body 回传）。本地伪 CID（`./wasm_cache/<cid>.wasm`）、档 0（`wasi:http/incoming-handler@0.2`，`wasmtime-wasi-http` p2 `ProxyPre`）、裸 HTTP gateway。**运维**：**`beenet-registry`** + **`config.toml` 的 `[gateway]` / `[worker]`**；Worker 向 Registry **心跳**；Gateway **轮询** Worker 列表（§4.3）。
+- **M1（已闭环）**：最短闭环已端到端跑通（`POST /run/ipfs/<cid>` → gateway → libp2p → worker → wasi:http proxy → spin-sdk guest → body 回传）。本地伪 CID（`./wasm_cache/<cid>.wasm`）、档 0（`wasi:http/incoming-handler@0.2`，`wasmtime-wasi-http` p2 `ProxyPre`）、裸 HTTP gateway。**运维**：**`beenet-registry`** + **`config.toml` 的 `[gateway]` / `[worker]`**；Worker 向 Registry **心跳**；Gateway **按已连接 peer lookup** 并缓存元数据（§4.3）。
   - **M1 已完成**：`beenet-common` / `beenet-proto` / `beenet-manifest` / `beenet-pack`，libp2p request-response 通信骨架，gateway→worker 转发，`Status` A/B 表，`beenet-worker` 的 `TaskExecutor` trait 抽象 + `Wasip2HttpExecutor` 实现（档 0），worker 并发闸门（tokio `Semaphore`，默认 `available_parallelism * 4`，超闸门返回 `Status::Rejected`）。
   - **M1 已交付但仍有限制**：`InvokeResponse` 不回传 stdout/stderr（仅 worker 本地 tracing）、manifest `max_memory_mb` 只读不 apply、`deadline_ms` 走 `tokio::time::timeout`（非 wasmtime epoch）、出网钳制靠 `WasiCtx` 默认 capability-not-granted 兜底（见 D16）——这些都由 M1.5 正式化。
 - **M1.5（下一步）**：

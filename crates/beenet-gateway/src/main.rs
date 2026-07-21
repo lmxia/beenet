@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -45,6 +46,7 @@ struct Args {
     #[arg(long)]
     registry_url: Option<String>,
 
+    /// Interval (ms) to refresh connected-peer metadata from Registry lookup.
     #[arg(long)]
     registry_poll_ms: Option<u64>,
 
@@ -61,14 +63,73 @@ struct Args {
     #[arg(long, value_name = "PATH")]
     identity_key_path: Option<PathBuf>,
 
-    #[arg(long, default_value = "gateway")]
-    gateway_id: String,
+    /// Display name in Registry/Dashboard (alias: `--name`). Duplicates allowed.
+    #[arg(long = "gateway-id", visible_alias = "name")]
+    gateway_id: Option<String>,
 
     #[arg(long)]
     region: Option<String>,
 
-    #[arg(long, default_value_t = 1000)]
-    capacity: u32,
+    #[arg(long)]
+    capacity: Option<u32>,
+
+    /// Bootstrap join token. Prefer --join-token-stdin or --join-token-file.
+    #[arg(long)]
+    join_token: Option<String>,
+
+    /// Read the bootstrap join token from a temporary secret file.
+    #[arg(long, value_name = "PATH")]
+    join_token_file: Option<PathBuf>,
+
+    /// Read the bootstrap join token from stdin.
+    #[arg(long)]
+    join_token_stdin: bool,
+}
+
+fn trimmed_token(value: String) -> Option<String> {
+    let value = value.trim().to_string();
+    (!value.is_empty()).then_some(value)
+}
+
+fn bootstrap_token(cli: &Args) -> Result<Option<String>> {
+    let explicit_sources = cli.join_token.is_some() as usize
+        + cli.join_token_file.is_some() as usize
+        + cli.join_token_stdin as usize;
+    if explicit_sources > 1 {
+        anyhow::bail!("use only one of --join-token, --join-token-file, or --join-token-stdin");
+    }
+    if let Some(token) = cli.join_token.clone().and_then(trimmed_token) {
+        warn!("--join-token may expose the bootstrap token; prefer stdin or a secret file");
+        return Ok(Some(token));
+    }
+    if let Some(path) = cli.join_token_file.as_ref() {
+        let token = fs::read_to_string(path)
+            .with_context(|| format!("read join token file `{}`", path.display()))?;
+        return Ok(trimmed_token(token));
+    }
+    if cli.join_token_stdin {
+        let mut token = String::new();
+        io::stdin()
+            .read_to_string(&mut token)
+            .context("read join token from stdin")?;
+        return Ok(trimmed_token(token));
+    }
+    Ok(None)
+}
+
+fn unix_secs_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn make_signature(keypair: &identity::Keypair, peer_id: &str, timestamp_secs: u64) -> Result<String> {
+    let message = format!("{peer_id}\n{timestamp_secs}");
+    let sig = keypair
+        .sign(message.as_bytes())
+        .map_err(|e| anyhow!("sign failed: {e}"))?;
+    Ok(STANDARD.encode(sig))
 }
 
 #[derive(NetworkBehaviour)]
@@ -184,6 +245,9 @@ async fn main() -> Result<()> {
         libp2p_listen_addr: cli.libp2p_listen_addr.clone(),
         public_addr: cli.public_addr.clone(),
         identity_key_path: cli.identity_key_path.clone(),
+        gateway_id: cli.gateway_id.clone(),
+        region: cli.region.clone(),
+        capacity: cli.capacity,
     };
     let settings = if path.exists() {
         let file_cfg = load_file(&path)?;
@@ -202,16 +266,25 @@ async fn main() -> Result<()> {
         );
     };
 
-    let worker_addrs: Arc<RwLock<Vec<WorkerListEntry>>> = Arc::new(RwLock::new(Vec::new()));
-    tokio::spawn(registry_poll_loop(
-        settings.registry_url.clone(),
-        settings.registry_poll_ms,
-        worker_addrs.clone(),
-    ));
+    let worker_cache: Arc<RwLock<HashMap<PeerId, WorkerListEntry>>> =
+        Arc::new(RwLock::new(HashMap::new()));
+    let connected: Arc<RwLock<HashSet<PeerId>>> = Arc::new(RwLock::new(HashSet::new()));
+    let http = reqwest::Client::new();
+    let bootstrap = bootstrap_token(&cli)?;
 
     let local_key = load_or_create_keypair(&settings.identity_key_path)?;
     let local_peer_id = local_key.public().to_peer_id();
-    let mut swarm = build_swarm(local_key.clone())?;
+    let keypair = Arc::new(local_key);
+    let identity_dir = settings
+        .identity_key_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let gateway_id = beenet_common::display_name::resolve_persistent_display_name(
+        &identity_dir,
+        settings.gateway_id.as_deref(),
+    )?;
+    let mut swarm = build_swarm((*keypair).clone())?;
     let libp2p_listen_addr: Multiaddr = settings.libp2p_listen_addr.parse().with_context(|| {
         format!(
             "invalid gateway libp2p_listen_addr `{}`",
@@ -228,7 +301,6 @@ async fn main() -> Result<()> {
         info!(%announced, "gateway public address announced");
     }
     let (tx, rx) = mpsc::channel(32);
-    let connected: Arc<RwLock<HashSet<PeerId>>> = Arc::new(RwLock::new(HashSet::new()));
 
     let dial_addr = if let Some(public_addr) = settings.public_addr.as_ref() {
         public_addr
@@ -244,19 +316,44 @@ async fn main() -> Result<()> {
             .to_string()
     };
 
+    ensure_gateway_registered(
+        &http,
+        &settings.registry_url,
+        &keypair,
+        &local_peer_id.to_string(),
+        &gateway_id,
+        settings.region.as_deref(),
+        &dial_addr,
+        bootstrap.as_deref(),
+    )
+    .await?;
+    drop(bootstrap);
+
     tokio::spawn(gateway_heartbeat_loop(
         settings.registry_url.clone(),
-        cli.gateway_id.clone(),
-        cli.region.clone(),
-        cli.capacity,
+        gateway_id.clone(),
+        settings.region.clone(),
+        settings.capacity,
         dial_addr,
-        local_key.clone(),
+        keypair.clone(),
         connected.clone(),
     ));
 
-    tokio::spawn(run_swarm_loop(
-        worker_addrs.clone(),
+    tokio::spawn(registry_peer_refresh_loop(
+        settings.registry_url.clone(),
+        settings.registry_poll_ms,
+        http.clone(),
+        keypair.clone(),
         connected.clone(),
+        worker_cache.clone(),
+    ));
+
+    tokio::spawn(run_swarm_loop(
+        settings.registry_url.clone(),
+        http,
+        keypair,
+        worker_cache,
+        connected,
         rx,
         swarm,
     ));
@@ -269,20 +366,23 @@ async fn main() -> Result<()> {
     let app = Router::new()
         .route("/health", get(health))
         .route("/run/ipfs/:cid", post(run_ipfs))
-        .layer(middleware::from_fn(cors_middleware))
-        .with_state(state);
+        .with_state(state)
+        .layer(middleware::from_fn(cors_middleware));
 
+    let listener = tokio::net::TcpListener::bind(settings.http_addr)
+        .await
+        .with_context(|| format!("bind gateway http `{}`", settings.http_addr))?;
     info!(
         peer_id = %local_peer_id,
+        gateway_id = %gateway_id,
         http_addr = %settings.http_addr,
         registry_url = %settings.registry_url,
-        poll_ms = settings.registry_poll_ms,
+        peer_refresh_ms = settings.registry_poll_ms,
         libp2p_listen_addr = %settings.libp2p_listen_addr,
-        public_addr = %settings.public_addr.as_deref().unwrap_or("<none>"),
+        public_addr = ?settings.public_addr,
         identity_key_path = %settings.identity_key_path.display(),
         "gateway started (workers dial in; invoke reuses inbound connections)"
     );
-    let listener = tokio::net::TcpListener::bind(settings.http_addr).await?;
     axum::serve(listener, app).await?;
     Ok(())
 }
@@ -416,10 +516,28 @@ struct WorkerListEntry {
 }
 
 #[derive(Serialize)]
+struct WorkersLookupRequest {
+    peer_id: String,
+    timestamp_secs: u64,
+    signature: String,
+    peer_ids: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct GatewayJoinBody {
+    join_token: String,
+    peer_id: String,
+    public_key: String,
+    timestamp_secs: u64,
+    signature: String,
+    gateway_id: String,
+    region: Option<String>,
+}
+
+#[derive(Serialize)]
 struct GatewayHeartbeat {
     gateway_id: String,
     peer_id: String,
-    public_key: String,
     timestamp_secs: u64,
     signature: String,
     dial_addr: String,
@@ -428,13 +546,101 @@ struct GatewayHeartbeat {
     connected_workers: u32,
 }
 
+const MAX_LOOKUP_PEER_IDS: usize = 256;
+
+async fn do_gateway_join(
+    http: &reqwest::Client,
+    registry_url: &str,
+    keypair: &identity::Keypair,
+    peer_id: &str,
+    gateway_id: &str,
+    region: Option<&str>,
+    join_token: &str,
+) -> Result<()> {
+    let ts = unix_secs_now();
+    let sig = make_signature(keypair, peer_id, ts)?;
+    let body = GatewayJoinBody {
+        join_token: join_token.to_owned(),
+        peer_id: peer_id.to_owned(),
+        public_key: STANDARD.encode(keypair.public().encode_protobuf()),
+        timestamp_secs: ts,
+        signature: sig,
+        gateway_id: gateway_id.to_owned(),
+        region: region.map(str::to_owned),
+    };
+    let url = format!("{}/v1/gateways/join", registry_url.trim_end_matches('/'));
+    let resp = http
+        .post(&url)
+        .json(&body)
+        .send()
+        .await
+        .with_context(|| format!("POST {url}"))?;
+    let status = resp.status();
+    if status.is_success() {
+        info!(%peer_id, "gateway registered with registry");
+        return Ok(());
+    }
+    let text = resp.text().await.unwrap_or_default();
+    anyhow::bail!("gateway join rejected (HTTP {status}): {text}")
+}
+
+/// Probe heartbeat; on 401 try join then succeed. Returns Err if enrollment impossible.
+async fn ensure_gateway_registered(
+    http: &reqwest::Client,
+    registry_url: &str,
+    keypair: &identity::Keypair,
+    peer_id: &str,
+    gateway_id: &str,
+    region: Option<&str>,
+    dial_addr: &str,
+    join_token: Option<&str>,
+) -> Result<()> {
+    let url = format!(
+        "{}/v1/gateways/heartbeat",
+        registry_url.trim_end_matches('/')
+    );
+    let ts = unix_secs_now();
+    let sig = make_signature(keypair, peer_id, ts)?;
+    let probe = GatewayHeartbeat {
+        gateway_id: gateway_id.to_owned(),
+        peer_id: peer_id.to_owned(),
+        timestamp_secs: ts,
+        signature: sig,
+        dial_addr: dial_addr.to_owned(),
+        region: region.map(str::to_owned),
+        capacity: 1,
+        connected_workers: 0,
+    };
+    let resp = http
+        .post(&url)
+        .json(&probe)
+        .send()
+        .await
+        .with_context(|| format!("POST {url}"))?;
+    let status = resp.status();
+    if status.is_success() {
+        info!(%peer_id, "gateway already registered with registry");
+        return Ok(());
+    }
+    if status != reqwest::StatusCode::UNAUTHORIZED {
+        let text = resp.text().await.unwrap_or_default();
+        anyhow::bail!("gateway heartbeat probe failed (HTTP {status}): {text}");
+    }
+    let Some(token) = join_token else {
+        anyhow::bail!(
+            "gateway is not registered; provide --join-token-file / --join-token-stdin / --join-token"
+        );
+    };
+    do_gateway_join(http, registry_url, keypair, peer_id, gateway_id, region, token).await
+}
+
 async fn gateway_heartbeat_loop(
     registry_url: String,
     gateway_id: String,
     region: Option<String>,
     capacity: u32,
     dial_addr: String,
-    keypair: identity::Keypair,
+    keypair: Arc<identity::Keypair>,
     connected: Arc<RwLock<HashSet<PeerId>>>,
 ) {
     let client = reqwest::Client::new();
@@ -443,17 +649,12 @@ async fn gateway_heartbeat_loop(
         registry_url.trim_end_matches('/')
     );
     let peer_id = keypair.public().to_peer_id().to_string();
-    let public_key = STANDARD.encode(keypair.public().encode_protobuf());
     let mut interval = tokio::time::interval(Duration::from_secs(20));
     loop {
         interval.tick().await;
-        let timestamp_secs = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|value| value.as_secs())
-            .unwrap_or(0);
-        let message = format!("{peer_id}\n{timestamp_secs}");
-        let signature = match keypair.sign(message.as_bytes()) {
-            Ok(value) => STANDARD.encode(value),
+        let timestamp_secs = unix_secs_now();
+        let signature = match make_signature(&keypair, &peer_id, timestamp_secs) {
+            Ok(value) => value,
             Err(error) => {
                 warn!(%error, "gateway heartbeat signing failed");
                 continue;
@@ -462,7 +663,6 @@ async fn gateway_heartbeat_loop(
         let body = GatewayHeartbeat {
             gateway_id: gateway_id.clone(),
             peer_id: peer_id.clone(),
-            public_key: public_key.clone(),
             timestamp_secs,
             signature,
             dial_addr: dial_addr.clone(),
@@ -480,42 +680,137 @@ async fn gateway_heartbeat_loop(
     }
 }
 
-async fn registry_poll_loop(
+async fn lookup_workers(
+    client: &reqwest::Client,
+    registry_base: &str,
+    keypair: &identity::Keypair,
+    peer_ids: &[PeerId],
+) -> Result<HashMap<PeerId, WorkerListEntry>> {
+    if peer_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let url = format!(
+        "{}/v1/workers/lookup",
+        registry_base.trim_end_matches('/')
+    );
+    let gateway_peer_id = keypair.public().to_peer_id().to_string();
+    let mut out = HashMap::new();
+    for chunk in peer_ids.chunks(MAX_LOOKUP_PEER_IDS) {
+        let timestamp_secs = unix_secs_now();
+        let signature = make_signature(keypair, &gateway_peer_id, timestamp_secs)?;
+        let body = WorkersLookupRequest {
+            peer_id: gateway_peer_id.clone(),
+            timestamp_secs,
+            signature,
+            peer_ids: chunk.iter().map(|p| p.to_string()).collect(),
+        };
+        let resp = client
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
+            .context("registry workers lookup request")?;
+        if !resp.status().is_success() {
+            anyhow::bail!("registry workers lookup HTTP {}", resp.status());
+        }
+        let parsed: WorkersListBody = resp
+            .json()
+            .await
+            .context("registry workers lookup JSON decode")?;
+        for entry in parsed.workers {
+            if let Ok(peer) = PeerId::from_str(&entry.peer_id) {
+                out.insert(peer, entry);
+            }
+        }
+    }
+    Ok(out)
+}
+
+async fn apply_lookup_to_cache(
+    cache: &Arc<RwLock<HashMap<PeerId, WorkerListEntry>>>,
+    connected: &Arc<RwLock<HashSet<PeerId>>>,
+    requested: &[PeerId],
+    found: HashMap<PeerId, WorkerListEntry>,
+) {
+    let still_connected = connected.read().await.clone();
+    let mut guard = cache.write().await;
+    for peer in requested {
+        if !still_connected.contains(peer) {
+            guard.remove(peer);
+            continue;
+        }
+        match found.get(peer) {
+            Some(entry) => {
+                guard.insert(*peer, entry.clone());
+            }
+            None => {
+                guard.remove(peer);
+            }
+        }
+    }
+    guard.retain(|peer, _| still_connected.contains(peer));
+}
+
+async fn registry_peer_refresh_loop(
     registry_base: String,
     period_ms: u64,
-    out: Arc<RwLock<Vec<WorkerListEntry>>>,
+    client: reqwest::Client,
+    keypair: Arc<identity::Keypair>,
+    connected: Arc<RwLock<HashSet<PeerId>>>,
+    cache: Arc<RwLock<HashMap<PeerId, WorkerListEntry>>>,
 ) {
-    let client = reqwest::Client::new();
-    let url = format!("{}/v1/workers", registry_base.trim_end_matches('/'));
-    let mut tick = tokio::time::interval(std::time::Duration::from_millis(period_ms.max(500)));
+    let mut tick = tokio::time::interval(Duration::from_millis(period_ms.max(500)));
     loop {
         tick.tick().await;
-        match client.get(&url).send().await {
-            Ok(resp) if resp.status().is_success() => match resp.json::<WorkersListBody>().await {
-                Ok(body) => {
-                    let parsed: Vec<WorkerListEntry> = body
-                        .workers
-                        .into_iter()
-                        .filter(|w| PeerId::from_str(&w.peer_id).is_ok())
-                        .collect();
-                    let mut guard = out.write().await;
-                    if guard.len() != parsed.len()
-                        || guard.iter().zip(parsed.iter()).any(|(a, b)| a != b)
-                    {
-                        info!(count = parsed.len(), "registry worker list updated");
-                    }
-                    *guard = parsed;
+        let peers: Vec<PeerId> = connected.read().await.iter().copied().collect();
+        if peers.is_empty() {
+            let mut guard = cache.write().await;
+            if !guard.is_empty() {
+                guard.clear();
+            }
+            continue;
+        }
+        match lookup_workers(&client, &registry_base, &keypair, &peers).await {
+            Ok(found) => {
+                let before = cache.read().await.len();
+                apply_lookup_to_cache(&cache, &connected, &peers, found).await;
+                let after = cache.read().await.len();
+                if before != after {
+                    info!(
+                        connected = peers.len(),
+                        cached = after,
+                        "registry connected-peer metadata refreshed"
+                    );
                 }
-                Err(e) => warn!(error = %e, "registry JSON decode failed"),
-            },
-            Ok(resp) => warn!(status = %resp.status(), "registry GET /v1/workers failed"),
-            Err(e) => warn!(error = %e, "registry poll request error"),
+            }
+            Err(e) => warn!(error = %e, "registry connected-peer lookup failed"),
         }
     }
 }
 
+fn spawn_peer_lookup(
+    registry_base: String,
+    client: reqwest::Client,
+    keypair: Arc<identity::Keypair>,
+    connected: Arc<RwLock<HashSet<PeerId>>>,
+    cache: Arc<RwLock<HashMap<PeerId, WorkerListEntry>>>,
+    peer_id: PeerId,
+) {
+    tokio::spawn(async move {
+        match lookup_workers(&client, &registry_base, &keypair, &[peer_id]).await {
+            Ok(found) => {
+                apply_lookup_to_cache(&cache, &connected, &[peer_id], found).await;
+            }
+            Err(e) => warn!(%peer_id, error = %e, "registry peer lookup on connect failed"),
+        }
+    });
+}
+
 async fn run_swarm_loop(
-    worker_addrs: Arc<RwLock<Vec<WorkerListEntry>>>,
+    registry_base: String,
+    http: reqwest::Client,
+    keypair: Arc<identity::Keypair>,
+    worker_cache: Arc<RwLock<HashMap<PeerId, WorkerListEntry>>>,
     connected: Arc<RwLock<HashSet<PeerId>>>,
     mut cmd_rx: mpsc::Receiver<Command>,
     mut swarm: libp2p::Swarm<GatewayBehaviour>,
@@ -527,38 +822,40 @@ async fn run_swarm_loop(
     loop {
         tokio::select! {
             Some(cmd) = cmd_rx.recv() => {
-                let workers = worker_addrs.read().await.clone();
-                let connected_snap = connected.read().await.clone();
-                let mut candidates: Vec<(PeerId, WorkerListEntry)> = workers
+                let cache = worker_cache.read().await;
+                let connected_snap = connected.read().await;
+                let mut candidates: Vec<(PeerId, WorkerListEntry)> = connected_snap
                     .iter()
-                    .filter_map(|w| {
-                        let peer = PeerId::from_str(&w.peer_id).ok()?;
-                        if !connected_snap.contains(&peer) {
-                            return None;
-                        }
-                        let cid_ok = w.supported_cids.is_empty()
-                            || w.supported_cids.iter().any(|cid| cid == &cmd.req.cid.to_string());
-                        cid_ok.then(|| (peer, w.clone()))
+                    .filter_map(|peer| {
+                        let entry = cache.get(peer)?;
+                        let cid_ok = entry.supported_cids.is_empty()
+                            || entry
+                                .supported_cids
+                                .iter()
+                                .any(|cid| cid == &cmd.req.cid.to_string());
+                        cid_ok.then(|| (*peer, entry.clone()))
                     })
                     .collect();
                 if candidates.is_empty() {
                     // Fall back to any connected registered worker (ignore CID hint miss).
-                    candidates = workers
+                    candidates = connected_snap
                         .iter()
-                        .filter_map(|w| {
-                            let peer = PeerId::from_str(&w.peer_id).ok()?;
-                            connected_snap.contains(&peer).then(|| (peer, w.clone()))
-                        })
+                        .filter_map(|peer| cache.get(peer).map(|entry| (*peer, entry.clone())))
                         .collect();
                 }
                 if candidates.is_empty() {
-                    let reason = if workers.is_empty() {
-                        "no workers with an active registry lease (empty list or registry unreachable)".into()
+                    let reason = if connected_snap.is_empty() {
+                        "no connected workers".into()
+                    } else if cache.is_empty() {
+                        format!(
+                            "no connected worker with an active registry lease (connected={})",
+                            connected_snap.len()
+                        )
                     } else {
                         format!(
-                            "no connected worker (registry has {}, connected={})",
-                            workers.len(),
-                            connected_snap.len()
+                            "no eligible connected worker (connected={}, cached={})",
+                            connected_snap.len(),
+                            cache.len()
                         )
                     };
                     let _ = cmd.respond_to.send(InvokeResponse {
@@ -594,6 +891,14 @@ async fn run_swarm_loop(
                         guard.len()
                     };
                     info!(%peer_id, ?endpoint, connected = n, "worker connected");
+                    spawn_peer_lookup(
+                        registry_base.clone(),
+                        http.clone(),
+                        keypair.clone(),
+                        connected.clone(),
+                        worker_cache.clone(),
+                        peer_id,
+                    );
                 }
                 SwarmEvent::ConnectionClosed { peer_id, .. } => {
                     let n = {
@@ -601,6 +906,7 @@ async fn run_swarm_loop(
                         guard.remove(&peer_id);
                         guard.len()
                     };
+                    worker_cache.write().await.remove(&peer_id);
                     info!(%peer_id, connected = n, "worker disconnected");
                 }
                 SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {

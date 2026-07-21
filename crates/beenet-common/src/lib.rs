@@ -3,6 +3,7 @@
 //! Keep this crate small: CID, errors, a handful of constants.
 
 pub mod config;
+pub mod display_name;
 
 use std::fmt;
 use std::str::FromStr;

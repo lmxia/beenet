@@ -92,12 +92,12 @@ docker-tag-latest: ## Re-tag current VERSION as :latest
 docker-release: docker-build docker-push docker-tag-latest ## Build, push, and tag as latest
 
 .PHONY: docker-up
-docker-up: ## Start Redis + registry + gateway via docker compose
-	docker compose -f docker/docker-compose.dev.yml up -d --build
+docker-up: ## Phased local stack via scripts/dev-up.sh (Docker services + host worker tokens)
+	./scripts/dev-up.sh up --build
 
 .PHONY: docker-down
 docker-down: ## Stop docker compose dev stack
-	docker compose -f docker/docker-compose.dev.yml down
+	./scripts/dev-up.sh down
 
 # ── Kubernetes ───────────────────────────────────────────────────────────────
 .PHONY: deploy

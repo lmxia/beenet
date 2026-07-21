@@ -2,6 +2,7 @@ export type StatusWorker = {
   peer_id: string;
   connected: boolean;
   last_seen_unix_ms: number;
+  name?: string;
   supported_cids: string[];
   loaded_cids: string[];
 };

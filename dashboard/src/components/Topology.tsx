@@ -81,13 +81,13 @@ export function Topology({ status, selectedPeer, onSelect, language }: Props) {
             point={pts[i]!}
             selected={selectedPeer === w.peer_id}
             onSelect={() => onSelect(w.peer_id)}
-            index={i}
+            label={copy.workerLabel(w.name, i)}
           />
         ))}
       </svg>
 
       {!status && (
-        <div className="topo-empty">{language === "zh" ? "等待注册表状态" : "WAITING FOR REGISTRY STATUS"}</div>
+        <div className="topo-empty">{copy.waitingRegistry}</div>
       )}
     </div>
   );
@@ -130,13 +130,13 @@ function WorkerNode({
   point,
   selected,
   onSelect,
-  index,
+  label,
 }: {
   worker: StatusWorker;
   point: Pt;
   selected: boolean;
   onSelect: () => void;
-  index: number;
+  label: string;
 }) {
   return (
     <g
@@ -148,7 +148,7 @@ function WorkerNode({
       <circle className="node-core" r="21" filter="url(#hard)" />
       <circle className="status-pin" r="4.5" />
       <text className="node-label" textAnchor="middle" y="42">
-        Worker {index + 1}
+        {label}
       </text>
       <text className="node-sub" textAnchor="middle" y="56">
         {shortPeer(worker.peer_id, 12)}

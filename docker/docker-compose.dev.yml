@@ -1,20 +1,16 @@
 # Local stack: Redis + MinIO + registry + gateway + dashboard (worker runs on the host).
 #
-#   docker compose -f docker/docker-compose.dev.yml up -d --build
-#   docker compose -f docker/docker-compose.dev.yml logs -f beenet-registry
+# Prefer the phased helper (creates gateway join token before starting gateway):
+#   ./scripts/dev-up.sh up [--build]
+#   ./scripts/dev-up.sh down
 #
-# Registry prints an admin token on startup. Create a join token:
-#   curl -s -X POST http://127.0.0.1:3030/v1/admin/tokens \
-#     -H "Authorization: Bearer <admin_token>" \
-#     -H "Content-Type: application/json" \
-#     -d '{"description":"dev","ttl_secs":600}'
+# Manual (not recommended): registry must be up and a gateway join token file must
+# exist at ../.beenet-dev/gateway-join-token before `up beenet-gateway`.
 #
-# MinIO console: http://127.0.0.1:9001  (minioadmin / minioadmin)
-# S3 API:         http://127.0.0.1:9000
-# Public wasm GET: http://127.0.0.1:9000/beenet/<cid>
-# Dashboard:      http://127.0.0.1:8081  (admin token: beenet-dev-admin-token)
-#
-# Then start worker on the host; it will discover gateways from the registry.
+# Admin token (fixed for local compose): beenet-dev-admin-token
+# Dashboard: http://127.0.0.1:8081
+# Gateway HTTP: http://127.0.0.1:18080  libp2p: 14001
+# MinIO: http://127.0.0.1:9000  console:9001 (minioadmin / minioadmin)
 
 services:
   redis:
@@ -82,6 +78,8 @@ services:
       - "14001:4001"
     volumes:
       - gateway-cache:/gateway_cache
+      # Created by ./scripts/dev-up.sh before this service starts.
+      - ../.beenet-dev/gateway-join-token:/run/secrets/gateway-join-token:ro
     command:
       - "--http-addr"
       - "0.0.0.0:8080"
@@ -95,6 +93,10 @@ services:
       - "/ip4/127.0.0.1/tcp/14001"
       - "--identity-key-path"
       - "/gateway_cache/identity.key"
+      - "--name"
+      - "local-gw"
+      - "--join-token-file"
+      - "/run/secrets/gateway-join-token"
 
   beenet-dashboard:
     image: beenet/beenet-dashboard:dev

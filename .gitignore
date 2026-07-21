@@ -10,3 +10,4 @@
 /wasm_cache/
 /logs/
 gateway_cache/
+.beenet-dev/

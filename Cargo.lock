@@ -738,6 +738,7 @@ dependencies = [
  "anyhow",
  "cid",
  "dirs",
+ "getrandom 0.2.17",
  "hex",
  "multihash",
  "serde",

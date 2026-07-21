@@ -97,6 +97,10 @@ struct Args {
     /// Optional region for Registry Gateway affinity (overrides `[worker].region`).
     #[arg(long)]
     region: Option<String>,
+
+    /// Human-readable display name (duplicates allowed; PeerId is the identity).
+    #[arg(long)]
+    name: Option<String>,
 }
 
 #[derive(NetworkBehaviour)]
@@ -602,6 +606,8 @@ struct JoinBody {
     loaded_cids: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     region: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -618,6 +624,8 @@ struct HeartbeatBody {
     loaded_cids: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     region: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -638,6 +646,7 @@ async fn do_join(
     loaded_cids: Vec<String>,
     join_token: &str,
     region: Option<&str>,
+    name: Option<&str>,
 ) -> Result<()> {
     let ts = unix_secs_now();
     let sig = make_signature(keypair, peer_id, ts)?;
@@ -651,6 +660,7 @@ async fn do_join(
         supported_cids,
         loaded_cids,
         region: region.map(str::to_owned),
+        name: name.map(str::to_owned),
     };
     let resp = http
         .post(join_url)
@@ -680,6 +690,7 @@ async fn do_heartbeat(
     supported_cids: Vec<String>,
     loaded_cids: Vec<String>,
     region: Option<&str>,
+    name: Option<&str>,
 ) -> Result<Option<Vec<GatewayCandidate>>> {
     let ts = unix_secs_now();
     let sig = make_signature(keypair, peer_id, ts)?;
@@ -690,6 +701,7 @@ async fn do_heartbeat(
         supported_cids,
         loaded_cids,
         region: region.map(str::to_owned),
+        name: name.map(str::to_owned),
     };
     let resp = http
         .post(heartbeat_url)
@@ -717,6 +729,7 @@ async fn registry_heartbeat_loop(
     runtime: Arc<Runtime>,
     period: Duration,
     region: Option<String>,
+    name: Option<String>,
     gateway_tx: watch::Sender<Vec<GatewayCandidate>>,
 ) {
     let mut interval = tokio::time::interval(period);
@@ -732,11 +745,12 @@ async fn registry_heartbeat_loop(
             supported_cids.clone(),
             loaded_cids.clone(),
             region.as_deref(),
+            name.as_deref(),
         )
         .await
         {
             Ok(Some(tip)) => {
-                let merged = take_gateway_tip(tip, &[]);
+                let merged = take_gateway_tip(tip);
                 if *gateway_tx.borrow() != merged {
                     let _ = gateway_tx.send(merged);
                 }
@@ -794,17 +808,9 @@ struct GatewayCandidate {
     dial_addr: String,
 }
 
-#[derive(Deserialize)]
-struct GatewaysBody {
-    gateways: Vec<GatewayCandidate>,
-}
-
 const GATEWAY_TIP_SIZE: usize = 3;
 
-fn take_gateway_tip(
-    discovered: Vec<GatewayCandidate>,
-    fallback: &[GatewayCandidate],
-) -> Vec<GatewayCandidate> {
+fn take_gateway_tip(discovered: Vec<GatewayCandidate>) -> Vec<GatewayCandidate> {
     let mut merged = Vec::new();
     for candidate in discovered.into_iter() {
         if merged.len() >= GATEWAY_TIP_SIZE {
@@ -827,18 +833,6 @@ fn take_gateway_tip(
         }
         merged.push(candidate);
     }
-
-    for candidate in fallback {
-        if merged.len() >= GATEWAY_TIP_SIZE {
-            break;
-        }
-        if !merged
-            .iter()
-            .any(|existing| existing.peer_id == candidate.peer_id)
-        {
-            merged.push(candidate.clone());
-        }
-    }
     merged
 }
 
@@ -855,69 +849,6 @@ fn reconnect_jitter() -> Duration {
         .map(|value| (value.subsec_millis() % 750) as u64)
         .unwrap_or(0);
     Duration::from_millis(millis)
-}
-
-async fn gateway_discovery_loop(
-    registry_url: String,
-    peer_id: String,
-    region: Option<String>,
-    fallback: Vec<GatewayCandidate>,
-    tx: watch::Sender<Vec<GatewayCandidate>>,
-) {
-    let client = reqwest::Client::new();
-    let mut interval = tokio::time::interval(Duration::from_secs(10));
-    loop {
-        interval.tick().await;
-        let mut url = format!(
-            "{}/v1/gateways?peer_id={}",
-            registry_url.trim_end_matches('/'),
-            urlencoding_peer_id(&peer_id)
-        );
-        if let Some(ref region) = region {
-            url.push_str("&region=");
-            url.push_str(&urlencoding_peer_id(region));
-        }
-        match client.get(&url).send().await {
-            Ok(response) if response.status().is_success() => {
-                match response.json::<GatewaysBody>().await {
-                    Ok(body) => {
-                        let merged = take_gateway_tip(body.gateways, &fallback);
-                        if *tx.borrow() != merged {
-                            let _ = tx.send(merged);
-                        }
-                    }
-                    Err(error) => {
-                        warn!(%error, "gateway discovery JSON decode failed; retaining cached candidates")
-                    }
-                }
-            }
-            Ok(response) if response.status() == reqwest::StatusCode::UNAUTHORIZED => {
-                if !tx.borrow().is_empty() {
-                    let _ = tx.send(Vec::new());
-                }
-                warn!("gateway discovery rejected because worker registration is missing");
-            }
-            Ok(response) => warn!(status = %response.status(), "gateway discovery rejected"),
-            Err(error) => warn!(%error, "gateway discovery failed; retaining cached candidates"),
-        }
-    }
-}
-
-/// Minimal query escaping for peer_id / region path segments.
-fn urlencoding_peer_id(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    for b in value.bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(b as char)
-            }
-            _ => {
-                out.push('%');
-                out.push_str(&format!("{b:02X}"));
-            }
-        }
-    }
-    out
 }
 
 async fn run_swarm_loop(
@@ -1073,6 +1004,7 @@ async fn main() -> Result<()> {
         wasm_fetch_bearer: cli.wasm_fetch_bearer.clone(),
         wasm_fetch_timeout_secs: cli.wasm_fetch_timeout_secs,
         region: cli.region.clone(),
+        name: cli.name.clone(),
     };
     let settings = beenet_common::config::resolve_worker_settings(&file_cfg, &overrides)?;
     let listen_addr: Multiaddr = settings
@@ -1081,6 +1013,10 @@ async fn main() -> Result<()> {
         .with_context(|| format!("invalid listen multiaddr `{}`", settings.listen_addr))?;
     fs::create_dir_all(&settings.wasm_cache_dir)
         .with_context(|| format!("create `{}`", settings.wasm_cache_dir.display()))?;
+    let worker_name = beenet_common::display_name::resolve_persistent_display_name(
+        &settings.wasm_cache_dir,
+        settings.name.as_deref(),
+    )?;
 
     let identity_key_path = settings.wasm_cache_dir.join("identity.key");
     if token_from_legacy_config && identity_key_path.exists() {
@@ -1116,11 +1052,12 @@ async fn main() -> Result<()> {
         initial_supported_cids.clone(),
         initial_loaded_cids.clone(),
         settings.region.as_deref(),
+        Some(worker_name.as_str()),
     )
     .await
     {
         Ok(Some(tip)) => {
-            info!(peer_id = %local_peer_id, "worker already registered with registry");
+            info!(peer_id = %local_peer_id, name = %worker_name, "worker already registered with registry");
             tip
         }
         Ok(None) => {
@@ -1134,6 +1071,7 @@ async fn main() -> Result<()> {
                     initial_loaded_cids,
                     token,
                     settings.region.as_deref(),
+                    Some(worker_name.as_str()),
                 )
                 .await
                 .context("initial worker registration failed")?;
@@ -1145,6 +1083,7 @@ async fn main() -> Result<()> {
                     runtime.supported_cids_on_disk(),
                     runtime.loaded_cids().await,
                     settings.region.as_deref(),
+                    Some(worker_name.as_str()),
                 )
                 .await?
                 .context("worker joined but heartbeat still reports it as unregistered")?
@@ -1163,20 +1102,13 @@ async fn main() -> Result<()> {
 
     let mut swarm = build_swarm((*keypair_arc).clone())?;
     swarm.listen_on(listen_addr.clone())?;
-    let fallback_gateways: Vec<GatewayCandidate> = Vec::new();
-    let initial_gateways = take_gateway_tip(initial_gateways, &fallback_gateways);
+    let initial_gateways = take_gateway_tip(initial_gateways);
     let (gateway_tx, gateway_rx) = watch::channel(initial_gateways);
-    tokio::spawn(gateway_discovery_loop(
-        settings.registry_url.clone(),
-        local_peer_id.to_string(),
-        settings.region.clone(),
-        fallback_gateways,
-        gateway_tx.clone(),
-    ));
     tokio::spawn(run_swarm_loop(runtime.clone(), gateway_rx, swarm));
 
     info!(
         peer_id = %local_peer_id,
+        name = %worker_name,
         listen_addr = %listen_addr,
         wasm_cache_dir = %settings.wasm_cache_dir.display(),
         max_concurrency = runtime.gate.available_permits(),
@@ -1195,6 +1127,7 @@ async fn main() -> Result<()> {
         runtime.clone(),
         period,
         region,
+        Some(worker_name),
         gateway_tx,
     ));
     tokio::signal::ctrl_c()

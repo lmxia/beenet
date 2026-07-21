@@ -227,6 +227,24 @@ code,
   margin-top: 16px;
 }
 
+.admin-panel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 8px;
+}
+
+.admin-panel-head h2 {
+  margin: 0;
+}
+
+.admin-hint {
+  margin: 0 0 12px;
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+
 .admin-form {
   display: flex;
   gap: 12px;
@@ -271,6 +289,10 @@ code,
 
 .token-description {
   color: var(--ink);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
 }
 
 .token-expiry {
