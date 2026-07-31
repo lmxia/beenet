@@ -231,7 +231,7 @@ pub fn resolve_worker_settings(
     })
 }
 
-/// `beenet-pack upload` / S3.
+/// S3-compatible settings retained for hosted publishers and local compatibility.
 #[derive(Clone, Debug)]
 pub struct OssSettings {
     pub endpoint: String,
@@ -399,7 +399,12 @@ fn resolve_gateway_settings_merged(
         identity_key_path,
         gateway_id,
         region,
-        capacity: pick_u32(cli.capacity, g.and_then(|s| s.capacity), DEFAULT_GATEWAY_CAPACITY).max(1),
+        capacity: pick_u32(
+            cli.capacity,
+            g.and_then(|s| s.capacity),
+            DEFAULT_GATEWAY_CAPACITY,
+        )
+        .max(1),
     })
 }
 
@@ -462,8 +467,10 @@ mod tests {
 
     #[test]
     fn worker_merge_requires_registry_and_optional_gateway_addr() {
-        let mut f = BeenetConfigFile::default();
-        f.worker = Some(WorkerSection::default());
+        let mut f = BeenetConfigFile {
+            worker: Some(WorkerSection::default()),
+            ..Default::default()
+        };
         assert!(resolve_worker_settings(&f, &WorkerCliOverrides::default()).is_err());
         f.worker.as_mut().unwrap().registry_url = Some("http://localhost:3030".into());
         let s = resolve_worker_settings(&f, &WorkerCliOverrides::default()).unwrap();

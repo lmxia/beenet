@@ -20,8 +20,7 @@ serde = { workspace = true }
 reqwest = { workspace = true }
 beenet-common = { workspace = true }
 beenet-factors = { workspace = true }
-beenet-manifest = { workspace = true }
-beenet-proto = { workspace = true }
+beenet-artifact = { workspace = true }
 spin-app = { workspace = true }
 spin-core = { workspace = true }
 spin-factors-executor = { workspace = true }

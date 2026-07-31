@@ -1,9 +1,11 @@
-//! Shared types for Beenet.
+//! Shared foundation for Beenet runtime components.
 //!
-//! Keep this crate small: CID, errors, a handful of constants.
+//! This crate owns content identifiers, configuration, display names, and the
+//! versioned Gateway ↔ Worker wire types exposed through [`proto`].
 
 pub mod config;
 pub mod display_name;
+pub mod proto;
 
 use std::fmt;
 use std::str::FromStr;

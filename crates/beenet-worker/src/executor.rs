@@ -4,8 +4,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
+use beenet_common::proto::{InvokeRequest, Status};
 use beenet_factors::{ai_usage_snapshot, AiUsageSnapshot, BeenetFactors};
-use beenet_proto::{InvokeRequest, Status};
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use spin_app::App;
@@ -225,7 +225,7 @@ fn http_reason(status: u16) -> String {
 pub async fn load_factors_app(
     executor: Arc<spin_factors_executor::FactorsExecutor<BeenetFactors, ()>>,
     cid: &beenet_common::BeenetCid,
-    manifest: &beenet_manifest::Manifest,
+    manifest: &beenet_artifact::Manifest,
     loader: &impl spin_factors_executor::ComponentLoader<BeenetFactors, ()>,
 ) -> Result<Arc<FactorsExecutorApp<BeenetFactors, ()>>> {
     let locked = beenet_factors::locked_app_single_http_component(

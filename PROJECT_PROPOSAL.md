@@ -75,7 +75,7 @@ Beenet 提出一个根本性的计算范式：**CID 即函数地址**。
 
 **① CID 即函数地址**
 
-`beenet-pack build` 将 Wasm 二进制与 `beenet.toml` 清单（运行时限制、能力声明、计量策略）打包为单文件，计算 CIDv1/raw/sha2-256 作为全局调用地址。CID 既是寻址凭据，也是完整性证明——Worker 拉取后必须校验哈希，篡改即拒绝执行。
+`beenet-artifact` 协议库将 Wasm 二进制与 `beenet.toml` 清单（运行时限制、能力声明、计量策略）打包为单文件，计算 CIDv1/raw/sha2-256 作为全局调用地址；托管构建与发布由 Beenet Cloud 完成。CID 既是寻址凭据，也是完整性证明——Worker 拉取后必须校验哈希，篡改即拒绝执行。
 
 **② P2P 即调用总线**
 
@@ -203,10 +203,8 @@ curl → Gateway(HTTP) → libp2p → Worker → wasi:http/incoming-handler@0.2 
 ```
 
 已落地组件：
-- `beenet-common`（CIDv1 内容寻址）
-- `beenet-proto`（InvokeRequest/Response/Status/Usage，CBOR）
-- `beenet-manifest`（`beenet:manifest/v1` + Wasm custom section）
-- `beenet-pack`（build/inspect/upload，S3 兼容，阿里云 OSS）
+- `beenet-common`（CIDv1 内容寻址、InvokeRequest/Response/Status/Usage CBOR 协议）
+- `beenet-artifact`（`beenet:manifest/v1`、Wasm custom section、package/inspect/CID 校验）与 Beenet Cloud Builder（托管构建、发布）
 - `beenet-registry`（HTTP 控制面，心跳/续租/Worker 列表）
 - `beenet-worker`（libp2p invoke + Wasmtime 执行 + HTTP 拉取 Wasm）
 - `beenet-gateway`（HTTP → libp2p，轮询 Registry 动态调度）

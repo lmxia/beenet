@@ -19,8 +19,8 @@ use beenet_common::config::{
     load_file, resolve_config_path_with_cli, resolve_gateway_settings_optional_file,
     GatewayCliOverrides,
 };
+use beenet_common::proto::{InvokeRequest, InvokeResponse, LoadStage, Status, TimeoutStage, Usage};
 use beenet_common::{BeenetCid, INVOKE_PROTOCOL};
-use beenet_proto::{InvokeRequest, InvokeResponse, LoadStage, Status, TimeoutStage, Usage};
 use clap::Parser;
 use libp2p::core::multiaddr::Protocol;
 use libp2p::futures::StreamExt;
@@ -124,7 +124,11 @@ fn unix_secs_now() -> u64 {
         .unwrap_or(0)
 }
 
-fn make_signature(keypair: &identity::Keypair, peer_id: &str, timestamp_secs: u64) -> Result<String> {
+fn make_signature(
+    keypair: &identity::Keypair,
+    peer_id: &str,
+    timestamp_secs: u64,
+) -> Result<String> {
     let message = format!("{peer_id}\n{timestamp_secs}");
     let sig = keypair
         .sign(message.as_bytes())
@@ -296,7 +300,7 @@ async fn main() -> Result<()> {
         let public_addr: Multiaddr = public_addr
             .parse()
             .with_context(|| format!("invalid gateway public_addr `{public_addr}`"))?;
-        let announced = public_addr.with(Protocol::P2p(local_peer_id.into()));
+        let announced = public_addr.with(Protocol::P2p(local_peer_id));
         swarm.add_external_address(announced.clone());
         info!(%announced, "gateway public address announced");
     }
@@ -305,14 +309,14 @@ async fn main() -> Result<()> {
     let dial_addr = if let Some(public_addr) = settings.public_addr.as_ref() {
         public_addr
             .parse::<Multiaddr>()?
-            .with(Protocol::P2p(local_peer_id.into()))
+            .with(Protocol::P2p(local_peer_id))
             .to_string()
     } else {
         warn!("gateway public_addr is not set; using libp2p_listen_addr for registry heartbeat in local/test mode");
         settings
             .libp2p_listen_addr
             .parse::<Multiaddr>()?
-            .with(Protocol::P2p(local_peer_id.into()))
+            .with(Protocol::P2p(local_peer_id))
             .to_string()
     };
 
@@ -585,6 +589,7 @@ async fn do_gateway_join(
 }
 
 /// Probe heartbeat; on 401 try join then succeed. Returns Err if enrollment impossible.
+#[allow(clippy::too_many_arguments)]
 async fn ensure_gateway_registered(
     http: &reqwest::Client,
     registry_url: &str,
@@ -631,7 +636,16 @@ async fn ensure_gateway_registered(
             "gateway is not registered; provide --join-token-file / --join-token-stdin / --join-token"
         );
     };
-    do_gateway_join(http, registry_url, keypair, peer_id, gateway_id, region, token).await
+    do_gateway_join(
+        http,
+        registry_url,
+        keypair,
+        peer_id,
+        gateway_id,
+        region,
+        token,
+    )
+    .await
 }
 
 async fn gateway_heartbeat_loop(
@@ -689,10 +703,7 @@ async fn lookup_workers(
     if peer_ids.is_empty() {
         return Ok(HashMap::new());
     }
-    let url = format!(
-        "{}/v1/workers/lookup",
-        registry_base.trim_end_matches('/')
-    );
+    let url = format!("{}/v1/workers/lookup", registry_base.trim_end_matches('/'));
     let gateway_peer_id = keypair.public().to_peer_id().to_string();
     let mut out = HashMap::new();
     for chunk in peer_ids.chunks(MAX_LOOKUP_PEER_IDS) {
@@ -920,12 +931,17 @@ async fn run_swarm_loop(
                     }
                 }
                 SwarmEvent::Behaviour(GatewayBehaviourEvent::RequestResponse(
-                    request_response::Event::Message { message, .. }
+                    request_response::Event::Message {
+                        message:
+                            request_response::Message::Response {
+                                request_id,
+                                response,
+                            },
+                        ..
+                    },
                 )) => {
-                    if let request_response::Message::Response { request_id, response } = message {
-                        if let Some(tx) = pending.remove(&request_id) {
-                            let _ = tx.send(response);
-                        }
+                    if let Some(tx) = pending.remove(&request_id) {
+                        let _ = tx.send(response);
                     }
                 }
                 SwarmEvent::Behaviour(GatewayBehaviourEvent::RequestResponse(

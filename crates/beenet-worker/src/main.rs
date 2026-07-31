@@ -6,7 +6,7 @@ mod executor;
 use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Read};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -14,11 +14,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD, Engine};
+use beenet_artifact::Manifest;
 use beenet_common::config::{resolve_config_path_with_cli, WorkerCliOverrides, WorkerSettings};
+use beenet_common::proto::{InvokeRequest, InvokeResponse, LoadStage, Status, TimeoutStage, Usage};
 use beenet_common::{BeenetCid, INVOKE_PROTOCOL};
 use beenet_factors::BeenetFactors;
-use beenet_manifest::Manifest;
-use beenet_proto::{InvokeRequest, InvokeResponse, LoadStage, Status, TimeoutStage, Usage};
 use clap::Parser;
 use futures::StreamExt;
 use libp2p::request_response::{self, ProtocolSupport};
@@ -464,7 +464,7 @@ impl Runtime {
         let wasm_path = self.wasm_path(cid);
         let wasm = fs::read(&wasm_path)
             .with_context(|| format!("read cached wasm `{}`", wasm_path.display()))?;
-        let manifest = beenet_manifest::extract(&wasm).context("manifest extraction failed")?;
+        let manifest = beenet_artifact::extract(&wasm).context("manifest extraction failed")?;
         let loader = BeenetComponentLoader {
             wasm_cache_dir: self.wasm_cache_dir.clone(),
         };
@@ -528,7 +528,7 @@ impl Runtime {
     }
 }
 
-/// `GET {trimmed_base}/{cid_string}` — same path segment `beenet-pack upload` uses for object key tail.
+/// `GET {trimmed_base}/{cid_string}` — the hosted publisher stores artifacts by CID.
 fn wasm_fetch_url(base: &str, cid: &BeenetCid) -> String {
     format!("{}/{}", base.trim_end_matches('/'), cid)
 }
@@ -546,7 +546,7 @@ fn registry_url(base: &str, path: &str) -> String {
 
 /// Load the worker's Ed25519 keypair from `<wasm_cache_dir>/identity.key`.
 /// If the file does not exist, generate a new keypair and persist it.
-fn load_or_create_keypair(wasm_cache_dir: &PathBuf) -> Result<identity::Keypair> {
+fn load_or_create_keypair(wasm_cache_dir: &Path) -> Result<identity::Keypair> {
     let key_path = wasm_cache_dir.join("identity.key");
     if key_path.exists() {
         let bytes = fs::read(&key_path)
@@ -637,6 +637,7 @@ struct HeartbeatOkResponse {
 // ── Registration & heartbeat logic ────────────────────────────────────────
 
 /// Call `POST /v1/workers/join`. Returns `Ok(())` on success.
+#[allow(clippy::too_many_arguments)]
 async fn do_join(
     http: &reqwest::Client,
     join_url: &str,
@@ -682,6 +683,7 @@ async fn do_join(
 }
 
 /// Send one heartbeat. Returns `Ok(Some(tip))` if accepted, `Ok(None)` if 401 (unregistered).
+#[allow(clippy::too_many_arguments)]
 async fn do_heartbeat(
     http: &reqwest::Client,
     heartbeat_url: &str,
@@ -721,6 +723,7 @@ async fn do_heartbeat(
     Ok(Some(parsed.gateways))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn registry_heartbeat_loop(
     http: reqwest::Client,
     heartbeat_url: String,
@@ -876,10 +879,10 @@ async fn run_swarm_loop(
                 desired_gateways = gateway_peer_set(&gateways.borrow());
                 info!(count = desired_gateways.len(), "gateway candidates updated");
                 for peer_id in connected.clone() {
-                    if !desired_gateways.contains(&peer_id) {
-                        if swarm.disconnect_peer_id(peer_id).is_err() {
-                            warn!(%peer_id, "failed to disconnect stale gateway");
-                        }
+                    if !desired_gateways.contains(&peer_id)
+                        && swarm.disconnect_peer_id(peer_id).is_err()
+                    {
+                        warn!(%peer_id, "failed to disconnect stale gateway");
                     }
                 }
             }

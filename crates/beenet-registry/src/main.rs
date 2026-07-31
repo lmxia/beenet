@@ -737,7 +737,12 @@ async fn delete_gateway_token(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    let deleted = state.gateway_join_tokens.write().await.remove(&id).is_some();
+    let deleted = state
+        .gateway_join_tokens
+        .write()
+        .await
+        .remove(&id)
+        .is_some();
     if deleted {
         info!(%id, "gateway join token revoked");
     }
@@ -802,7 +807,12 @@ async fn delete_gateway_registration(
         Ok(p) => p,
         Err(_) => return (StatusCode::BAD_REQUEST, "invalid peer_id").into_response(),
     };
-    let deleted = state.registered_gateways.write().await.remove(&pid).is_some();
+    let deleted = state
+        .registered_gateways
+        .write()
+        .await
+        .remove(&pid)
+        .is_some();
     if deleted {
         state.gateways.write().await.remove(&pid);
         redis_gateway_del(&mut state.redis, &pid).await;
@@ -1059,12 +1069,7 @@ async fn post_gateway_heartbeat(
         }
     };
     if let Err(error) = check_timestamp(body.timestamp_secs).and_then(|_| {
-        verify_signature(
-            &pubkey,
-            &body.peer_id,
-            body.timestamp_secs,
-            &body.signature,
-        )
+        verify_signature(&pubkey, &body.peer_id, body.timestamp_secs, &body.signature)
     }) {
         return (StatusCode::UNAUTHORIZED, error.to_string()).into_response();
     }
@@ -1261,7 +1266,11 @@ fn select_active_workers_by_peers(
 ) -> Vec<WorkerView> {
     peer_ids
         .iter()
-        .filter_map(|pid| active.get(pid).and_then(|rec| worker_view_if_active(pid, rec, now)))
+        .filter_map(|pid| {
+            active
+                .get(pid)
+                .and_then(|rec| worker_view_if_active(pid, rec, now))
+        })
         .collect()
 }
 
@@ -1316,12 +1325,7 @@ async fn post_workers_lookup(
     if let Err(e) = check_timestamp(body.timestamp_secs) {
         return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
     }
-    if let Err(e) = verify_signature(
-        &pubkey,
-        &body.peer_id,
-        body.timestamp_secs,
-        &body.signature,
-    ) {
+    if let Err(e) = verify_signature(&pubkey, &body.peer_id, body.timestamp_secs, &body.signature) {
         return (StatusCode::UNAUTHORIZED, e.to_string()).into_response();
     }
 

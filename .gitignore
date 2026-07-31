@@ -1,5 +1,6 @@
 /target
 /examples/**/target/
+/.tmp-builder-output/
 /dist
 **/Cargo.lock.bak
 .DS_Store

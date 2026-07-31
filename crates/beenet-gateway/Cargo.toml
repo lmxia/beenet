@@ -13,7 +13,6 @@ anyhow = { workspace = true }
 axum = { workspace = true }
 base64 = { workspace = true }
 beenet-common = { workspace = true }
-beenet-proto = { workspace = true }
 clap = { workspace = true }
 libp2p = { workspace = true }
 serde = { workspace = true }

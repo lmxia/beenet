@@ -1,4 +1,5 @@
-# Local stack: Redis + MinIO + registry + gateway + dashboard (worker runs on the host).
+# Local runtime stack: Redis + registry + gateway + dashboard (worker runs on the host).
+# Artifact storage is owned by the sibling Beenet Cloud stack on :9000/:9001.
 #
 # Prefer the phased helper (creates gateway join token before starting gateway):
 #   ./scripts/dev-up.sh up [--build]
@@ -10,38 +11,12 @@
 # Admin token (fixed for local compose): beenet-dev-admin-token
 # Dashboard: http://127.0.0.1:8081
 # Gateway HTTP: http://127.0.0.1:18080  libp2p: 14001
-# MinIO: http://127.0.0.1:9000  console:9001 (minioadmin / minioadmin)
 
 services:
   redis:
     image: redis:7-alpine
     ports:
       - "6379:6379"
-
-  minio:
-    image: quay.io/minio/minio:latest
-    command: server /data --console-address ":9001"
-    ports:
-      - "9000:9000"
-      - "9001:9001"
-    environment:
-      MINIO_ROOT_USER: minioadmin
-      MINIO_ROOT_PASSWORD: minioadmin
-    volumes:
-      - minio-data:/data
-
-  minio-init:
-    image: quay.io/minio/mc:latest
-    depends_on:
-      minio:
-        condition: service_started
-    entrypoint: >
-      /bin/sh -c "
-      until mc alias set local http://minio:9000 minioadmin minioadmin; do sleep 1; done;
-      mc mb local/beenet --ignore-existing;
-      mc anonymous set download local/beenet;
-      echo 'MinIO bucket beenet ready (anonymous download)';
-      "
 
   beenet-registry:
     image: beenet/beenet-registry:dev
@@ -114,5 +89,4 @@ services:
       REGISTRY_UPSTREAM: http://beenet-registry:3030
 
 volumes:
-  minio-data:
   gateway-cache:

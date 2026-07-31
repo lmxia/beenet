@@ -1,4 +1,4 @@
-//! `beenet:manifest/v1` custom section schema + embed/extract.
+//! `beenet:manifest/v1` schema and Wasm custom-section embed/extract.
 //!
 //! See `readme.md §3.5`. The manifest is written as TOML into a Wasm custom
 //! section. We intentionally avoid the `wasm-encoder` re-emit path and simply
@@ -38,23 +38,13 @@ pub struct Task {
     pub interface: String,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Runtime {
     /// Wasm linear-memory cap requested by the author. Worker clamps to its own
     /// hard cap — see `readme.md §6.2.5`.
     pub max_memory_mb: Option<u32>,
     pub deadline_ms: Option<u32>,
     pub fuel_limit: Option<u64>,
-}
-
-impl Default for Runtime {
-    fn default() -> Self {
-        Self {
-            max_memory_mb: None,
-            deadline_ms: None,
-            fuel_limit: None,
-        }
-    }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

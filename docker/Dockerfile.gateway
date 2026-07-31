@@ -1,8 +1,8 @@
 # Build context: beenet/ workspace root.
 #   docker build -f docker/Dockerfile.gateway -t beenet/gateway:dev .
 #
-# beenet-gateway depends on beenet-common + beenet-proto. Spin-dependent
-# workspace members are stripped so the sibling spin/ checkout is not required.
+# Gateway wire types live in beenet-common. Spin-dependent workspace members
+# are stripped so the sibling spin/ checkout is not required.
 
 FROM rust:1-slim AS builder
 

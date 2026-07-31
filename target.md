@@ -262,10 +262,9 @@ bill = base_fee + compute_fee + resource_fee
 
 已落地（M1 / M1.5）：
 
-- `crates/beenet-common`：`BeenetCid`（CIDv1/raw/sha2-256）+ 协议常量。
-- `crates/beenet-proto`：`InvokeRequest` / `InvokeResponse` / `Status` / `Usage`，libp2p CBOR 上线。
-- `crates/beenet-manifest`：`beenet:manifest/v1` TOML schema + wasm custom section embed/extract。
-- `crates/beenet-pack`：`build` / `inspect` / **`upload`**（S3 兼容，含阿里云 OSS）。
+- `crates/beenet-common`：`BeenetCid`（CIDv1/raw/sha2-256）、协议常量，以及 `InvokeRequest` / `InvokeResponse` / `Status` / `Usage` libp2p CBOR 类型。
+- `crates/beenet-artifact`：`beenet:manifest/v1` TOML schema、Wasm custom section、package / inspect / CID 校验。
+- Beenet Cloud Builder：托管编译、打包与发布，并提供内部 `beenet-pack` 工具。
 - `crates/beenet-factors`：扁平 `BeenetFactors`（Wasi/Variables/OutboundNetworking/OutboundHttp/Audit/AI）。
 - `crates/beenet-worker`：libp2p invoke + FactorsExecutor；Registry **心跳**；可选 **HTTP 拉取 wasm**（`[worker].wasm_fetch_base`）写本地缓存。
 - `crates/beenet-gateway`：HTTP `POST /run/ipfs/:cid` → libp2p；**按已连接 peer lookup** Registry 元数据并本地缓存（§4.3）。
@@ -283,7 +282,7 @@ bill = base_fee + compute_fee + resource_fee
 
 1. 任务作者使用 `#[http_component]`。
 2. 写 `beenet.toml`。
-3. `beenet-pack build` 输出 `task.wasm`。
+3. Beenet Cloud Builder 输出 `task.wasm`。
 4. 计算 CID 并发布。
 5. Gateway/Agent 调用 `cid`。
 6. Worker 执行并回传 body + usage（含 AI 计量字段）。
@@ -301,7 +300,7 @@ bill = base_fee + compute_fee + resource_fee
 ## 10. 里程碑
 
 - **M1（已闭环）**：最短闭环已端到端跑通（`POST /run/ipfs/<cid>` → gateway → libp2p → worker → wasi:http proxy → spin-sdk guest → body 回传）。本地伪 CID（`./wasm_cache/<cid>.wasm`）、档 0（`wasi:http/incoming-handler@0.2`，`wasmtime-wasi-http` p2 `ProxyPre`）、裸 HTTP gateway。**运维**：**`beenet-registry`** + **`config.toml` 的 `[gateway]` / `[worker]`**；Worker 向 Registry **心跳**；Gateway **按已连接 peer lookup** 并缓存元数据（§4.3）。
-  - **M1 已完成**：`beenet-common` / `beenet-proto` / `beenet-manifest` / `beenet-pack`，libp2p request-response 通信骨架，gateway→worker 转发，`Status` A/B 表，`beenet-worker` 的 `TaskExecutor` trait 抽象 + `Wasip2HttpExecutor` 实现（档 0），worker 并发闸门（tokio `Semaphore`，默认 `available_parallelism * 4`，超闸门返回 `Status::Rejected`）。
+  - **M1 已完成**：`beenet-common` / `beenet-artifact` 与 Beenet Cloud Builder，libp2p request-response 通信骨架，gateway→worker 转发，`Status` A/B 表，`beenet-worker` 的 `TaskExecutor` trait 抽象 + `Wasip2HttpExecutor` 实现（档 0），worker 并发闸门（tokio `Semaphore`，默认 `available_parallelism * 4`，超闸门返回 `Status::Rejected`）。
   - **M1 已交付但仍有限制**：`InvokeResponse` 不回传 stdout/stderr（仅 worker 本地 tracing）、manifest `max_memory_mb` 只读不 apply、`deadline_ms` 走 `tokio::time::timeout`（非 wasmtime epoch）、出网钳制靠 `WasiCtx` 默认 capability-not-granted 兜底（见 D16）——这些都由 M1.5 正式化。
 - **M1.5（下一步）**：
   - 接 `spin_factors_executor::FactorsExecutor::load_app`（动态 `LockedApp`，D4）。

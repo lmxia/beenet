@@ -378,8 +378,7 @@ fn read_persisted(path: &Path) -> Result<Option<String>> {
 
 fn write_persisted(path: &Path, name: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("create `{}`", parent.display()))?;
+        fs::create_dir_all(parent).with_context(|| format!("create `{}`", parent.display()))?;
     }
     fs::write(path, format!("{name}\n"))
         .with_context(|| format!("write display name `{}`", path.display()))?;

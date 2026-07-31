@@ -1,6 +1,6 @@
 # Local / host-side config used by:
 #   beenet-worker --config examples/local-dev-config.toml
-#   beenet-pack upload --config examples/local-dev-config.toml
+#   Beenet Cloud publishes artifacts by CID in hosted environments.
 #   beenet-gateway --config examples/local-dev-config.toml   (native only)
 #
 # Docker Compose gateway/registry do NOT read this file (they use CLI flags).
@@ -20,7 +20,7 @@ registry_url = "http://127.0.0.1:3030"
 # Display name (duplicates ok; PeerId is the identity). Override with --name.
 # If omitted, a Docker-style name is generated and saved as wasm_cache/display_name.
 # name = "dev-worker"
-# MinIO public read (bucket `beenet`, path-style URL)
+# Beenet Cloud MinIO public read (bucket `beenet`, path-style URL)
 wasm_fetch_base = "http://127.0.0.1:9000/beenet"
 
 [oss]

@@ -1,7 +1,8 @@
 .git
+.DS_Store
 target
-relay_cache
-wasm_cache
-*.log
-node_modules
-*.tmp
+examples/**/target
+.tmp-builder-output
+dist
+dashboard/node_modules
+dashboard/dist

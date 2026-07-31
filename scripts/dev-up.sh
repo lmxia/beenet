@@ -2,7 +2,7 @@
 # Phased local stack: Docker services + host Worker.
 #
 # Order:
-#   1) redis / minio / registry / dashboard
+#   1) redis / registry / dashboard
 #   2) mint gateway join token
 #   3) gateway (with token file mounted)
 #   4) mint worker join token for host process
@@ -25,6 +25,7 @@ GW_TOKEN_FILE="$SECRET_DIR/gateway-join-token"
 WORKER_TOKEN_FILE="$SECRET_DIR/worker-join-token"
 REGISTRY_URL="${BEENET_REGISTRY_URL:-http://127.0.0.1:3030}"
 GATEWAY_HEALTH_URL="${BEENET_GATEWAY_HEALTH_URL:-http://127.0.0.1:18080/health}"
+ARTIFACT_STORE_HEALTH_URL="${BEENET_ARTIFACT_STORE_HEALTH_URL:-http://127.0.0.1:9000/minio/health/live}"
 
 mkdir -p "$SECRET_DIR"
 chmod 700 "$SECRET_DIR" 2>/dev/null || true
@@ -83,7 +84,7 @@ cmd_up() {
     shift || true
   fi
 
-  echo "==> phase 1: redis / minio / registry / dashboard"
+  echo "==> phase 1: redis / registry / dashboard"
   if [[ "$build" == "1" ]]; then
     # compose 默认可能走 buildx container builder，且会强制访问 Docker Hub
     # 鉴权；本机已有基础镜像时用 default builder + --pull=false 更稳。
@@ -97,8 +98,12 @@ cmd_up() {
       docker build --pull=false -f docker/Dockerfile.dashboard -t beenet/beenet-dashboard:dev .
     )
   fi
-  "${COMPOSE[@]}" up -d redis minio minio-init beenet-registry beenet-dashboard
+  "${COMPOSE[@]}" up -d redis beenet-registry beenet-dashboard
   wait_http "${REGISTRY_URL}/health" "registry"
+  if ! curl -sf "$ARTIFACT_STORE_HEALTH_URL" >/dev/null; then
+    echo "warning: Beenet Cloud artifact store is not running at $ARTIFACT_STORE_HEALTH_URL" >&2
+    echo "         start it with: make -C ../beenet-cloud storage-up" >&2
+  fi
 
   echo "==> phase 2: mint gateway join token"
   mint_token "/v1/admin/gateway-tokens" "compose-gateway" "$GW_TOKEN_FILE"
@@ -118,7 +123,7 @@ Stack is up.
   Registry:   ${REGISTRY_URL}
   Gateway:    http://127.0.0.1:18080
   Dashboard:  http://127.0.0.1:8081  (admin: ${ADMIN_TOKEN})
-  MinIO:      http://127.0.0.1:9000  (console :9001)
+  Artifacts:  http://127.0.0.1:9000  (owned by Beenet Cloud; console :9001)
 
 Gateway join token:  ${GW_TOKEN_FILE}
 Worker join token:   ${WORKER_TOKEN_FILE}

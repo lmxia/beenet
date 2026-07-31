@@ -6,13 +6,14 @@ rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Shared types (CID, config, errors) for Beenet."
+description = "Shared CID, configuration, and Gateway ↔ Worker protocol types for Beenet."
 
 [dependencies]
 anyhow = { workspace = true }
 dirs = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
+serde_bytes = { workspace = true }
 toml = { workspace = true }
 cid = { workspace = true }
 multihash = { workspace = true }

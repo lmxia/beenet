@@ -3,8 +3,9 @@
 //! These mirror `readme.md §4.2`. Encoding is handled by `libp2p-request-response`'s
 //! CBOR codec, so we only need `serde` derives here.
 
-use beenet_common::BeenetCid;
 use serde::{Deserialize, Serialize};
+
+use crate::BeenetCid;
 
 /// Request sent by a Gateway (or Agent) to a Worker over libp2p.
 #[derive(Clone, Debug, Serialize, Deserialize)]

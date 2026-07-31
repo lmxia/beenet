@@ -4,7 +4,7 @@
 			"path": "."
 		},
 		{
-			"path": "../spin"
+			"path": "../beenet-cloud"
 		}
 	],
 	"settings": {}

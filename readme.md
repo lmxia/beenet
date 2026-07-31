@@ -18,7 +18,7 @@ curl → Gateway(HTTP) → libp2p → Worker → wasi:http/incoming-handler@0.2 
 
 **必须** 运行 **`beenet-registry`**：Worker / Gateway 首次入网各用 admin 签发的 **join token**；之后用本地持久化 Ed25519 identity 签名 heartbeat（及 Gateway 的 lookup）。详见 [`target.md` §4.1 / §4.3](./target.md)。
 
-**Wasm 分发（推荐）**：`beenet-pack build` 后 **`beenet-pack upload`** 到 S3 兼容存储；Worker 配置 **`wasm_fetch_base`**，缓存未命中时 `GET {base}/{cid}`（见 [`target.md` §3.1](./target.md)）。
+**Wasm 构建与发布**由相邻的 **Beenet Cloud** 项目负责；本仓库保留 CID、manifest 和 Artifact 校验协议。Worker 配置 **`wasm_fetch_base`**，缓存未命中时按 CID 拉取产物。
 
 档 0 接口走 W3C 标准 `wasi:http/incoming-handler@0.2`（`spin-sdk` + `#[http_component]`）。
 
@@ -26,15 +26,20 @@ curl → Gateway(HTTP) → libp2p → Worker → wasi:http/incoming-handler@0.2 
 
 - Rust stable（`rust-toolchain.toml` 已固定）
 - `wasm32-wasip2`：`rustup target add wasm32-wasip2`
-- Docker（本地推荐用 compose 跑 Registry / Gateway / MinIO / Dashboard）
+- Docker（本地推荐用 compose 跑 Registry / Gateway / Dashboard；Artifact Store 由 Beenet Cloud 提供）
 
 ## 本地一键栈（推荐）
 
 控制面与 Gateway **容器化**；Worker **宿主机进程**（依赖 Spin 宿主，暂不容器化）。
+MinIO/未来 OSS 属于发布平台，因此统一由相邻的 **Beenet Cloud** 管理，Beenet 不再启动第二套
+对象存储。
 
 Gateway 需要 Registry 先签发 **gateway join token**，因此不要直接 `docker compose up` 全部服务，请用分阶段脚本：
 
 ```bash
+# 首次启动共享 Artifact Store
+make -C ../beenet-cloud storage-up
+
 # 首次或镜像有变更时加 --build（使用本机已有基础镜像，避免 Docker Hub 超时）
 ./scripts/dev-up.sh up --build
 # 仅启动 / 刷新 token（不重建镜像）
@@ -43,7 +48,7 @@ Gateway 需要 Registry 先签发 **gateway join token**，因此不要直接 `d
 
 脚本顺序：
 
-1. 启动 Redis / MinIO / Registry / Dashboard  
+1. 启动 Redis / Registry / Dashboard，并检查 Beenet Cloud Artifact Store
 2. 签发 gateway join token → `.beenet-dev/gateway-join-token`  
 3. 启动 Gateway（挂载该 token）  
 4. 签发 worker join token → `.beenet-dev/worker-join-token`  
@@ -53,7 +58,7 @@ Gateway 需要 Registry 先签发 **gateway join token**，因此不要直接 `d
 | http://127.0.0.1:3030 | Registry |
 | http://127.0.0.1:18080 | Gateway HTTP（libp2p `14001`） |
 | http://127.0.0.1:8081 | Dashboard（admin：`beenet-dev-admin-token`） |
-| http://127.0.0.1:9000 | MinIO S3（控制台 `:9001`，`minioadmin` / `minioadmin`） |
+| http://127.0.0.1:9000 | Beenet Cloud MinIO S3（控制台 `:9001`，`minioadmin` / `minioadmin`） |
 
 常用命令：
 
@@ -62,6 +67,7 @@ Gateway 需要 Registry 先签发 **gateway join token**，因此不要直接 `d
 ./scripts/dev-up.sh logs
 ./scripts/dev-up.sh worker-token   # 刷新 worker join token
 ./scripts/dev-up.sh down
+make -C ../beenet-cloud storage-up
 # 或: make docker-up / make docker-down
 ```
 
@@ -79,11 +85,12 @@ cargo build --release -p beenet-worker
 
 ## 配置文件
 
-**Gateway / Worker / `beenet-pack upload`** 读 TOML；**`beenet-registry`** 只用 CLI。
+**Gateway / Worker** 读 TOML；Beenet Cloud 的 **`beenet-pack upload`** 也可复用其中的
+`[oss]` 发布配置；**`beenet-registry`** 只用 CLI。
 
 - 默认：`dirs::config_dir()/beenet/config.toml`
 - 覆盖：`--config /path/to/config.toml`
-- 本地联调可直接用 **`examples/local-dev-config.toml`**（含 MinIO `[oss]` + `wasm_fetch_base`）
+- 本地联调可直接用 **`examples/local-dev-config.toml`**。
 
 ```toml
 [worker]
@@ -101,41 +108,40 @@ force_path_style = true
 
 ## 端到端示例
 
-假定仓库根目录；本地栈已用 `./scripts/dev-up.sh up` 拉起。
-
-### 1. 编译与打包
+假定仓库根目录；Beenet Cloud Artifact Store 与本地运行时栈已经拉起：
 
 ```bash
-cargo build --release --workspace
-
-cargo build --release \
-  --manifest-path examples/fair-red-packet-http/Cargo.toml \
-  --target wasm32-wasip2
-
-mkdir -p dist wasm_cache
-./target/release/beenet-pack build \
-  --wasm examples/fair-red-packet-http/target/wasm32-wasip2/release/fair_red_packet_http.wasm \
-  --manifest examples/fair-red-packet-http/beenet.toml \
-  --out dist/task.wasm
+make -C ../beenet-cloud storage-up
+./scripts/dev-up.sh up
 ```
 
-### 2. 发布 wasm
-
-**MinIO（推荐开发）** — compose 已起 MinIO 时：
+### 1. 通过 Beenet Cloud Builder 编译与打包
 
 ```bash
-./target/release/beenet-pack upload \
-  --config examples/local-dev-config.toml \
-  --wasm dist/task.wasm
-
-CID=$(./target/release/beenet-pack inspect dist/task.wasm | awk '/^CID:/{print $2}')
-curl -s -o /dev/null -w "%{http_code}\n" "http://127.0.0.1:9000/beenet/${CID}"
-# 预期 200
+mkdir -p dist
+make -C ../beenet-cloud builder-image
+make -C ../beenet-cloud wasm \
+  DIR=../beenet/examples/fair-red-packet-http \
+  OUT=../beenet/dist
 ```
 
-**仅本地缓存**：`cp dist/task.wasm "wasm_cache/${CID}.wasm"`。
+### 2. 通过 `beenet-pack upload` 发布到 MinIO
 
-**阿里云 OSS**：在 `[oss]` 填 RAM AK/SK 后同样 `beenet-pack upload`。
+```bash
+make -C ../beenet-cloud upload \
+  WASM=../beenet/dist/task.wasm \
+  CONFIG=../beenet/examples/local-dev-config.toml
+
+export CID="$(awk '/^CID:/{print $2}' dist/build-result.txt)"
+curl -I "http://127.0.0.1:9000/beenet/$CID"
+```
+
+`make upload` 会启动一个独立、可联网的容器，并在其中执行 `beenet-pack upload`。
+Artifact 的对象 key 是 CID 本身，不带 `.wasm` 后缀；Builder 容器仍使用
+`--network none`，不会接触 MinIO/OSS 的 AK/SK。
+
+生产环境不需要 Agent 手动上传：Beenet Cloud API 会在编译完成并重新校验 CID 后自动
+上传 OSS，验证对象存在后才将 Build Job 标记为 `succeeded/published`。
 
 ### 3. 启动 Worker 并调用
 
@@ -144,7 +150,6 @@ curl -s -o /dev/null -w "%{http_code}\n" "http://127.0.0.1:9000/beenet/${CID}"
   --config examples/local-dev-config.toml \
   --join-token-file .beenet-dev/worker-join-token
 
-export CID="$(./target/release/beenet-pack inspect dist/task.wasm | awk '/^CID:/{print $2}')"
 curl -i -X POST "http://127.0.0.1:18080/run/ipfs/$CID" \
   -H 'content-type: application/json' \
   --data '{
@@ -187,24 +192,22 @@ curl -s -H "Authorization: Bearer beenet-dev-admin-token" \
 
 ### 故障排查（简）
 
-- **connection refused**：`./scripts/dev-up.sh status`，确认 Gateway `18080` 与 Worker 在跑。  
-- **load-error**：wasm 未 upload / 未进 `wasm_cache`，或工作目录与 `wasm_cache_dir` 不一致。  
+- **connection refused**：`./scripts/dev-up.sh status`，确认 Gateway `18080` 与 Worker 在跑。
+- **load-error**：Wasm 未上传到 `{wasm_fetch_base}/{CID}`、对象名错误地带了 `.wasm`，或本地缓存目录不可写。
 - **Gateway 起不来**：是否跳过了 `dev-up.sh`、直接 compose up？需先有 `.beenet-dev/gateway-join-token`。
 
 ## 写你自己的任务
 
 1. 新建 `wasm32-wasip2` `cdylib`，`spin-sdk` + `#[http_component]`。  
 2. 写 `beenet.toml`（`interface` = `wasi:http/incoming-handler@0.2`）。  
-3. `beenet-pack build` → upload 或拷入 `wasm_cache` → 经 Gateway 调 CID。
+3. 交给 Beenet Cloud 构建、发布，再经鉴权后的 Invoke Proxy 调用 CID。
 
 ## 仓库结构
 
 | 路径 | 说明 |
 | --- | --- |
-| `crates/beenet-common` | `BeenetCid` + 协议常量 |
-| `crates/beenet-proto` | Invoke 请求/响应类型 |
-| `crates/beenet-manifest` | `beenet:manifest/v1` |
-| `crates/beenet-pack` | `build` / `inspect` / `upload` |
+| `crates/beenet-common` | `BeenetCid`、协议常量、Invoke 请求/响应类型 |
+| `crates/beenet-artifact` | `beenet:manifest/v1`、package / inspect / CID 校验 |
 | `crates/beenet-registry` | HTTP 控制面（join / heartbeat / lookup） |
 | `crates/beenet-worker` | libp2p Worker（宿主机） |
 | `crates/beenet-gateway` | HTTP → libp2p Gateway |
