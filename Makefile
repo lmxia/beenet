@@ -10,6 +10,7 @@ HTTPS_PROXY ?= http://host.docker.internal:7890
 
 REGISTRY_IMAGE := $(REGISTRY)/beenet-registry:$(VERSION)
 GATEWAY_IMAGE  := $(REGISTRY)/beenet-gateway:$(VERSION)
+FRONTDOOR_IMAGE := $(REGISTRY)/beenet-frontdoor:$(VERSION)
 DASHBOARD_IMAGE := $(REGISTRY)/beenet-dashboard:$(VERSION)
 
 # Build context is the beenet/ workspace root.
@@ -19,12 +20,12 @@ DOCKER_CTX := .
 
 # ── Rust / Dev ───────────────────────────────────────────────────────────────
 .PHONY: build
-build: ## Build release binaries (registry + gateway)
-	cargo build --release -p beenet-registry -p beenet-gateway
+build: ## Build release binaries (registry + gateway + frontdoor)
+	cargo build --release -p beenet-registry -p beenet-gateway -p beenet-frontdoor
 
 .PHONY: build-debug
 build-debug: ## Build debug binaries (registry + gateway)
-	cargo build -p beenet-registry -p beenet-gateway
+	cargo build -p beenet-registry -p beenet-gateway -p beenet-frontdoor
 
 .PHONY: test
 test: ## Run all workspace tests
@@ -40,14 +41,14 @@ fmt-check: ## Check formatting (non-destructive)
 
 .PHONY: lint
 lint: ## Run clippy on registry + gateway
-	cargo clippy -p beenet-registry -p beenet-gateway -- -D warnings
+	cargo clippy -p beenet-registry -p beenet-gateway -p beenet-frontdoor -- -D warnings
 
 .PHONY: check
 check: fmt-check lint ## Run all static checks (fmt + clippy)
 
 # ── Docker ───────────────────────────────────────────────────────────────────
 .PHONY: docker-build
-docker-build: docker-build-registry docker-build-gateway docker-build-dashboard ## Build all Docker images
+docker-build: docker-build-registry docker-build-gateway docker-build-frontdoor docker-build-dashboard ## Build all Docker images
 
 .PHONY: docker-build-registry
 docker-build-registry: ## Build beenet-registry Docker image
@@ -76,16 +77,22 @@ docker-build-dashboard: ## Build beenet-dashboard Docker image
 		-t $(DASHBOARD_IMAGE) \
 		$(DOCKER_CTX)
 
+.PHONY: docker-build-frontdoor
+docker-build-frontdoor: ## Build beenet-frontdoor Docker image
+	docker build -f docker/Dockerfile.frontdoor -t $(FRONTDOOR_IMAGE) $(DOCKER_CTX)
+
 .PHONY: docker-push
 docker-push: ## Push images to the registry
 	docker push $(REGISTRY_IMAGE)
 	docker push $(GATEWAY_IMAGE)
+	docker push $(FRONTDOOR_IMAGE)
 	docker push $(DASHBOARD_IMAGE)
 
 .PHONY: docker-tag-latest
 docker-tag-latest: ## Re-tag current VERSION as :latest
 	docker tag $(REGISTRY_IMAGE) $(REGISTRY)/beenet-registry:latest
 	docker tag $(GATEWAY_IMAGE)  $(REGISTRY)/beenet-gateway:latest
+	docker tag $(FRONTDOOR_IMAGE) $(REGISTRY)/beenet-frontdoor:latest
 	docker tag $(DASHBOARD_IMAGE) $(REGISTRY)/beenet-dashboard:latest
 
 .PHONY: docker-release
@@ -100,22 +107,35 @@ docker-down: ## Stop docker compose dev stack
 	./scripts/dev-up.sh down
 
 # ── Kubernetes ───────────────────────────────────────────────────────────────
+.PHONY: ensure-routing-secret
+ensure-routing-secret: ## Create routing tokens once; preserve them on subsequent deploys
+	./scripts/ensure-routing-secret.sh
+
 .PHONY: deploy
-deploy: ## Apply Kubernetes manifests (registry + gateway)
+deploy: ensure-routing-secret ## Apply Kubernetes manifests (registry + gateway + frontdoor)
 	kubectl apply -f beenet-deploy/registry.yaml
 	kubectl apply -f beenet-deploy/gateway.yaml
+	kubectl apply -f beenet-deploy/frontdoor.yaml
+	kubectl apply -f beenet-deploy/ingress.yaml
 
 .PHONY: deploy-registry
-deploy-registry: ## Deploy only beenet-registry
+deploy-registry: ensure-routing-secret ## Deploy only beenet-registry
+	kubectl apply -f beenet-deploy/redis.yaml
 	kubectl apply -f beenet-deploy/registry.yaml
 
 .PHONY: deploy-gateway
-deploy-gateway: ## Deploy only beenet-gateway
+deploy-gateway: ensure-routing-secret ## Deploy only beenet-gateway
 	kubectl apply -f beenet-deploy/gateway.yaml
+
+.PHONY: deploy-frontdoor
+deploy-frontdoor: ensure-routing-secret ## Deploy only beenet-frontdoor
+	kubectl apply -f beenet-deploy/frontdoor.yaml
 
 .PHONY: undeploy
 undeploy: ## Remove all beenet Kubernetes resources
 	kubectl delete -f beenet-deploy/gateway.yaml  --ignore-not-found
+	kubectl delete -f beenet-deploy/frontdoor.yaml --ignore-not-found
+	kubectl delete -f beenet-deploy/ingress.yaml --ignore-not-found
 	kubectl delete -f beenet-deploy/registry.yaml --ignore-not-found
 
 .PHONY: status

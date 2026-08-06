@@ -1,0 +1,74 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: beenet-redis
+  namespace: beenet
+spec:
+  serviceName: beenet-redis
+  replicas: 1
+  selector:
+    matchLabels:
+      app: beenet-redis
+  template:
+    metadata:
+      labels:
+        app: beenet-redis
+    spec:
+      containers:
+        - name: redis
+          image: hyperos-registry-vpc.cn-hangzhou.cr.aliyuncs.com/beenet/redis:7-alpine
+          command: ["/bin/sh", "-ec"]
+          args:
+            - exec redis-server --appendonly yes --appendfsync everysec --requirepass "$REDIS_PASSWORD"
+          env:
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: beenet-redis-auth
+                  key: redis-password
+          ports:
+            - name: redis
+              containerPort: 6379
+          readinessProbe:
+            exec:
+              command: ["/bin/sh", "-ec", "redis-cli -a \"$REDIS_PASSWORD\" ping | grep PONG"]
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          livenessProbe:
+            exec:
+              command: ["/bin/sh", "-ec", "redis-cli -a \"$REDIS_PASSWORD\" ping | grep PONG"]
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          volumeMounts:
+            - name: data
+              mountPath: /data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: alicloud-disk-essd
+        resources:
+          requests:
+            storage: 20Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: beenet-redis
+  namespace: beenet
+spec:
+  type: ClusterIP
+  selector:
+    app: beenet-redis
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: redis

@@ -11,6 +11,9 @@ replicaCount: 1
 httpAddr: "0.0.0.0:8080"
 libp2pListenAddr: "/ip4/0.0.0.0/tcp/4001"
 publicAddr: ""
+httpUrl: ""
+frontdoorTokenSecretName: "beenet-routing-tokens"
+frontdoorTokenSecretKey: "frontdoor-token"
 # Persistent PeerId for workers to dial (reverse long connection).
 # Mounted read-only from Secret `identitySecretName` (key: identity.key).
 identityKeyPath: "/gateway_cache/identity.key"

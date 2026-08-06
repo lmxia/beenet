@@ -77,6 +77,7 @@ const GATEWAY_TIP_SIZE: usize = 3;
 const STICKY_MOD: u64 = 1_000_000;
 /// Max peer_ids accepted by `POST /v1/workers/lookup`.
 const MAX_LOOKUP_PEER_IDS: usize = 256;
+const MAX_GATEWAY_CONNECTIONS: usize = 10_000;
 
 // ── CLI ────────────────────────────────────────────────────────────────────
 
@@ -96,6 +97,10 @@ struct Args {
     /// If omitted, a random token is generated at startup and still printed.
     #[arg(long)]
     admin_token: Option<String>,
+
+    /// Shared bearer token protecting Front Door route resolution.
+    #[arg(long, env = "BEENET_INTERNAL_TOKEN")]
+    internal_token: Option<String>,
 }
 
 // ── State ──────────────────────────────────────────────────────────────────
@@ -103,6 +108,7 @@ struct Args {
 #[derive(Clone)]
 struct AppState {
     admin_token: String,
+    internal_token: Option<String>,
     join_tokens: Arc<RwLock<HashMap<String, JoinTokenRecord>>>,
     gateway_join_tokens: Arc<RwLock<HashMap<String, JoinTokenRecord>>>,
     /// Workers that have successfully joined (public key stored here for sig verification).
@@ -385,6 +391,8 @@ struct ActiveGateway {
     region: Option<String>,
     capacity: u32,
     connected_workers: u32,
+    connected_worker_peer_ids: Vec<String>,
+    http_url: Option<String>,
     last_seen: Instant,
 }
 
@@ -541,7 +549,9 @@ struct GatewayHeartbeatBody {
     #[serde(default = "default_gateway_capacity")]
     capacity: u32,
     #[serde(default)]
-    connected_workers: u32,
+    connected_worker_peer_ids: Vec<String>,
+    #[serde(default)]
+    http_url: Option<String>,
 }
 
 fn default_gateway_capacity() -> u32 {
@@ -563,6 +573,24 @@ struct GatewayView {
 #[derive(Debug, Serialize)]
 struct GatewaysResponse {
     gateways: Vec<GatewayView>,
+}
+
+#[derive(Debug, Serialize)]
+struct ResolveRoute {
+    gateway_id: String,
+    gateway_peer_id: String,
+    gateway_url: String,
+    worker_peer_id: String,
+    region: Option<String>,
+    load: u32,
+    preferred: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct ResolveResponse {
+    cid: String,
+    ttl_ms: u64,
+    routes: Vec<ResolveRoute>,
 }
 
 #[derive(Debug, Serialize)]
@@ -648,7 +676,7 @@ async fn admin_auth_middleware(
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
-        .map_or(false, |t| t == state.admin_token);
+        .is_some_and(|t| t == state.admin_token);
 
     if !authorized {
         return (StatusCode::UNAUTHORIZED, "invalid or missing admin token").into_response();
@@ -1044,6 +1072,15 @@ async fn post_gateway_heartbeat(
     State(state): State<AppState>,
     Json(body): Json<GatewayHeartbeatBody>,
 ) -> impl IntoResponse {
+    if body.connected_worker_peer_ids.len() > MAX_GATEWAY_CONNECTIONS {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!(
+                "connected_worker_peer_ids must contain at most {MAX_GATEWAY_CONNECTIONS} entries"
+            ),
+        )
+            .into_response();
+    }
     let peer_id = match PeerId::from_str(&body.peer_id) {
         Ok(value) => value,
         Err(_) => return (StatusCode::BAD_REQUEST, "invalid peer_id").into_response(),
@@ -1093,6 +1130,25 @@ async fn post_gateway_heartbeat(
             redis_gateway_put(&mut state.redis.clone(), &peer_id, &snapshot).await;
         }
     }
+    let mut connected_worker_peer_ids: Vec<String> = body
+        .connected_worker_peer_ids
+        .iter()
+        .filter_map(|peer| PeerId::from_str(peer.trim()).ok())
+        .map(|peer| peer.to_string())
+        .collect();
+    connected_worker_peer_ids.sort();
+    connected_worker_peer_ids.dedup();
+    let http_url = match body.http_url {
+        Some(url) => {
+            let url = url.trim().trim_end_matches('/');
+            if !url.starts_with("http://") && !url.starts_with("https://") {
+                return (StatusCode::BAD_REQUEST, "http_url must use http or https")
+                    .into_response();
+            }
+            Some(url.to_string())
+        }
+        None => None,
+    };
     state.gateways.write().await.insert(
         peer_id,
         ActiveGateway {
@@ -1100,7 +1156,9 @@ async fn post_gateway_heartbeat(
             dial_addr: body.dial_addr,
             region,
             capacity: body.capacity.max(1),
-            connected_workers: body.connected_workers,
+            connected_workers: connected_worker_peer_ids.len() as u32,
+            connected_worker_peer_ids,
+            http_url,
             last_seen: Instant::now(),
         },
     );
@@ -1131,7 +1189,7 @@ async fn gateway_views(state: &AppState) -> Vec<GatewayView> {
             })
         })
         .collect();
-    values.sort_by_key(|gateway| gateway_load(gateway));
+    values.sort_by_key(gateway_load);
     values
 }
 
@@ -1228,7 +1286,7 @@ fn select_gateway_tip(
                 .unwrap_or(false);
             // Prefer region-diverse first, then lower load, then sticky.
             let key = (!region_diverse, *load, *sticky);
-            if best_key.map_or(true, |bk| key < bk) {
+            if best_key.is_none_or(|bk| key < bk) {
                 best_key = Some(key);
                 best_idx = Some(idx);
             }
@@ -1349,6 +1407,84 @@ async fn get_dashboard_status(State(state): State<AppState>) -> impl IntoRespons
         gateways,
         workers,
     })
+}
+
+async fn resolve_cid(
+    State(state): State<AppState>,
+    axum::extract::Path(cid): axum::extract::Path<String>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    let Some(expected) = state.internal_token.as_deref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "route resolver is disabled",
+        )
+            .into_response();
+    };
+    let supplied = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "));
+    if supplied != Some(expected) {
+        return (StatusCode::UNAUTHORIZED, "invalid resolver credentials").into_response();
+    }
+    if cid.trim().is_empty() {
+        return (StatusCode::BAD_REQUEST, "cid is required").into_response();
+    }
+    let now = Instant::now();
+    let active = state.active.read().await;
+    let gateways = state.gateways.read().await;
+    let mut routes = Vec::new();
+    for (gateway_peer_id, gateway) in gateways.iter() {
+        if now.duration_since(gateway.last_seen) > STALE_AFTER {
+            continue;
+        }
+        let Some(gateway_url) = gateway.http_url.clone() else {
+            continue;
+        };
+        for worker_peer_id in &gateway.connected_worker_peer_ids {
+            let Ok(worker_peer_id_parsed) = PeerId::from_str(worker_peer_id) else {
+                continue;
+            };
+            let Some(worker) = active.get(&worker_peer_id_parsed) else {
+                continue;
+            };
+            if now.duration_since(worker.last_seen) > STALE_AFTER {
+                continue;
+            }
+            let preferred = worker.supported_cids.is_empty()
+                || worker
+                    .supported_cids
+                    .iter()
+                    .any(|supported| supported == &cid);
+            {
+                routes.push(ResolveRoute {
+                    gateway_id: gateway.gateway_id.clone(),
+                    gateway_peer_id: gateway_peer_id.to_string(),
+                    gateway_url: gateway_url.clone(),
+                    worker_peer_id: worker_peer_id.clone(),
+                    region: gateway.region.clone(),
+                    load: gateway_load(&GatewayView {
+                        gateway_id: gateway.gateway_id.clone(),
+                        peer_id: gateway_peer_id.to_string(),
+                        dial_addr: gateway.dial_addr.clone(),
+                        region: gateway.region.clone(),
+                        capacity: gateway.capacity,
+                        connected_workers: gateway.connected_workers,
+                        last_seen_unix_ms: 0,
+                    }),
+                    preferred,
+                });
+            }
+        }
+    }
+    routes.sort_by_key(|route| (!route.preferred, route.load));
+    Json(ResolveResponse {
+        cid,
+        ttl_ms: 2_000,
+        routes,
+    })
+    .into_response()
 }
 
 async fn health() -> &'static str {
@@ -1478,6 +1614,7 @@ async fn main() -> Result<()> {
 
     let state = AppState {
         admin_token: admin_token.clone(),
+        internal_token: cli.internal_token.filter(|token| !token.trim().is_empty()),
         join_tokens: Arc::new(RwLock::new(HashMap::new())),
         gateway_join_tokens: Arc::new(RwLock::new(HashMap::new())),
         registered: Arc::new(RwLock::new(registered_map)),
@@ -1523,6 +1660,7 @@ async fn main() -> Result<()> {
         .route("/v1/workers/lookup", post(post_workers_lookup))
         .route("/v1/gateways/join", post(post_gateway_join))
         .route("/v1/gateways/heartbeat", post(post_gateway_heartbeat))
+        .route("/v1/internal/routes/resolve/:cid", get(resolve_cid))
         .merge(admin_routes)
         .with_state(state);
 

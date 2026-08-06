@@ -146,6 +146,11 @@ bill = base_fee + compute_fee + resource_fee
 
 ## 4. Gateway 设计
 
+公网调用统一进入 `beenet-frontdoor`。Front Door 按 CID 调用 Registry 的内部 resolve
+接口并短期缓存路由，随后把请求直接代理到持有目标 Worker 反向连接的 Gateway；客户端
+不需要知道 Gateway IP，也不需要 SDK。Gateway heartbeat 同时上报连接的 Worker PeerId
+集合与内部 HTTP URL，Registry 据此建立 `CID → Worker → Gateway` 路由视图。
+
 - 对外 API：`POST /run/ipfs/:cid`、`POST /invoke`、`GET /health`、`GET /metrics`
 - 对内协议：`InvokeRequest` / `InvokeResponse`
 - Status 体系：

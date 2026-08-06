@@ -9,7 +9,7 @@ use anyhow::{anyhow, Context, Result};
 use axum::body::Bytes;
 use axum::extract::{Path as AxumPath, State};
 use axum::http::header::{HeaderValue, ACCESS_CONTROL_ALLOW_ORIGIN};
-use axum::http::{Method, Request, Response, StatusCode};
+use axum::http::{HeaderMap, Method, Request, Response, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
@@ -72,6 +72,14 @@ struct Args {
 
     #[arg(long)]
     capacity: Option<u32>,
+
+    /// HTTP URL advertised to Front Door (for example http://beenet-gateway:8080).
+    #[arg(long)]
+    http_url: Option<String>,
+
+    /// Shared secret required for Front Door targeted routing.
+    #[arg(long, env = "BEENET_FRONTDOOR_TOKEN")]
+    frontdoor_token: Option<String>,
 
     /// Bootstrap join token. Prefer --join-token-stdin or --join-token-file.
     #[arg(long)]
@@ -147,6 +155,7 @@ struct GatewayBehaviour {
 struct AppState {
     client: GatewayClient,
     default_deadline_ms: u32,
+    frontdoor_token: Option<String>,
 }
 
 #[derive(Clone)]
@@ -156,15 +165,21 @@ struct GatewayClient {
 
 struct Command {
     req: InvokeRequest,
+    target_worker: Option<PeerId>,
     respond_to: oneshot::Sender<InvokeResponse>,
 }
 
 impl GatewayClient {
-    async fn invoke(&self, req: InvokeRequest) -> Result<InvokeResponse> {
+    async fn invoke(
+        &self,
+        req: InvokeRequest,
+        target_worker: Option<PeerId>,
+    ) -> Result<InvokeResponse> {
         let (tx, rx) = oneshot::channel();
         self.tx
             .send(Command {
                 req,
+                target_worker,
                 respond_to: tx,
             })
             .await
@@ -252,6 +267,8 @@ async fn main() -> Result<()> {
         gateway_id: cli.gateway_id.clone(),
         region: cli.region.clone(),
         capacity: cli.capacity,
+        http_url: cli.http_url.clone(),
+        frontdoor_token: cli.frontdoor_token.clone(),
     };
     let settings = if path.exists() {
         let file_cfg = load_file(&path)?;
@@ -341,6 +358,7 @@ async fn main() -> Result<()> {
         dial_addr,
         keypair.clone(),
         connected.clone(),
+        settings.http_url.clone(),
     ));
 
     tokio::spawn(registry_peer_refresh_loop(
@@ -365,6 +383,7 @@ async fn main() -> Result<()> {
     let state = AppState {
         client: GatewayClient { tx },
         default_deadline_ms: settings.default_deadline_ms,
+        frontdoor_token: settings.frontdoor_token.clone(),
     };
 
     let app = Router::new()
@@ -428,6 +447,7 @@ fn is_lb_health_probe_addr(addr: &Multiaddr) -> bool {
 async fn run_ipfs(
     AxumPath(cid): AxumPath<String>,
     State(state): State<AppState>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> impl IntoResponse {
     let cid: BeenetCid = match cid.parse() {
@@ -446,7 +466,27 @@ async fn run_ipfs(
         trace_parent: None,
     };
 
-    match state.client.invoke(req).await {
+    let supplied_token = headers
+        .get("x-beenet-frontdoor-token")
+        .and_then(|value| value.to_str().ok());
+    if let Some(expected_token) = state.frontdoor_token.as_deref() {
+        if supplied_token != Some(expected_token) {
+            return (StatusCode::UNAUTHORIZED, "invalid Front Door credentials").into_response();
+        }
+    }
+    let requested_worker = headers
+        .get("x-beenet-target-worker")
+        .and_then(|value| value.to_str().ok());
+    let target_worker = if let Some(worker) = requested_worker {
+        match PeerId::from_str(worker) {
+            Ok(peer) => Some(peer),
+            Err(_) => return (StatusCode::BAD_REQUEST, "invalid target worker").into_response(),
+        }
+    } else {
+        None
+    };
+
+    match state.client.invoke(req, target_worker).await {
         Ok(resp) => into_http_response(resp),
         Err(err) => (
             StatusCode::BAD_GATEWAY,
@@ -548,6 +588,8 @@ struct GatewayHeartbeat {
     region: Option<String>,
     capacity: u32,
     connected_workers: u32,
+    connected_worker_peer_ids: Vec<String>,
+    http_url: Option<String>,
 }
 
 const MAX_LOOKUP_PEER_IDS: usize = 256;
@@ -615,6 +657,8 @@ async fn ensure_gateway_registered(
         region: region.map(str::to_owned),
         capacity: 1,
         connected_workers: 0,
+        connected_worker_peer_ids: Vec::new(),
+        http_url: None,
     };
     let resp = http
         .post(&url)
@@ -648,6 +692,7 @@ async fn ensure_gateway_registered(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn gateway_heartbeat_loop(
     registry_url: String,
     gateway_id: String,
@@ -656,6 +701,7 @@ async fn gateway_heartbeat_loop(
     dial_addr: String,
     keypair: Arc<identity::Keypair>,
     connected: Arc<RwLock<HashSet<PeerId>>>,
+    http_url: Option<String>,
 ) {
     let client = reqwest::Client::new();
     let url = format!(
@@ -674,6 +720,12 @@ async fn gateway_heartbeat_loop(
                 continue;
             }
         };
+        let connected_worker_peer_ids: Vec<String> = connected
+            .read()
+            .await
+            .iter()
+            .map(ToString::to_string)
+            .collect();
         let body = GatewayHeartbeat {
             gateway_id: gateway_id.clone(),
             peer_id: peer_id.clone(),
@@ -682,7 +734,9 @@ async fn gateway_heartbeat_loop(
             dial_addr: dial_addr.clone(),
             region: region.clone(),
             capacity,
-            connected_workers: connected.read().await.len() as u32,
+            connected_workers: connected_worker_peer_ids.len() as u32,
+            connected_worker_peer_ids,
+            http_url: http_url.clone(),
         };
         match client.post(&url).json(&body).send().await {
             Ok(response) if response.status().is_success() => {
@@ -838,6 +892,9 @@ async fn run_swarm_loop(
                 let mut candidates: Vec<(PeerId, WorkerListEntry)> = connected_snap
                     .iter()
                     .filter_map(|peer| {
+                        if cmd.target_worker.is_some_and(|target| target != *peer) {
+                            return None;
+                        }
                         let entry = cache.get(peer)?;
                         let cid_ok = entry.supported_cids.is_empty()
                             || entry
@@ -847,7 +904,7 @@ async fn run_swarm_loop(
                         cid_ok.then(|| (*peer, entry.clone()))
                     })
                     .collect();
-                if candidates.is_empty() {
+                if candidates.is_empty() && cmd.target_worker.is_none() {
                     // Fall back to any connected registered worker (ignore CID hint miss).
                     candidates = connected_snap
                         .iter()

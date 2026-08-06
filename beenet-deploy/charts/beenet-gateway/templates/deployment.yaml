@@ -49,8 +49,18 @@ spec:
             - "--public-addr"
             - "{{ .Values.publicAddr }}"
             {{- end }}
+            {{- if .Values.httpUrl }}
+            - "--http-url"
+            - "{{ .Values.httpUrl }}"
+            {{- end }}
             - "--identity-key-path"
             - "{{ .Values.identityKeyPath }}"
+          env:
+            - name: BEENET_FRONTDOOR_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.frontdoorTokenSecretName }}
+                  key: {{ .Values.frontdoorTokenSecretKey }}
           ports:
             - name: http
               containerPort: {{ .Values.service.port }}

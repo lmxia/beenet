@@ -1,0 +1,61 @@
+# Shared Alibaba Cloud ALB entrypoint for the Beenet HTTP control plane.
+# Dashboard is intentionally excluded; use kubectl port-forward for operations.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: beenet-control-plane
+  namespace: beenet
+spec:
+  ingressClassName: alb
+  rules:
+    - host: registry.hyperos.online
+      http:
+        paths:
+          - path: /v1/workers
+            pathType: Prefix
+            backend:
+              service:
+                name: beenet-registry
+                port:
+                  number: 3030
+          - path: /v1/gateways
+            pathType: Prefix
+            backend:
+              service:
+                name: beenet-registry
+                port:
+                  number: 3030
+          - path: /health
+            pathType: Exact
+            backend:
+              service:
+                name: beenet-registry
+                port:
+                  number: 3030
+    - host: dashboard.hyperos.online
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: beenet-dashboard
+                port:
+                  number: 80
+    - host: frontdoor.hyperos.online
+      http:
+        paths:
+          - path: /run/ipfs
+            pathType: Prefix
+            backend:
+              service:
+                name: beenet-frontdoor
+                port:
+                  number: 80
+          - path: /health
+            pathType: Exact
+            backend:
+              service:
+                name: beenet-frontdoor
+                port:
+                  number: 80

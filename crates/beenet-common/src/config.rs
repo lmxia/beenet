@@ -35,6 +35,10 @@ pub struct GatewaySection {
     pub gateway_id: Option<String>,
     pub region: Option<String>,
     pub capacity: Option<u32>,
+    /// HTTP URL advertised to the Registry for Front Door routing.
+    pub http_url: Option<String>,
+    /// Shared secret accepted from Front Door for targeted internal requests.
+    pub frontdoor_token: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -298,6 +302,8 @@ pub struct GatewaySettings {
     pub gateway_id: Option<String>,
     pub region: Option<String>,
     pub capacity: u32,
+    pub http_url: Option<String>,
+    pub frontdoor_token: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -312,6 +318,8 @@ pub struct GatewayCliOverrides {
     pub gateway_id: Option<String>,
     pub region: Option<String>,
     pub capacity: Option<u32>,
+    pub http_url: Option<String>,
+    pub frontdoor_token: Option<String>,
 }
 
 pub fn require_gateway_section(cfg: &BeenetConfigFile) -> Result<&GatewaySection> {
@@ -405,6 +413,11 @@ fn resolve_gateway_settings_merged(
             DEFAULT_GATEWAY_CAPACITY,
         )
         .max(1),
+        http_url: opt_merge(cli.http_url.clone(), g.and_then(|s| s.http_url.as_ref())),
+        frontdoor_token: opt_merge(
+            cli.frontdoor_token.clone(),
+            g.and_then(|s| s.frontdoor_token.as_ref()),
+        ),
     })
 }
 

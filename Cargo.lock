@@ -460,6 +460,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "beenet-frontdoor"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "beenet-common",
+ "bytes",
+ "clap",
+ "reqwest",
+ "serde",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "beenet-gateway"
 version = "0.1.0"
 dependencies = [

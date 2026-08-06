@@ -23,7 +23,7 @@ spec:
     spec:
       containers:
         - name: dashboard
-          image: teethlink-global-registry.cn-hongkong.cr.aliyuncs.com/beenet/dashboard:latest
+          image: teethlink-global-registry-vpc.cn-hongkong.cr.aliyuncs.com/beenet/dashboard:latest
           imagePullPolicy: Always
           env:
             - name: REGISTRY_UPSTREAM
@@ -59,7 +59,7 @@ metadata:
   labels:
     app: beenet-dashboard
 spec:
-  type: LoadBalancer
+  type: ClusterIP
   selector:
     app: beenet-dashboard
   ports:

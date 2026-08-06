@@ -33,7 +33,7 @@ spec:
     spec:
       containers:
         - name: registry
-          image: teethlink-global-registry.cn-hongkong.cr.aliyuncs.com/beenet/registry:latest
+          image: teethlink-global-registry-vpc.cn-hongkong.cr.aliyuncs.com/beenet/registry:latest
           imagePullPolicy: Always
           command:
             - /bin/sh
@@ -49,6 +49,11 @@ spec:
                 secretKeyRef:
                   name: beenet-redis-auth
                   key: redis-password
+            - name: BEENET_INTERNAL_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: beenet-routing-tokens
+                  key: internal-token
           ports:
             - containerPort: 3030
           livenessProbe:

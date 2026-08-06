@@ -9,6 +9,20 @@ Helm charts for deploying beenet on Kubernetes.
 | `charts/beenet-registry` | Worker registry with Redis persistence + admin API |
 | `charts/beenet-gateway` | HTTP gateway that dispatches invocations to registered workers |
 
+Public invocations should expose `beenet-frontdoor` from `frontdoor.yaml`; Gateway HTTP
+services remain internal. Create `beenet-routing-tokens` as documented in that manifest,
+then configure Registry and Gateway with the same Secret.
+
+`make deploy` automatically creates `beenet-routing-tokens` with two random 256-bit
+tokens when it is absent. Subsequent deploys preserve the existing Secret. The same
+idempotent step is available directly as `make ensure-routing-secret`.
+
+`ingress.yaml` reuses the cluster's `alb` IngressClass for Front Door invocation and
+Registry join/heartbeat APIs. Dashboard stays private. The in-cluster Gateway advertises
+its ClusterIP URL to Registry; a Gateway outside this cluster must instead advertise an
+HTTPS URL reachable by Front Door. When `BEENET_FRONTDOOR_TOKEN` is configured, Gateway
+rejects every invoke request that does not carry the matching internal credential.
+
 ## Quick start
 
 ```bash

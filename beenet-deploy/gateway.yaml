@@ -36,12 +36,24 @@ spec:
             - "0.0.0.0:8080"
             - "--registry-url"
             - "http://beenet-registry:3030"
+            - "--http-url"
+            - "http://beenet-gateway:8080"
+            - "--gateway-id"
+            - "gateway-hk-1"
+            - "--region"
+            - "cn-hongkong"
             - "--libp2p-listen-addr"
             - "/ip4/0.0.0.0/tcp/4001"
             - "--public-addr"
-            - "/ip4/47.76.175.242/tcp/4001"
+            - "/ip4/47.242.13.246/tcp/4001"
             - "--identity-key-path"
             - "/gateway_cache/identity.key"
+          env:
+            - name: BEENET_FRONTDOOR_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: beenet-routing-tokens
+                  key: frontdoor-token
           ports:
             - name: http
               containerPort: 8080
@@ -86,13 +98,26 @@ metadata:
   labels:
     app: beenet-gateway
 spec:
-  type: LoadBalancer
+  type: ClusterIP
   selector:
     app: beenet-gateway
   ports:
     - name: http
       port: 8080
       targetPort: http
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: beenet-gateway-libp2p
+  namespace: beenet
+  labels:
+    app: beenet-gateway
+spec:
+  type: LoadBalancer
+  selector:
+    app: beenet-gateway
+  ports:
     - name: libp2p
       port: 4001
       targetPort: libp2p

@@ -43,6 +43,8 @@ spec:
             - "0.0.0.0:8080"
             - "--registry-url"
             - "http://beenet-registry:3030"
+            - "--http-url"
+            - "http://beenet-gateway-a:8080"
             - "--registry-poll-ms"
             - "2000"
             - "--default-deadline-ms"
@@ -59,6 +61,12 @@ spec:
             - "/dns4/beenet-gateway-a.beenet.svc.cluster.local/tcp/4001"
             - "--identity-key-path"
             - "/gateway_cache/identity.key"
+          env:
+            - name: BEENET_FRONTDOOR_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: beenet-routing-tokens
+                  key: frontdoor-token
           ports:
             - name: http
               containerPort: 8080
@@ -143,6 +151,8 @@ spec:
             - "0.0.0.0:8080"
             - "--registry-url"
             - "http://beenet-registry:3030"
+            - "--http-url"
+            - "http://beenet-gateway-b:8080"
             - "--registry-poll-ms"
             - "2000"
             - "--default-deadline-ms"
@@ -159,6 +169,12 @@ spec:
             - "/dns4/beenet-gateway-b.beenet.svc.cluster.local/tcp/4001"
             - "--identity-key-path"
             - "/gateway_cache/identity.key"
+          env:
+            - name: BEENET_FRONTDOOR_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: beenet-routing-tokens
+                  key: frontdoor-token
           ports:
             - name: http
               containerPort: 8080

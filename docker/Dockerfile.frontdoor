@@ -1,0 +1,19 @@
+FROM rust:1-slim AS builder
+
+WORKDIR /build
+RUN apt-get update && apt-get install -y --no-install-recommends pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+COPY Cargo.toml Cargo.lock ./
+RUN sed -i \
+    -e '/"crates\/beenet-worker"/d' \
+    -e '/"crates\/beenet-factors"/d' \
+    Cargo.toml
+COPY crates/ ./crates/
+RUN cargo build --release -p beenet-frontdoor
+
+FROM debian:bookworm-slim AS runtime
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=builder /build/target/release/beenet-frontdoor /usr/local/bin/beenet-frontdoor
+EXPOSE 8080
+ENTRYPOINT ["beenet-frontdoor"]

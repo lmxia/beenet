@@ -13,7 +13,7 @@
 最短闭环已端到端跑通：
 
 ```text
-curl → Gateway(HTTP) → libp2p → Worker → wasi:http/incoming-handler@0.2 → body 回传
+curl → Front Door(HTTP) → Gateway → libp2p → Worker → wasi:http/incoming-handler@0.2 → body 回传
 ```
 
 **必须** 运行 **`beenet-registry`**：Worker / Gateway 首次入网各用 admin 签发的 **join token**；之后用本地持久化 Ed25519 identity 签名 heartbeat（及 Gateway 的 lookup）。详见 [`target.md` §4.1 / §4.3](./target.md)。
@@ -211,6 +211,7 @@ curl -s -H "Authorization: Bearer beenet-dev-admin-token" \
 | `crates/beenet-registry` | HTTP 控制面（join / heartbeat / lookup） |
 | `crates/beenet-worker` | libp2p Worker（宿主机） |
 | `crates/beenet-gateway` | HTTP → libp2p Gateway |
+| `crates/beenet-frontdoor` | 统一公网 HTTP 入口；按 Registry 路由到持有 Worker 连接的 Gateway |
 | `scripts/dev-up.sh` | 本地分阶段 Docker 启动 |
 | `docker/` | Dockerfile + `docker-compose.dev.yml` |
 | `examples/fair-red-packet-http` | 可复算的公平拼手气红包（推荐端到端示例） |
