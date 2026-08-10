@@ -26,7 +26,7 @@ curl → Front Door(HTTP) → Gateway → libp2p → Worker → wasi:http/incomi
 
 - Rust stable（`rust-toolchain.toml` 已固定）
 - `wasm32-wasip2`：`rustup target add wasm32-wasip2`
-- Docker（本地推荐用 compose 跑 Registry / Gateway / Dashboard；Artifact Store 由 Beenet Cloud 提供）
+- Docker（本地推荐用 compose 跑 Registry / Gateway；用户 Console 由 Beenet Cloud 提供）
 
 ## 本地一键栈（推荐）
 
@@ -48,7 +48,7 @@ make -C ../beenet-cloud storage-up
 
 脚本顺序：
 
-1. 启动 Redis / Registry / Dashboard，并检查 Beenet Cloud Artifact Store
+1. 启动 Redis / Registry，并检查 Beenet Cloud Artifact Store
 2. 签发 gateway join token → `.beenet-dev/gateway-join-token`  
 3. 启动 Gateway（挂载该 token）  
 4. 签发 worker join token → `.beenet-dev/worker-join-token`  
@@ -57,7 +57,6 @@ make -C ../beenet-cloud storage-up
 | --- | --- |
 | http://127.0.0.1:3030 | Registry |
 | http://127.0.0.1:18080 | Gateway HTTP（libp2p `14001`） |
-| http://127.0.0.1:8081 | Dashboard（admin：`beenet-dev-admin-token`） |
 | http://127.0.0.1:9000 | Beenet Cloud MinIO S3（控制台 `:9001`，`minioadmin` / `minioadmin`） |
 
 常用命令：

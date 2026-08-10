@@ -165,6 +165,8 @@ struct Runtime {
     wasm_fetch_base: Option<String>,
     wasm_fetch_bearer: Option<String>,
     wasm_fetch_timeout: Duration,
+    worker_peer_id: String,
+    worker_keypair: Arc<identity::Keypair>,
     default_deadline_ms: u32,
     default_memory_mb: u32,
     max_instance_memory_mb: u32,
@@ -192,7 +194,12 @@ impl ComponentLoader<BeenetFactors, ()> for BeenetComponentLoader {
 }
 
 impl Runtime {
-    fn new(factors_executor: Arc<FactorsExecutor<BeenetFactors, ()>>, s: &WorkerSettings) -> Self {
+    fn new(
+        factors_executor: Arc<FactorsExecutor<BeenetFactors, ()>>,
+        s: &WorkerSettings,
+        worker_peer_id: String,
+        worker_keypair: Arc<identity::Keypair>,
+    ) -> Self {
         let max_concurrency = s.max_concurrency.unwrap_or_else(|| {
             std::thread::available_parallelism()
                 .map(|n| n.get() * 4)
@@ -208,6 +215,8 @@ impl Runtime {
                 .filter(|x| !x.is_empty()),
             wasm_fetch_bearer: s.wasm_fetch_bearer.clone().filter(|x| !x.trim().is_empty()),
             wasm_fetch_timeout: Duration::from_secs(s.wasm_fetch_timeout_secs.max(1)),
+            worker_peer_id,
+            worker_keypair,
             default_deadline_ms: s.default_deadline_ms,
             default_memory_mb: s.default_memory_mb,
             max_instance_memory_mb: s.max_instance_memory_mb,
@@ -281,6 +290,12 @@ impl Runtime {
         let entry = match self.load_task(&req.cid).await {
             Ok(e) => e,
             Err(e) => {
+                warn!(
+                    cid = %req.cid,
+                    request_id = %req.request_id,
+                    error = ?e,
+                    "task load failed"
+                );
                 return Ok(InvokeResponse {
                     request_id: req.request_id.clone(),
                     status: Status::LoadError {
@@ -497,23 +512,23 @@ impl Runtime {
                 path.display()
             );
         };
-        let url = wasm_fetch_url(base, cid);
-        info!(%url, %cid, "fetching wasm into cache");
+        let download_url = self.artifact_download_url(base, cid).await?;
+        info!(url = %download_url, %cid, "fetching wasm into cache");
         let client = reqwest::Client::builder()
             .timeout(self.wasm_fetch_timeout)
             .build()
             .context("build HTTP client for wasm fetch")?;
-        let mut req = client.get(url.clone());
+        let mut req = client.get(download_url.clone());
         if let Some(ref token) = self.wasm_fetch_bearer {
             req = req.bearer_auth(token);
         }
-        let resp = req.send().await.with_context(|| format!("GET {url}"))?;
+        let resp = req.send().await.with_context(|| format!("GET {download_url}"))?;
         if !resp.status().is_success() {
-            anyhow::bail!("wasm fetch from {} returned HTTP {}", url, resp.status());
+            anyhow::bail!("wasm fetch from {} returned HTTP {}", download_url, resp.status());
         }
         let bytes = resp.bytes().await.context("wasm fetch read body")?;
         if bytes.is_empty() {
-            anyhow::bail!("wasm fetch returned empty body from {url}");
+            anyhow::bail!("wasm fetch returned empty body from {download_url}");
         }
         let got = BeenetCid::from_bytes(&bytes);
         if &got != cid {
@@ -526,11 +541,40 @@ impl Runtime {
         info!(path = %path.display(), %cid, "wasm stored in cache after fetch");
         Ok(())
     }
+
+    async fn artifact_download_url(&self, base: &str, cid: &BeenetCid) -> Result<String> {
+        let client = reqwest::Client::builder()
+            .timeout(self.wasm_fetch_timeout)
+            .build()
+            .context("build HTTP client for artifact URL request")?;
+        let url = wasm_fetch_url(base, cid);
+        let timestamp_secs = unix_secs_now();
+        let signature = make_signature(&self.worker_keypair, &self.worker_peer_id, timestamp_secs)?;
+        let resp = client
+            .get(url.clone())
+            .header("x-beenet-worker-peer-id", self.worker_peer_id.as_str())
+            .header("x-beenet-worker-timestamp", timestamp_secs.to_string())
+            .header("x-beenet-worker-signature", signature)
+            .send()
+            .await
+            .with_context(|| format!("GET {url}"))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!("artifact URL request from {url} returned HTTP {status}: {text}");
+        }
+        let parsed: ArtifactDownloadUrlResponse = resp
+            .json()
+            .await
+            .context("parse artifact download URL response")?;
+        Ok(parsed.download_url)
+    }
 }
 
-/// `GET {trimmed_base}/{cid_string}` — the hosted publisher stores artifacts by CID.
+/// `GET {trimmed_base}/{cid_string}/download-url` — Cloud API issues a short-lived URL
+/// only after verifying this worker's registry identity and health.
 fn wasm_fetch_url(base: &str, cid: &BeenetCid) -> String {
-    format!("{}/{}", base.trim_end_matches('/'), cid)
+    format!("{}/{}/download-url", base.trim_end_matches('/'), cid)
 }
 
 fn registry_url(base: &str, path: &str) -> String {
@@ -632,6 +676,11 @@ struct HeartbeatBody {
 struct HeartbeatOkResponse {
     #[serde(default)]
     gateways: Vec<GatewayCandidate>,
+}
+
+#[derive(Deserialize)]
+struct ArtifactDownloadUrlResponse {
+    download_url: String,
 }
 
 // ── Registration & heartbeat logic ────────────────────────────────────────
@@ -1030,18 +1079,24 @@ async fn main() -> Result<()> {
         bootstrap_token = None;
     }
 
-    let factors = BeenetFactors::new();
-    let engine_builder = spin_core::Engine::builder(&spin_core::Config::default())?;
-    let factors_executor = Arc::new(FactorsExecutor::new(engine_builder, factors)?);
-    let runtime = Arc::new(Runtime::new(factors_executor, &settings));
-
     // Load or generate a persistent Ed25519 keypair from wasm_cache_dir/identity.key.
     let local_key = load_or_create_keypair(&settings.wasm_cache_dir)?;
     let local_peer_id = PeerId::from(local_key.public());
+    let keypair_arc = Arc::new(local_key);
+
+    let factors = BeenetFactors::new();
+    let engine_builder = spin_core::Engine::builder(&spin_core::Config::default())?;
+    let factors_executor = Arc::new(FactorsExecutor::new(engine_builder, factors)?);
+    let runtime = Arc::new(Runtime::new(
+        factors_executor,
+        &settings,
+        local_peer_id.to_string(),
+        keypair_arc.clone(),
+    ));
+
     let heartbeat_url = registry_url(&settings.registry_url, &settings.registry_heartbeat_path);
     let join_url = registry_url(&settings.registry_url, "/v1/workers/join");
     let http = reqwest::Client::new();
-    let keypair_arc = Arc::new(local_key);
     let peer_s = local_peer_id.to_string();
 
     // Initial registration: try heartbeat first; if unregistered, attempt join.

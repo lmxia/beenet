@@ -18,7 +18,7 @@ tokens when it is absent. Subsequent deploys preserve the existing Secret. The s
 idempotent step is available directly as `make ensure-routing-secret`.
 
 `ingress.yaml` reuses the cluster's `alb` IngressClass for Front Door invocation and
-Registry join/heartbeat APIs. Dashboard stays private. The in-cluster Gateway advertises
+Registry join/heartbeat APIs. The Operations UI is served by Beenet Cloud Console. The in-cluster Gateway advertises
 its ClusterIP URL to Registry; a Gateway outside this cluster must instead advertise an
 HTTPS URL reachable by Front Door. When `BEENET_FRONTDOOR_TOKEN` is configured, Gateway
 rejects every invoke request that does not carry the matching internal credential.

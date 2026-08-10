@@ -437,6 +437,7 @@ struct TokenListResponse {
 #[derive(Debug, Serialize)]
 struct RegistrationView {
     peer_id: String,
+    public_key: String,
     registered_at_unix_ms: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     name: Option<String>,
@@ -785,6 +786,7 @@ async fn list_registrations(State(state): State<AppState>) -> impl IntoResponse 
         .iter()
         .map(|(pid, rec)| RegistrationView {
             peer_id: pid.to_string(),
+            public_key: STANDARD.encode(rec.public_key.encode_protobuf()),
             registered_at_unix_ms: rec.registered_at_unix_ms,
             name: rec.name.clone(),
             supported_cids: rec.supported_cids.clone(),

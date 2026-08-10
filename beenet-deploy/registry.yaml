@@ -33,7 +33,7 @@ spec:
     spec:
       containers:
         - name: registry
-          image: teethlink-global-registry-vpc.cn-hongkong.cr.aliyuncs.com/beenet/registry:latest
+          image: teethlink-global-registry-vpc.cn-hongkong.cr.aliyuncs.com/beenet/registry:hk-20260810-v1
           imagePullPolicy: Always
           command:
             - /bin/sh
@@ -42,7 +42,8 @@ spec:
             - |
               exec beenet-registry \
                 --http-addr 0.0.0.0:3030 \
-                --redis-url "redis://:${REDIS_PASSWORD}@redis-master.redis.svc.cluster.local:6379/0"
+                --redis-url "redis://:${REDIS_PASSWORD}@redis-master.redis.svc.cluster.local:6379/0" \
+                --admin-token "${REGISTRY_ADMIN_TOKEN}"
           env:
             - name: REDIS_PASSWORD
               valueFrom:
@@ -54,6 +55,11 @@ spec:
                 secretKeyRef:
                   name: beenet-routing-tokens
                   key: internal-token
+            - name: REGISTRY_ADMIN_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: beenet-cloud-secrets
+                  key: registry-admin-token
           ports:
             - containerPort: 3030
           livenessProbe:

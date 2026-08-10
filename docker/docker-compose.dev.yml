@@ -1,4 +1,4 @@
-# Local runtime stack: Redis + registry + gateway + dashboard (worker runs on the host).
+# Local runtime stack: Redis + registry + gateway (worker runs on the host).
 # Artifact storage is owned by the sibling Beenet Cloud stack on :9000/:9001.
 #
 # Prefer the phased helper (creates gateway join token before starting gateway):
@@ -9,7 +9,6 @@
 # exist at ../.beenet-dev/gateway-join-token before `up beenet-gateway`.
 #
 # Admin token (fixed for local compose): beenet-dev-admin-token
-# Dashboard: http://127.0.0.1:8081
 # Gateway HTTP: http://127.0.0.1:18080  libp2p: 14001
 
 services:
@@ -72,21 +71,6 @@ services:
       - "local-gw"
       - "--join-token-file"
       - "/run/secrets/gateway-join-token"
-
-  beenet-dashboard:
-    image: beenet/beenet-dashboard:dev
-    build:
-      context: ..
-      dockerfile: docker/Dockerfile.dashboard
-      args:
-        HTTP_PROXY: ${HTTP_PROXY:-}
-        HTTPS_PROXY: ${HTTPS_PROXY:-}
-    depends_on:
-      - beenet-registry
-    ports:
-      - "8081:80"
-    environment:
-      REGISTRY_UPSTREAM: http://beenet-registry:3030
 
 volumes:
   gateway-cache:

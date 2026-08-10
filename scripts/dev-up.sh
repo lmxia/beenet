@@ -2,7 +2,7 @@
 # Phased local stack: Docker services + host Worker.
 #
 # Order:
-#   1) redis / registry / dashboard
+#   1) redis / registry
 #   2) mint gateway join token
 #   3) gateway (with token file mounted)
 #   4) mint worker join token for host process
@@ -37,7 +37,7 @@ Usage: $0 <command> [options]
 Commands:
   up [--build]   Phased start of Docker stack; print host worker command
   down           Stop compose stack (keeps volumes)
-  status         Show registry dashboard snapshot + compose ps
+  status         Show registry status snapshot + compose ps
   worker-token   Mint a fresh worker join token into $WORKER_TOKEN_FILE
   logs [svc]     Tail compose logs (default: beenet-registry beenet-gateway)
 
@@ -84,7 +84,7 @@ cmd_up() {
     shift || true
   fi
 
-  echo "==> phase 1: redis / registry / dashboard"
+  echo "==> phase 1: redis / registry"
   if [[ "$build" == "1" ]]; then
     # compose 默认可能走 buildx container builder，且会强制访问 Docker Hub
     # 鉴权；本机已有基础镜像时用 default builder + --pull=false 更稳。
@@ -95,10 +95,9 @@ cmd_up() {
       unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy ALL_PROXY all_proxy || true
       docker build --pull=false -f docker/Dockerfile.registry -t beenet/beenet-registry:dev .
       docker build --pull=false -f docker/Dockerfile.gateway -t beenet/beenet-gateway:dev .
-      docker build --pull=false -f docker/Dockerfile.dashboard -t beenet/beenet-dashboard:dev .
     )
   fi
-  "${COMPOSE[@]}" up -d redis beenet-registry beenet-dashboard
+  "${COMPOSE[@]}" up -d redis beenet-registry
   wait_http "${REGISTRY_URL}/health" "registry"
   if ! curl -sf "$ARTIFACT_STORE_HEALTH_URL" >/dev/null; then
     echo "warning: Beenet Cloud artifact store is not running at $ARTIFACT_STORE_HEALTH_URL" >&2
@@ -122,7 +121,6 @@ Stack is up.
 
   Registry:   ${REGISTRY_URL}
   Gateway:    http://127.0.0.1:18080
-  Dashboard:  http://127.0.0.1:8081  (admin: ${ADMIN_TOKEN})
   Artifacts:  http://127.0.0.1:9000  (owned by Beenet Cloud; console :9001)
 
 Gateway join token:  ${GW_TOKEN_FILE}

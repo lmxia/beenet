@@ -1,5 +1,5 @@
 # Shared Alibaba Cloud ALB entrypoint for the Beenet HTTP control plane.
-# Dashboard is intentionally excluded; use kubectl port-forward for operations.
+# Operations UI is provided by Beenet Cloud Console; the Registry status API remains available internally.
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
@@ -32,16 +32,6 @@ spec:
                 name: beenet-registry
                 port:
                   number: 3030
-    - host: dashboard.hyperos.online
-      http:
-        paths:
-          - path: /
-            pathType: Prefix
-            backend:
-              service:
-                name: beenet-dashboard
-                port:
-                  number: 80
     - host: frontdoor.hyperos.online
       http:
         paths:
