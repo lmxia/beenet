@@ -592,6 +592,26 @@ struct GatewayHeartbeat {
     http_url: Option<String>,
 }
 
+fn worker_is_candidate(
+    peer: &PeerId,
+    entry: &WorkerListEntry,
+    target_worker: Option<&PeerId>,
+    cid: &str,
+) -> bool {
+    match target_worker {
+        // Frontdoor already selected this worker. Its CID list is a cache hint,
+        // not a capability boundary; the worker can fetch a missing artifact.
+        Some(target) => target == peer,
+        None => {
+            entry.supported_cids.is_empty()
+                || entry
+                    .supported_cids
+                    .iter()
+                    .any(|supported| supported == cid)
+        }
+    }
+}
+
 const MAX_LOOKUP_PEER_IDS: usize = 256;
 
 async fn do_gateway_join(
@@ -889,19 +909,18 @@ async fn run_swarm_loop(
             Some(cmd) = cmd_rx.recv() => {
                 let cache = worker_cache.read().await;
                 let connected_snap = connected.read().await;
+                let cid = cmd.req.cid.to_string();
                 let mut candidates: Vec<(PeerId, WorkerListEntry)> = connected_snap
                     .iter()
                     .filter_map(|peer| {
-                        if cmd.target_worker.is_some_and(|target| target != *peer) {
-                            return None;
-                        }
                         let entry = cache.get(peer)?;
-                        let cid_ok = entry.supported_cids.is_empty()
-                            || entry
-                                .supported_cids
-                                .iter()
-                                .any(|cid| cid == &cmd.req.cid.to_string());
-                        cid_ok.then(|| (*peer, entry.clone()))
+                        worker_is_candidate(
+                            peer,
+                            entry,
+                            cmd.target_worker.as_ref(),
+                            &cid,
+                        )
+                        .then(|| (*peer, entry.clone()))
                     })
                     .collect();
                 if candidates.is_empty() && cmd.target_worker.is_none() {
@@ -1038,10 +1057,39 @@ async fn run_swarm_loop(
 mod tests {
     use super::*;
 
+    fn worker(peer_id: &PeerId, supported_cids: &[&str]) -> WorkerListEntry {
+        WorkerListEntry {
+            peer_id: peer_id.to_string(),
+            last_seen_unix_ms: 0,
+            supported_cids: supported_cids
+                .iter()
+                .map(|cid| (*cid).to_string())
+                .collect(),
+            loaded_cids: Vec::new(),
+        }
+    }
+
     #[test]
     fn peer_id_from_str_ok() {
         let key = identity::Keypair::generate_ed25519();
         let peer = PeerId::from(key.public());
         assert_eq!(PeerId::from_str(&peer.to_string()).unwrap(), peer);
+    }
+
+    #[test]
+    fn targeted_worker_accepts_uncached_cid() {
+        let peer = PeerId::from(identity::Keypair::generate_ed25519().public());
+        let entry = worker(&peer, &["cached-cid"]);
+
+        assert!(worker_is_candidate(&peer, &entry, Some(&peer), "new-cid"));
+    }
+
+    #[test]
+    fn untargeted_worker_still_uses_cid_cache_hint() {
+        let peer = PeerId::from(identity::Keypair::generate_ed25519().public());
+        let entry = worker(&peer, &["cached-cid"]);
+
+        assert!(!worker_is_candidate(&peer, &entry, None, "new-cid"));
+        assert!(worker_is_candidate(&peer, &entry, None, "cached-cid"));
     }
 }

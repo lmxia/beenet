@@ -29,7 +29,7 @@ spec:
     spec:
       containers:
         - name: gateway
-          image: teethlink-global-registry.cn-hongkong.cr.aliyuncs.com/beenet/gateway:latest
+          image: teethlink-global-registry.cn-hongkong.cr.aliyuncs.com/beenet/gateway:cid-cold-start-20260811
           imagePullPolicy: Always
           args:
             - "--http-addr"
