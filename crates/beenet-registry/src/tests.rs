@@ -184,3 +184,23 @@ mod workers_lookup_tests {
         assert_eq!(MAX_LOOKUP_PEER_IDS, 256);
     }
 }
+
+mod registration_view_tests {
+    use super::*;
+
+    #[test]
+    fn empty_cid_lists_are_serialized_as_arrays() {
+        let view = RegistrationView {
+            peer_id: "worker-peer".to_string(),
+            public_key: "public-key".to_string(),
+            registered_at_unix_ms: 1,
+            name: None,
+            supported_cids: Vec::new(),
+            loaded_cids: Vec::new(),
+        };
+
+        let value = serde_json::to_value(view).expect("registration view should serialize");
+        assert_eq!(value["supported_cids"], serde_json::json!([]));
+        assert_eq!(value["loaded_cids"], serde_json::json!([]));
+    }
+}
