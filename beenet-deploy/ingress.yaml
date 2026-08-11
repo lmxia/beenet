@@ -25,25 +25,11 @@ spec:
                 name: beenet-registry
                 port:
                   number: 3030
-          - path: /health
-            pathType: Exact
-            backend:
-              service:
-                name: beenet-registry
-                port:
-                  number: 3030
-    - host: frontdoor.hyperos.online
+    - host: run.hyperos.online
       http:
         paths:
-          - path: /run/ipfs
+          - path: /
             pathType: Prefix
-            backend:
-              service:
-                name: beenet-frontdoor
-                port:
-                  number: 80
-          - path: /health
-            pathType: Exact
             backend:
               service:
                 name: beenet-frontdoor

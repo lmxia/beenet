@@ -270,6 +270,7 @@ async fn main() -> Result<()> {
     };
     let app = Router::new()
         .route("/health", get(health))
+        .route("/:cid", post(run_ipfs))
         .route("/run/ipfs/:cid", post(run_ipfs))
         .with_state(state);
     info!(http_addr = %args.http_addr, "beenet-frontdoor listening");

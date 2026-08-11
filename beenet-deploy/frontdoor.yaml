@@ -18,7 +18,7 @@ spec:
     spec:
       containers:
         - name: frontdoor
-          image: teethlink-global-registry-vpc.cn-hongkong.cr.aliyuncs.com/beenet/frontdoor:latest
+          image: teethlink-global-registry.cn-hongkong.cr.aliyuncs.com/beenet/frontdoor:hk-20260811-v2
           args:
             - "--http-addr"
             - "0.0.0.0:8080"
