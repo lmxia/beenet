@@ -33,7 +33,7 @@ spec:
     spec:
       containers:
         - name: registry
-          image: teethlink-global-registry.cn-hongkong.cr.aliyuncs.com/beenet/registry:hk-20260811-v2
+          image: teethlink-global-registry.cn-hongkong.cr.aliyuncs.com/beenet/registry:hk-20260811-v3
           imagePullPolicy: Always
           command:
             - /bin/sh

@@ -624,9 +624,9 @@ struct WorkerView {
     last_seen_unix_ms: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     name: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
     supported_cids: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
     loaded_cids: Vec<String>,
 }
 

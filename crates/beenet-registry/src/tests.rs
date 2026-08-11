@@ -203,4 +203,20 @@ mod registration_view_tests {
         assert_eq!(value["supported_cids"], serde_json::json!([]));
         assert_eq!(value["loaded_cids"], serde_json::json!([]));
     }
+
+    #[test]
+    fn dashboard_worker_empty_cid_lists_are_serialized_as_arrays() {
+        let view = WorkerView {
+            peer_id: "worker-peer".to_string(),
+            connected: true,
+            last_seen_unix_ms: 1,
+            name: None,
+            supported_cids: Vec::new(),
+            loaded_cids: Vec::new(),
+        };
+
+        let value = serde_json::to_value(view).expect("worker view should serialize");
+        assert_eq!(value["supported_cids"], serde_json::json!([]));
+        assert_eq!(value["loaded_cids"], serde_json::json!([]));
+    }
 }
