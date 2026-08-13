@@ -1,5 +1,12 @@
 FROM rust:1-slim AS builder
 
+ARG HTTP_PROXY
+ARG HTTPS_PROXY
+ENV HTTP_PROXY=$HTTP_PROXY \
+    HTTPS_PROXY=$HTTPS_PROXY \
+    http_proxy=$HTTP_PROXY \
+    https_proxy=$HTTPS_PROXY
+
 WORKDIR /build
 RUN apt-get update && apt-get install -y --no-install-recommends pkg-config \
     && rm -rf /var/lib/apt/lists/*

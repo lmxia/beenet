@@ -5,6 +5,9 @@
 		},
 		{
 			"path": "../beenet-cloud"
+		},
+		{
+			"path": "../beenet-web"
 		}
 	],
 	"settings": {}

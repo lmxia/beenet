@@ -6,7 +6,12 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use axum::body::Bytes;
 use axum::extract::{Path, State};
-use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
+use axum::http::header::{
+    HeaderValue, ACCESS_CONTROL_ALLOW_HEADERS, ACCESS_CONTROL_ALLOW_METHODS,
+    ACCESS_CONTROL_ALLOW_ORIGIN, ACCESS_CONTROL_EXPOSE_HEADERS, ACCESS_CONTROL_MAX_AGE,
+};
+use axum::http::{HeaderMap, HeaderName, Method, Request, StatusCode};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
@@ -78,6 +83,37 @@ struct AppState {
 
 async fn health() -> &'static str {
     "ok"
+}
+
+fn apply_cors(mut response: Response) -> Response {
+    let headers = response.headers_mut();
+    headers.insert(ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
+    headers.insert(
+        ACCESS_CONTROL_ALLOW_METHODS,
+        HeaderValue::from_static("GET, POST, OPTIONS"),
+    );
+    headers.insert(
+        ACCESS_CONTROL_ALLOW_HEADERS,
+        HeaderValue::from_static("content-type, x-request-id"),
+    );
+    headers.insert(
+        ACCESS_CONTROL_EXPOSE_HEADERS,
+        HeaderValue::from_static("x-beenet-request-id, x-beenet-status, x-beenet-gateway"),
+    );
+    headers.insert(ACCESS_CONTROL_MAX_AGE, HeaderValue::from_static("86400"));
+    response
+}
+
+async fn cors_middleware(req: Request<axum::body::Body>, next: Next) -> impl IntoResponse {
+    if req.method() == Method::OPTIONS {
+        return apply_cors(
+            Response::builder()
+                .status(StatusCode::NO_CONTENT)
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        );
+    }
+    apply_cors(next.run(req).await)
 }
 
 async fn resolve(state: &AppState, cid: &str) -> Result<Vec<Route>, String> {
@@ -272,7 +308,8 @@ async fn main() -> Result<()> {
         .route("/health", get(health))
         .route("/:cid", post(run_ipfs))
         .route("/run/ipfs/:cid", post(run_ipfs))
-        .with_state(state);
+        .with_state(state)
+        .layer(middleware::from_fn(cors_middleware));
     info!(http_addr = %args.http_addr, "beenet-frontdoor listening");
     let listener = tokio::net::TcpListener::bind(args.http_addr).await?;
     axum::serve(listener, app).await?;
