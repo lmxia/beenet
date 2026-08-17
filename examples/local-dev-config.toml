@@ -23,6 +23,14 @@ registry_url = "http://127.0.0.1:3030"
 # Beenet Cloud MinIO public read (bucket `beenet`, path-style URL)
 wasm_fetch_base = "http://127.0.0.1:9000/beenet"
 
+# Optional OS-level worker quota. Linux uses cgroup v2 for CPU/memory/pids.
+# macOS native mode currently supports only nice.
+# [worker.quota]
+# cpu_percent = 25
+# memory_mb = 512
+# pids_max = 128
+# nice = 5
+
 [oss]
 endpoint = "http://127.0.0.1:9000"
 bucket = "beenet"

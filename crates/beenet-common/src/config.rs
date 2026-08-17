@@ -43,6 +43,8 @@ pub struct GatewaySection {
 
 #[derive(Debug, Deserialize, Default)]
 pub struct WorkerSection {
+    /// Execution backend. `native` runs on the host; `vm` uses the macOS vfkit supervisor.
+    pub backend: Option<WorkerBackend>,
     pub listen_addr: Option<String>,
     pub wasm_cache_dir: Option<String>,
     pub default_deadline_ms: Option<u32>,
@@ -62,6 +64,44 @@ pub struct WorkerSection {
     pub region: Option<String>,
     /// Human-readable display name (duplicates allowed; PeerId is the identity).
     pub name: Option<String>,
+    #[serde(default)]
+    pub quota: Option<WorkerQuotaSection>,
+    #[serde(default)]
+    pub vm: Option<WorkerVmSection>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum WorkerBackend {
+    #[default]
+    Native,
+    Vm,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct WorkerVmSection {
+    /// vfkit executable name or absolute path.
+    pub vfkit_path: Option<String>,
+    pub kernel_path: Option<String>,
+    pub initrd_path: Option<String>,
+    pub root_disk_path: Option<String>,
+    pub cpus: Option<u16>,
+    /// Guest RAM. This is the VM envelope, separate from `[worker.quota].memory_mb`.
+    pub memory_mb: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct WorkerQuotaSection {
+    /// Whole-worker CPU budget as a percentage of one logical CPU.
+    /// Linux cgroup v2 maps this to `cpu.max`; macOS currently ignores it.
+    pub cpu_percent: Option<u32>,
+    /// Whole-worker resident/virtual memory cap in MB.
+    pub memory_mb: Option<u32>,
+    /// Whole-worker process/thread cap. Linux cgroup v2 maps this to `pids.max`;
+    /// macOS currently ignores it.
+    pub pids_max: Option<u32>,
+    /// Process niceness adjustment. Positive values lower scheduling priority.
+    pub nice: Option<i32>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -122,6 +162,7 @@ fn pick_bool(cli: Option<bool>, file: Option<bool>, default: bool) -> bool {
 /// Resolved settings for `beenet-worker`.
 #[derive(Clone, Debug)]
 pub struct WorkerSettings {
+    pub backend: WorkerBackend,
     pub listen_addr: String,
     pub wasm_cache_dir: PathBuf,
     pub default_deadline_ms: u32,
@@ -140,6 +181,40 @@ pub struct WorkerSettings {
     pub region: Option<String>,
     /// Human-readable display name (duplicates allowed; PeerId is the identity).
     pub name: Option<String>,
+    /// Optional OS-level quota applied before the worker starts serving work.
+    pub quota: WorkerQuotaSettings,
+    pub vm: WorkerVmSettings,
+}
+
+#[derive(Clone, Debug)]
+pub struct WorkerVmSettings {
+    pub vfkit_path: PathBuf,
+    pub kernel_path: Option<PathBuf>,
+    pub initrd_path: Option<PathBuf>,
+    pub root_disk_path: Option<PathBuf>,
+    pub cpus: u16,
+    pub memory_mb: u32,
+}
+
+impl Default for WorkerVmSettings {
+    fn default() -> Self {
+        Self {
+            vfkit_path: PathBuf::from("vfkit"),
+            kernel_path: None,
+            initrd_path: None,
+            root_disk_path: None,
+            cpus: 2,
+            memory_mb: 1024,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct WorkerQuotaSettings {
+    pub cpu_percent: Option<u32>,
+    pub memory_mb: Option<u32>,
+    pub pids_max: Option<u32>,
+    pub nice: Option<i32>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -159,6 +234,7 @@ pub struct WorkerCliOverrides {
     pub wasm_fetch_timeout_secs: Option<u64>,
     pub region: Option<String>,
     pub name: Option<String>,
+    pub quota: WorkerQuotaSettings,
 }
 
 pub fn require_worker_section(cfg: &BeenetConfigFile) -> Result<&WorkerSection> {
@@ -196,6 +272,7 @@ pub fn resolve_worker_settings(
     .unwrap_or_else(|| DEFAULT_REGISTRY_HEARTBEAT_PATH.to_string());
 
     Ok(WorkerSettings {
+        backend: w.backend.unwrap_or_default(),
         listen_addr,
         wasm_cache_dir,
         default_deadline_ms: pick_u32(
@@ -232,7 +309,74 @@ pub fn resolve_worker_settings(
         .max(1),
         region: opt_merge(cli.region.clone(), w.region.as_ref()),
         name: opt_merge(cli.name.clone(), w.name.as_ref()),
+        quota: merge_worker_quota(
+            w.quota
+                .as_ref()
+                .map(resolve_worker_quota)
+                .unwrap_or_default(),
+            &cli.quota,
+        ),
+        vm: resolve_worker_vm(w.vm.as_ref()),
     })
+}
+
+fn resolve_worker_vm(vm: Option<&WorkerVmSection>) -> WorkerVmSettings {
+    let Some(vm) = vm else {
+        return WorkerVmSettings::default();
+    };
+    WorkerVmSettings {
+        vfkit_path: vm
+            .vfkit_path
+            .as_deref()
+            .and_then(trim_nonempty)
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("vfkit")),
+        kernel_path: vm
+            .kernel_path
+            .as_deref()
+            .and_then(trim_nonempty)
+            .map(PathBuf::from),
+        initrd_path: vm
+            .initrd_path
+            .as_deref()
+            .and_then(trim_nonempty)
+            .map(PathBuf::from),
+        root_disk_path: vm
+            .root_disk_path
+            .as_deref()
+            .and_then(trim_nonempty)
+            .map(PathBuf::from),
+        cpus: vm.cpus.unwrap_or(2).max(1),
+        memory_mb: vm.memory_mb.unwrap_or(1024).max(256),
+    }
+}
+
+fn resolve_worker_quota(q: &WorkerQuotaSection) -> WorkerQuotaSettings {
+    WorkerQuotaSettings {
+        cpu_percent: q.cpu_percent.filter(|v| *v > 0),
+        memory_mb: q.memory_mb.filter(|v| *v > 0),
+        pids_max: q.pids_max.filter(|v| *v > 0),
+        nice: q.nice.map(|v| v.clamp(-20, 20)),
+    }
+}
+
+fn merge_worker_quota(
+    mut file: WorkerQuotaSettings,
+    cli: &WorkerQuotaSettings,
+) -> WorkerQuotaSettings {
+    if cli.cpu_percent.is_some() {
+        file.cpu_percent = cli.cpu_percent;
+    }
+    if cli.memory_mb.is_some() {
+        file.memory_mb = cli.memory_mb;
+    }
+    if cli.pids_max.is_some() {
+        file.pids_max = cli.pids_max;
+    }
+    if cli.nice.is_some() {
+        file.nice = cli.nice;
+    }
+    file
 }
 
 /// S3-compatible settings retained for hosted publishers and local compatibility.
@@ -496,5 +640,42 @@ mod tests {
         f.worker.as_mut().unwrap().region = Some("cn-hangzhou".into());
         let s = resolve_worker_settings(&f, &WorkerCliOverrides::default()).unwrap();
         assert_eq!(s.region.as_deref(), Some("cn-hangzhou"));
+    }
+
+    #[test]
+    fn worker_vm_backend_and_quota_are_resolved() {
+        let config: BeenetConfigFile = toml::from_str(
+            r#"
+            [worker]
+            backend = "vm"
+            registry_url = "https://registry.example"
+
+            [worker.quota]
+            cpu_percent = 25
+            memory_mb = 512
+            pids_max = 128
+            nice = 5
+
+            [worker.vm]
+            kernel_path = "/opt/beenet/vmlinuz"
+            root_disk_path = "/opt/beenet/root.raw"
+            cpus = 4
+            memory_mb = 2048
+            "#,
+        )
+        .unwrap();
+        let settings = resolve_worker_settings(&config, &WorkerCliOverrides::default()).unwrap();
+
+        assert_eq!(settings.backend, WorkerBackend::Vm);
+        assert_eq!(settings.quota.cpu_percent, Some(25));
+        assert_eq!(settings.quota.memory_mb, Some(512));
+        assert_eq!(settings.quota.pids_max, Some(128));
+        assert_eq!(settings.quota.nice, Some(5));
+        assert_eq!(settings.vm.cpus, 4);
+        assert_eq!(settings.vm.memory_mb, 2048);
+        assert_eq!(
+            settings.vm.root_disk_path,
+            Some(PathBuf::from("/opt/beenet/root.raw"))
+        );
     }
 }

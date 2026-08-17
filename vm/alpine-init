@@ -1,0 +1,104 @@
+#!/bin/sh
+set -eu
+
+worker_pid=""
+
+power_off() {
+    status=$?
+    trap - EXIT INT TERM HUP
+    if [ -n "$worker_pid" ]; then
+        kill -TERM "$worker_pid" 2>/dev/null || true
+        wait "$worker_pid" 2>/dev/null || true
+    fi
+    mkdir -p /proc /sys 2>/dev/null || true
+    mount -t proc proc /proc 2>/dev/null || true
+    mount -t sysfs sysfs /sys 2>/dev/null || true
+    sync
+    # Alpine virt busybox does not ship poweroff/reboot applets. Request a real
+    # poweroff so vfkit exits; never reboot, which would keep the hypervisor
+    # alive and skip launchd KeepAlive.
+    if [ -w /proc/sys/kernel/sysrq ]; then
+        printf '1\n' >/proc/sys/kernel/sysrq 2>/dev/null || true
+    fi
+    if [ -w /proc/sysrq-trigger ]; then
+        printf o >/proc/sysrq-trigger 2>/dev/null || true
+    fi
+    /bin/busybox poweroff -f 2>/dev/null || true
+    sleep 30 2>/dev/null || true
+    exit "$status"
+}
+
+forward_signal() {
+    [ -z "$worker_pid" ] || kill -TERM "$worker_pid" 2>/dev/null || true
+}
+
+trap power_off EXIT
+trap forward_signal INT TERM HUP
+
+/bin/busybox --install -s
+mkdir -p /proc /sys /dev /run /mnt/beenet-config /var/lib/beenet
+mount -t proc proc /proc 2>/dev/null || true
+mount -t sysfs sysfs /sys 2>/dev/null || true
+mount -t devtmpfs devtmpfs /dev 2>/dev/null || true
+mount -t devpts devpts /dev/pts 2>/dev/null || true
+
+modprobe virtio_mmio 2>/dev/null || true
+modprobe virtiofs 2>/dev/null || true
+modprobe virtio_net 2>/dev/null || true
+mount -t cgroup2 cgroup2 /sys/fs/cgroup 2>/dev/null || true
+mount -t virtiofs beenet-config /mnt/beenet-config
+mount -t virtiofs beenet-state /var/lib/beenet
+mkdir -p /var/lib/beenet/logs
+{
+    echo "loading virtio-net and requesting DHCP"
+    iface=""
+    i=0
+    while [ "$i" -lt 20 ]; do
+        for n in /sys/class/net/*; do
+            name=${n##*/}
+            [ "$name" = lo ] && continue
+            iface=$name
+            break
+        done
+        [ -n "$iface" ] && break
+        i=$((i + 1))
+        sleep 1
+    done
+    if [ -z "$iface" ]; then
+        echo "no guest network interface after loading virtio_net" >&2
+    else
+        echo "using interface $iface"
+        ifconfig "$iface" up 2>/dev/null || ip link set "$iface" up 2>/dev/null || true
+        if command -v udhcpc >/dev/null 2>&1; then
+            udhcpc -q -n -i "$iface" || true
+        fi
+        ifconfig "$iface" 2>/dev/null || ip addr show "$iface" 2>/dev/null || true
+        cat /etc/resolv.conf 2>/dev/null || true
+    fi
+} >>/var/lib/beenet/logs/worker.log 2>&1
+export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+
+cmdline="$(cat /proc/cmdline 2>/dev/null || true)"
+config_name="$(printf '%s\n' "$cmdline" | sed -n 's/.*\bbeenet\.config=\([^ ]*\).*/\1/p')"
+config_name="${config_name:-config.toml}"
+config="/mnt/beenet-config/$config_name"
+[ -f "$config" ] || {
+    echo "missing guest worker config: $config" >&2
+    exit 1
+}
+
+export BEENET_VM_GUEST=1
+/usr/local/bin/beenet-worker \
+    --config "$config" \
+    --wasm-cache-dir /var/lib/beenet \
+    run-internal >>/var/lib/beenet/logs/worker.log 2>&1 &
+worker_pid=$!
+
+set +e
+wait "$worker_pid"
+worker_status=$?
+set -e
+worker_pid=""
+echo "beenet guest worker exited with status $worker_status; powering off" \
+    >>/var/lib/beenet/logs/worker.log
+exit "$worker_status"

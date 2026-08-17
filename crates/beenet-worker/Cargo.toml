@@ -37,3 +37,4 @@ async-trait = { workspace = true }
 bytes = { workspace = true }
 base64 = { workspace = true }
 serde_json = { workspace = true }
+libc = { workspace = true }

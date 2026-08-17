@@ -1,0 +1,19 @@
+schema_version = 1
+
+[task]
+name = "quota-stress-http"
+version = "0.1.0"
+interface = "wasi:http/incoming-handler@0.2"
+
+[runtime]
+max_memory_mb = 256
+deadline_ms = 10000
+
+[networking]
+allowed_outbound_hosts = []
+
+[ai]
+allowed_models = []
+
+[audit]
+cpu_reporting = "wall"

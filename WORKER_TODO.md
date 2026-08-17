@@ -59,6 +59,15 @@ worker abstraction.
 | Windows | Job Objects | Good fit for process tree CPU and memory limits. |
 | macOS | rlimit, priority, process policy | Weaker than cgroup; may need conservative defaults. |
 
+The initial macOS backend split is now `native` (nice only) and `vm` (vfkit /
+Apple Virtualization.framework supervising a dedicated Linux guest). The guest runs
+`beenet-worker run-internal` and uses the same Linux cgroup v2 implementation. This is
+deliberately not a Docker Desktop runtime dependency. The Linux/arm64 worker is built natively
+inside a multi-stage Alpine Docker build, so macOS does not need a Linux Rust target, Zig, LLVM,
+or another cross toolchain. The initial Alpine initramfs and real vfkit boot have been validated
+with `cpu.max`, `memory.max`, and `pids.max` applied.
+The guest PID 1 also shuts down Linux when the worker exits so launchd can restart vfkit cleanly.
+
 The worker should expose one product-level quota model, then translate it to
 the best local backend.
 
@@ -175,3 +184,17 @@ app exists.
 6. Add macOS conservative quota backend.
 7. Build Tauri desktop control app.
 8. Package native installers and service integration.
+
+## macOS VM Follow-ups
+
+- Build, sign, publish, and verify the minimal kernel/initrd/root-disk bundle.
+- Add atomic image updates, rollback, and garbage collection.
+- Package the existing guest init, Docker-built worker, and verified Alpine kernel as a signed
+  release artifact instead of requiring users to run the developer image-build script.
+- Add a guest agent or vsock health protocol so `status` reports worker readiness rather than
+  only the vfkit process state.
+- Add a one-time enrollment flow that passes bootstrap credentials over a temporary protected
+  channel and never uses process arguments, kernel parameters, config logs, or image layers.
+- Validate vfkit device syntax and boot behavior in macOS CI on both Apple Silicon and Intel,
+  where supported.
+- Define host-to-guest networking/DNS for control-plane URLs that currently use localhost.

@@ -18,7 +18,7 @@ curl → Front Door(HTTP) → Gateway → libp2p → Worker → wasi:http/incomi
 
 **必须** 运行 **`beenet-registry`**：Worker / Gateway 首次入网各用 admin 签发的 **join token**；之后用本地持久化 Ed25519 identity 签名 heartbeat（及 Gateway 的 lookup）。详见 [`target.md` §4.1 / §4.3](./target.md)。
 
-**Wasm 构建与发布**由相邻的 **Beenet Cloud** 项目负责；本仓库保留 CID、manifest 和 Artifact 校验协议。Worker 配置 **`wasm_fetch_base`**，缓存未命中时按 CID 拉取产物。
+**Wasm 构建与发布**由相邻的 **Beenet Cloud** 项目负责；本仓库保留 CID、manifest 和 Artifact 校验协议。Worker 配置 **`wasm_fetch_base`**，缓存未命中时先向 Cloud API 请求短期下载 URL，再按 CID 拉取并校验产物。
 
 档 0 接口走 W3C 标准 `wasi:http/incoming-handler@0.2`（`spin-sdk` + `#[http_component]`）。
 
@@ -76,11 +76,38 @@ make -C ../beenet-cloud storage-up
 cargo build --release -p beenet-worker
 
 ./target/release/beenet-worker \
+  join \
   --config examples/local-dev-config.toml \
-  --join-token-file .beenet-dev/worker-join-token
+  --registry-url http://127.0.0.1:3030 \
+  --join-token-file .beenet-dev/worker-join-token \
+  --quota-nice 5
 ```
 
-首次 join 成功后可删除临时 token 文件；重启复用 `wasm_cache_dir/identity.key`。`--join-token-stdin` 亦可；避免把明文写进 shell history。
+如果 `--config` 指向的文件不存在，`join` 会用参数初始化本机 worker 配置，包括显式传入的
+quota，但不会写入 join token。`join` 成功后会直接运行并承接任务。首次 join 成功后可删除
+临时 token 文件；后续后台启动复用 `wasm_cache_dir/identity.key`：
+
+```bash
+./target/release/beenet-worker --config examples/local-dev-config.toml start
+./target/release/beenet-worker --config examples/local-dev-config.toml status
+./target/release/beenet-worker --config examples/local-dev-config.toml stop
+```
+
+启动方式约定：
+
+- 人在终端里手动启动：使用 `start`，它会在后台拉起 worker 并返回 shell。
+- 系统服务管理器启动：使用隐藏入口 `run-internal`，让 launchd/systemd 直接守护真正的 worker 进程。
+
+macOS LaunchAgent 示例中的 `ProgramArguments` 应指向：
+
+```text
+/path/to/beenet-worker --config /path/to/config.toml run-internal
+```
+
+Linux systemd service 的 `ExecStart` 也应使用同样形式，而不是 `start`。
+
+`--join-token-stdin` 亦可；避免把明文写进 shell history。当前 daemon 生命周期命令优先支持
+macOS / Linux，并按本机唯一 worker 管理。
 
 ## 配置文件
 
@@ -93,8 +120,26 @@ cargo build --release -p beenet-worker
 
 ```toml
 [worker]
+backend = "native" # "native" or macOS host mode "vm"
 registry_url = "http://127.0.0.1:3030"
 wasm_fetch_base = "http://127.0.0.1:9000/beenet"
+
+# Optional OS-level quota, applied before the worker starts serving tasks.
+# Linux uses cgroup v2 for CPU/memory/pids. macOS native mode currently supports only nice.
+# [worker.quota]
+# cpu_percent = 25
+# memory_mb = 512
+# pids_max = 128
+# nice = 5
+
+# macOS vfkit supervisor settings. Required only for backend = "vm".
+# [worker.vm]
+# vfkit_path = "/opt/homebrew/bin/vfkit"
+# kernel_path = "/Library/Application Support/Beenet/vm/vmlinuz"
+# initrd_path = "/Library/Application Support/Beenet/vm/initrd.img"
+# root_disk_path = "/Library/Application Support/Beenet/vm/root.raw" # optional
+# cpus = 2
+# memory_mb = 1024
 
 [oss]
 endpoint = "http://127.0.0.1:9000"
@@ -103,6 +148,78 @@ access_key_id = "minioadmin"
 access_key_secret = "minioadmin"
 region = "us-east-1"
 force_path_style = true
+```
+
+### macOS isolated VM backend (initial version)
+
+`backend = "native"` preserves the lightweight host process. On macOS it accepts only
+`quota.nice`; configuring `cpu_percent`, `memory_mb`, or `pids_max` fails with an explicit
+request to use `backend = "vm"`. Wasmtime's per-instance memory/deadline controls still apply
+in either mode.
+
+`backend = "vm"` is a minimal vfkit supervisor built on Apple Virtualization.framework. It
+does not use Docker Desktop, containerd, or dockerd at runtime. Docker is used only as a native
+Linux/arm64 build environment, avoiding a Rust Linux cross toolchain on the Mac. Install vfkit
+(for example `brew install vfkit`) and build the Alpine kernel/initramfs bundle with:
+
+```sh
+scripts/build-macos-vm-image.sh
+```
+
+The script verifies the Alpine 3.24.1 virt ISO checksum, builds `beenet-worker` in the
+multi-stage [`docker/Dockerfile.worker-vm`](docker/Dockerfile.worker-vm), and writes artifacts
+under `~/Library/Caches/beenet/vm/alpine-3.24.1`. The Docker build needs the sibling Spin checkout
+at `../spin`; proxy settings can be passed as `BEENET_DOCKER_HTTP_PROXY` and
+`BEENET_DOCKER_HTTPS_PROXY`. Do not pass credentials as build arguments. Configure
+`kernel_path` with the extracted Alpine `boot/Image` and `initrd_path` with the generated
+`beenet-alpine-3.24.1-aarch64-initramfs.img`. A raw root disk is optional because this image boots
+entirely from initramfs and keeps persistent state in the virtio-fs state share.
+
+The supervisor attaches NAT networking and two virtio-fs shares:
+
+| Mount tag | Host path | Required guest mount |
+| --- | --- | --- |
+| `beenet-config` | directory containing `config.toml` | `/mnt/beenet-config` |
+| `beenet-state` | configured `wasm_cache_dir` | `/var/lib/beenet` |
+
+The guest image's init must mount those tags, mount cgroup v2 at `/sys/fs/cgroup`, and execute:
+
+```sh
+BEENET_VM_GUEST=1 /usr/local/bin/beenet-worker \
+  --config /mnt/beenet-config/config.toml \
+  --wasm-cache-dir /var/lib/beenet \
+  run-internal
+```
+
+The config filename is also supplied as the non-secret kernel parameter `beenet.config=...` so
+the init can handle names other than `config.toml`. The init should redirect persistent worker
+logs to `/var/lib/beenet/logs/worker.log`. Because the complete state directory is shared,
+`identity.key`, compiled/downloaded Wasm cache entries, PID state, and logs survive VM restarts.
+The supervisor never copies or logs join tokens or bearer credentials. Initial VM enrollment is
+not wired yet: create/enroll the persistent identity before switching to VM mode, or build a guest
+provisioning flow that reads a temporary secret without placing it on the kernel command line.
+
+The guest init remains PID 1. Alpine virt busybox has no `poweroff` applet, so after
+`run-internal` exits the init writes sysrq `o` to power off Linux. vfkit therefore exits,
+and launchd `KeepAlive` restarts the complete VM instead of leaving an idle Linux guest
+behind. On macOS, `beenet-worker start` with `backend = "vm"` writes
+`~/Library/LaunchAgents/com.beenet.worker.plist` (`KeepAlive` must be unconditional `true`,
+because guest poweroff is a successful vfkit exit) and bootstraps it. The plist still runs
+`run-internal`, not `start`.
+
+Inside Linux, `run-internal` writes `cpu.max`, `memory.max`, and `pids.max` in a cgroup v2 child
+before serving tasks. The guest init must run it as root or delegate a writable cgroup subtree.
+Also note that `127.0.0.1` inside the VM is the guest, not the macOS host; registry and artifact
+URLs must be reachable through the VM NAT network. The init loads `virtio_net` and runs DHCP
+before starting the worker.
+
+The current arm64 initramfs is about 22 MB compressed (the stripped worker is about 32 MB before
+compression). Product bundles should still budget 80-200 MB for a dedicated minimal microVM, or
+200-500 MB with debugging tools, rollback data, and update caches. It contains no Docker daemon,
+containerd, or OpenSSL runtime; TLS uses rustls with native CA roots.
+
+```text
+/path/to/beenet-worker --config /path/to/config.toml start
 ```
 
 ## 端到端示例
@@ -146,8 +263,11 @@ Artifact 的对象 key 是 CID 本身，不带 `.wasm` 后缀；Builder 容器�
 
 ```bash
 ./target/release/beenet-worker \
+  join \
   --config examples/local-dev-config.toml \
-  --join-token-file .beenet-dev/worker-join-token
+  --registry-url http://127.0.0.1:3030 \
+  --join-token-file .beenet-dev/worker-join-token \
+  --quota-nice 5
 
 curl -i -X POST "http://127.0.0.1:18080/run/ipfs/$CID" \
   -H 'content-type: application/json' \
@@ -192,7 +312,7 @@ curl -s -H "Authorization: Bearer beenet-dev-admin-token" \
 ### 故障排查（简）
 
 - **connection refused**：`./scripts/dev-up.sh status`，确认 Gateway `18080` 与 Worker 在跑。
-- **load-error**：Wasm 未上传到 `{wasm_fetch_base}/{CID}`、对象名错误地带了 `.wasm`，或本地缓存目录不可写。
+- **load-error**：Wasm 未发布、`{wasm_fetch_base}/{CID}/download-url` 不可用、返回的短期下载 URL 指向了错误对象，或本地缓存目录不可写。
 - **Gateway 起不来**：是否跳过了 `dev-up.sh`、直接 compose up？需先有 `.beenet-dev/gateway-join-token`。
 
 ## 写你自己的任务

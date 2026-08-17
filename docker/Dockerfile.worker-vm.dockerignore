@@ -1,0 +1,12 @@
+.git
+.env
+.env.*
+target
+dist
+.beenet-dev
+wasm_cache
+wasm_cache_dir
+**/identity.key
+**/*.wasm
+**/*.log
+examples/quota-stress-http/target

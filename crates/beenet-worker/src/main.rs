@@ -1,12 +1,15 @@
 //! Beenet M1.5 worker: libp2p invoke + Spin [`FactorsExecutor`](spin_factors_executor::FactorsExecutor)
 //! (flat [`BeenetFactors`](beenet_factors::BeenetFactors)) + wasi:http p2.
 
+mod backend;
 mod executor;
+mod quota;
 
 use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -15,11 +18,14 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD, Engine};
 use beenet_artifact::Manifest;
-use beenet_common::config::{resolve_config_path_with_cli, WorkerCliOverrides, WorkerSettings};
+use beenet_common::config::{
+    resolve_config_path_with_cli, WorkerBackend, WorkerCliOverrides, WorkerQuotaSettings,
+    WorkerSettings,
+};
 use beenet_common::proto::{InvokeRequest, InvokeResponse, LoadStage, Status, TimeoutStage, Usage};
 use beenet_common::{BeenetCid, INVOKE_PROTOCOL};
 use beenet_factors::BeenetFactors;
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use futures::StreamExt;
 use libp2p::request_response::{self, ProtocolSupport};
 use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
@@ -32,75 +38,114 @@ use tokio::sync::{watch, RwLock, Semaphore};
 use tracing::{info, warn};
 
 use crate::executor::{invoke_prepared, load_factors_app, ExecOutcome};
+use crate::quota::apply_os_quota;
 
 /// CLI overrides for fields also set in `config.toml` under `[worker]`.
 #[derive(Parser, Debug, Clone)]
 #[command(name = "beenet-worker", about = "Beenet worker (M1.5 factors)")]
 struct Args {
     /// `config.toml` path (default: platform config dir `beenet/config.toml`).
-    #[arg(long, value_name = "PATH")]
+    #[arg(long, global = true, value_name = "PATH")]
     config: Option<PathBuf>,
 
-    #[arg(long)]
+    #[arg(long, global = true)]
     listen_addr: Option<String>,
 
-    #[arg(long)]
+    #[arg(long, global = true)]
     wasm_cache_dir: Option<PathBuf>,
 
-    #[arg(long)]
+    #[arg(long, global = true)]
     default_deadline_ms: Option<u32>,
 
-    #[arg(long)]
+    #[arg(long, global = true)]
     default_memory_mb: Option<u32>,
 
     /// Worker-wide hard cap (L1) on per-instance linear memory (`target.md` D14).
-    #[arg(long)]
+    #[arg(long, global = true)]
     max_instance_memory_mb: Option<u32>,
 
-    #[arg(long)]
+    #[arg(long, global = true)]
     max_concurrency: Option<usize>,
 
     /// HTTP registry base URL; overrides `[worker].registry_url` in config.
-    #[arg(long)]
+    #[arg(long, global = true)]
     registry_url: Option<String>,
 
     /// Heartbeat `POST` path; overrides `[worker].registry_heartbeat_path`.
-    #[arg(long)]
+    #[arg(long, global = true)]
     registry_heartbeat_path: Option<String>,
 
     /// Bootstrap join token. Prefer --join-token-stdin or --join-token-file so
     /// the token is not exposed in shell history or the process list.
-    #[arg(long)]
+    #[arg(long, global = true)]
     join_token: Option<String>,
 
     /// Read the bootstrap join token from a temporary secret file.
-    #[arg(long, value_name = "PATH")]
+    #[arg(long, global = true, value_name = "PATH")]
     join_token_file: Option<PathBuf>,
 
     /// Read the bootstrap join token from stdin.
-    #[arg(long)]
+    #[arg(long, global = true)]
     join_token_stdin: bool,
 
-    #[arg(long)]
+    #[arg(long, global = true)]
     registry_heartbeat_secs: Option<u64>,
 
     /// Optional `GET {base}/{cid}` base for wasm cache misses.
-    #[arg(long)]
+    #[arg(long, global = true)]
     wasm_fetch_base: Option<String>,
 
-    #[arg(long)]
+    #[arg(long, global = true)]
     wasm_fetch_bearer: Option<String>,
 
-    #[arg(long)]
+    #[arg(long, global = true)]
     wasm_fetch_timeout_secs: Option<u64>,
 
     /// Optional region for Registry Gateway affinity (overrides `[worker].region`).
-    #[arg(long)]
+    #[arg(long, global = true)]
     region: Option<String>,
 
     /// Human-readable display name (duplicates allowed; PeerId is the identity).
-    #[arg(long)]
+    #[arg(long, global = true)]
     name: Option<String>,
+
+    /// Whole-worker CPU budget as a percentage of one logical CPU.
+    #[arg(long, global = true)]
+    quota_cpu_percent: Option<u32>,
+
+    /// Whole-worker memory cap in MB.
+    #[arg(long, global = true)]
+    quota_memory_mb: Option<u32>,
+
+    /// Whole-worker process/thread cap.
+    #[arg(long, global = true)]
+    quota_pids_max: Option<u32>,
+
+    /// Process niceness adjustment. Positive values lower scheduling priority.
+    #[arg(long, global = true)]
+    quota_nice: Option<i32>,
+
+    #[command(subcommand)]
+    command: Option<WorkerCommand>,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+enum WorkerCommand {
+    /// Join the Beenet network and run in the foreground.
+    Join,
+    /// Start the local worker in the background.
+    Start,
+    /// Stop the background worker.
+    Stop,
+    /// Show local worker status.
+    Status,
+    /// Remove local worker state. The worker must be stopped first.
+    Remove,
+    /// Alias for `remove`.
+    Rm,
+    /// Internal entrypoint used by `start`.
+    #[command(hide = true)]
+    RunInternal,
 }
 
 #[derive(NetworkBehaviour)]
@@ -115,10 +160,7 @@ fn trimmed_token(value: String) -> Option<String> {
     (!value.is_empty()).then_some(value)
 }
 
-fn bootstrap_token(
-    cli: &Args,
-    legacy_config_token: Option<String>,
-) -> Result<(Option<String>, bool)> {
+fn bootstrap_token(cli: &Args) -> Result<Option<String>> {
     let explicit_sources = cli.join_token.is_some() as usize
         + cli.join_token_file.is_some() as usize
         + cli.join_token_stdin as usize;
@@ -128,28 +170,21 @@ fn bootstrap_token(
 
     if let Some(token) = cli.join_token.clone().and_then(trimmed_token) {
         warn!("--join-token may expose the bootstrap token; prefer stdin or a secret file");
-        return Ok((Some(token), false));
+        return Ok(Some(token));
     }
     if let Some(path) = cli.join_token_file.as_ref() {
         let token = fs::read_to_string(path)
             .with_context(|| format!("read join token file `{}`", path.display()))?;
-        return Ok((trimmed_token(token), false));
+        return Ok(trimmed_token(token));
     }
     if cli.join_token_stdin {
         let mut token = String::new();
         io::stdin()
             .read_to_string(&mut token)
             .context("read join token from stdin")?;
-        return Ok((trimmed_token(token), false));
+        return Ok(trimmed_token(token));
     }
-    if let Some(token) = legacy_config_token.and_then(trimmed_token) {
-        warn!(
-            "[worker].join_token is deprecated and only bootstraps a brand-new identity; \
-             use --join-token-stdin or --join-token-file"
-        );
-        return Ok((Some(token), true));
-    }
-    Ok((None, false))
+    Ok(None)
 }
 
 pub struct TaskEntry {
@@ -522,9 +557,16 @@ impl Runtime {
         if let Some(ref token) = self.wasm_fetch_bearer {
             req = req.bearer_auth(token);
         }
-        let resp = req.send().await.with_context(|| format!("GET {download_url}"))?;
+        let resp = req
+            .send()
+            .await
+            .with_context(|| format!("GET {download_url}"))?;
         if !resp.status().is_success() {
-            anyhow::bail!("wasm fetch from {} returned HTTP {}", download_url, resp.status());
+            anyhow::bail!(
+                "wasm fetch from {} returned HTTP {}",
+                download_url,
+                resp.status()
+            );
         }
         let bytes = resp.bytes().await.context("wasm fetch read body")?;
         if bytes.is_empty() {
@@ -584,6 +626,454 @@ fn registry_url(base: &str, path: &str) -> String {
     } else {
         format!("{base}/{path}")
     }
+}
+
+fn is_join_command(cli: &Args) -> bool {
+    matches!(cli.command, None | Some(WorkerCommand::Join))
+}
+
+fn ensure_config_for_run(cli: &Args, argv: &[String]) -> Result<PathBuf> {
+    let path = resolve_config_path_with_cli(cli.config.clone(), argv);
+    if path.exists() {
+        return Ok(path);
+    }
+    if !is_join_command(cli) {
+        anyhow::bail!(
+            "missing config file `{}` (run `beenet-worker join --registry-url ...` first)",
+            path.display()
+        );
+    }
+    create_join_config(cli, &path)?;
+    Ok(path)
+}
+
+fn create_join_config(cli: &Args, path: &Path) -> Result<()> {
+    let registry_url = cli.registry_url.as_deref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "missing config file `{}`; pass --registry-url so join can initialize it",
+            path.display()
+        )
+    })?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("create `{}`", parent.display()))?;
+    }
+
+    let mut out = String::from("[worker]\n");
+    push_toml_string(&mut out, "registry_url", registry_url);
+    if let Some(value) = cli.listen_addr.as_deref() {
+        push_toml_string(&mut out, "listen_addr", value);
+    }
+    if let Some(value) = cli.wasm_cache_dir.as_ref() {
+        push_toml_string(&mut out, "wasm_cache_dir", &value.display().to_string());
+    }
+    if let Some(value) = cli.default_deadline_ms {
+        push_toml_number(&mut out, "default_deadline_ms", value);
+    }
+    if let Some(value) = cli.default_memory_mb {
+        push_toml_number(&mut out, "default_memory_mb", value);
+    }
+    if let Some(value) = cli.max_instance_memory_mb {
+        push_toml_number(&mut out, "max_instance_memory_mb", value);
+    }
+    if let Some(value) = cli.max_concurrency {
+        push_toml_number(&mut out, "max_concurrency", value);
+    }
+    if let Some(value) = cli.registry_heartbeat_path.as_deref() {
+        push_toml_string(&mut out, "registry_heartbeat_path", value);
+    }
+    if let Some(value) = cli.registry_heartbeat_secs {
+        push_toml_number(&mut out, "registry_heartbeat_secs", value);
+    }
+    if let Some(value) = cli.wasm_fetch_base.as_deref() {
+        push_toml_string(&mut out, "wasm_fetch_base", value);
+    }
+    if let Some(value) = cli.wasm_fetch_bearer.as_deref() {
+        push_toml_string(&mut out, "wasm_fetch_bearer", value);
+    }
+    if let Some(value) = cli.wasm_fetch_timeout_secs {
+        push_toml_number(&mut out, "wasm_fetch_timeout_secs", value);
+    }
+    if let Some(value) = cli.region.as_deref() {
+        push_toml_string(&mut out, "region", value);
+    }
+    if let Some(value) = cli.name.as_deref() {
+        push_toml_string(&mut out, "name", value);
+    }
+
+    let quota = cli_quota(cli);
+    if quota_configured(&quota) {
+        out.push_str("\n[worker.quota]\n");
+        if let Some(value) = quota.cpu_percent {
+            push_toml_number(&mut out, "cpu_percent", value);
+        }
+        if let Some(value) = quota.memory_mb {
+            push_toml_number(&mut out, "memory_mb", value);
+        }
+        if let Some(value) = quota.pids_max {
+            push_toml_number(&mut out, "pids_max", value);
+        }
+        if let Some(value) = quota.nice {
+            push_toml_number(&mut out, "nice", value);
+        }
+    }
+
+    fs::write(path, out).with_context(|| format!("write `{}`", path.display()))?;
+    info!(path = %path.display(), "created worker config from join arguments");
+    Ok(())
+}
+
+fn push_toml_string(out: &mut String, key: &str, value: &str) {
+    out.push_str(key);
+    out.push_str(" = \"");
+    for ch in value.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            other => out.push(other),
+        }
+    }
+    out.push_str("\"\n");
+}
+
+fn push_toml_number(out: &mut String, key: &str, value: impl std::fmt::Display) {
+    out.push_str(key);
+    out.push_str(" = ");
+    out.push_str(&value.to_string());
+    out.push('\n');
+}
+
+fn cli_quota(cli: &Args) -> WorkerQuotaSettings {
+    WorkerQuotaSettings {
+        cpu_percent: cli.quota_cpu_percent.filter(|v| *v > 0),
+        memory_mb: cli.quota_memory_mb.filter(|v| *v > 0),
+        pids_max: cli.quota_pids_max.filter(|v| *v > 0),
+        nice: cli.quota_nice.map(|v| v.clamp(-20, 20)),
+    }
+}
+
+fn quota_configured(q: &WorkerQuotaSettings) -> bool {
+    q.cpu_percent.is_some() || q.memory_mb.is_some() || q.pids_max.is_some() || q.nice.is_some()
+}
+
+fn worker_pid_path(wasm_cache_dir: &Path) -> PathBuf {
+    wasm_cache_dir.join("worker.pid")
+}
+
+fn write_current_pid(wasm_cache_dir: &Path) -> Result<()> {
+    let pid_path = worker_pid_path(wasm_cache_dir);
+    fs::write(&pid_path, format!("{}\n", std::process::id()))
+        .with_context(|| format!("write `{}`", pid_path.display()))
+}
+
+fn read_pid(path: &Path) -> Result<Option<u32>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let raw = fs::read_to_string(path).with_context(|| format!("read `{}`", path.display()))?;
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    let pid = raw
+        .parse::<u32>()
+        .with_context(|| format!("parse pid `{raw}` from `{}`", path.display()))?;
+    Ok(Some(pid))
+}
+
+#[cfg(unix)]
+fn process_alive(pid: u32) -> bool {
+    Command::new("kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+#[cfg(unix)]
+fn pid_matches_worker(pid: u32) -> bool {
+    let output = Command::new("ps")
+        .arg("-p")
+        .arg(pid.to_string())
+        .arg("-o")
+        .arg("command=")
+        .output();
+    let Ok(output) = output else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    let command = String::from_utf8_lossy(&output.stdout);
+    command.contains("beenet-worker") || command.contains("vfkit")
+}
+
+#[cfg(not(unix))]
+fn process_alive(_pid: u32) -> bool {
+    false
+}
+
+#[cfg(not(unix))]
+fn pid_matches_worker(_pid: u32) -> bool {
+    false
+}
+
+fn worker_pid_is_running(pid: u32) -> bool {
+    process_alive(pid) && pid_matches_worker(pid)
+}
+
+#[cfg(unix)]
+fn terminate_process(pid: u32) -> Result<()> {
+    let status = Command::new("kill")
+        .arg("-TERM")
+        .arg(pid.to_string())
+        .status()
+        .context("send SIGTERM to worker")?;
+    if !status.success() {
+        anyhow::bail!("failed to stop worker pid {pid}");
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn terminate_process(_pid: u32) -> Result<()> {
+    anyhow::bail!("daemon lifecycle commands are currently supported on Linux and macOS only")
+}
+
+fn load_worker_settings(cli: &Args, argv: &[String]) -> Result<(PathBuf, WorkerSettings)> {
+    let path = resolve_config_path_with_cli(cli.config.clone(), argv);
+    if !path.exists() {
+        anyhow::bail!(
+            "missing config file `{}` (add a [worker] table or pass --config)",
+            path.display()
+        );
+    }
+    let file_cfg = beenet_common::config::load_file(&path)?;
+    let overrides = WorkerCliOverrides {
+        listen_addr: cli.listen_addr.clone(),
+        wasm_cache_dir: cli.wasm_cache_dir.clone(),
+        default_deadline_ms: cli.default_deadline_ms,
+        default_memory_mb: cli.default_memory_mb,
+        max_instance_memory_mb: cli.max_instance_memory_mb,
+        max_concurrency: cli.max_concurrency,
+        registry_url: cli.registry_url.clone(),
+        registry_heartbeat_path: cli.registry_heartbeat_path.clone(),
+        join_token: None,
+        registry_heartbeat_secs: cli.registry_heartbeat_secs,
+        wasm_fetch_base: cli.wasm_fetch_base.clone(),
+        wasm_fetch_bearer: cli.wasm_fetch_bearer.clone(),
+        wasm_fetch_timeout_secs: cli.wasm_fetch_timeout_secs,
+        region: cli.region.clone(),
+        name: cli.name.clone(),
+        quota: cli_quota(cli),
+    };
+    let settings = beenet_common::config::resolve_worker_settings(&file_cfg, &overrides)?;
+    Ok((path, settings))
+}
+
+fn append_runtime_args(cmd: &mut Command, config_path: &Path, cli: &Args) {
+    cmd.arg("--config").arg(config_path);
+    if let Some(value) = &cli.listen_addr {
+        cmd.arg("--listen-addr").arg(value);
+    }
+    if let Some(value) = &cli.wasm_cache_dir {
+        cmd.arg("--wasm-cache-dir").arg(value);
+    }
+    if let Some(value) = cli.default_deadline_ms {
+        cmd.arg("--default-deadline-ms").arg(value.to_string());
+    }
+    if let Some(value) = cli.default_memory_mb {
+        cmd.arg("--default-memory-mb").arg(value.to_string());
+    }
+    if let Some(value) = cli.max_instance_memory_mb {
+        cmd.arg("--max-instance-memory-mb").arg(value.to_string());
+    }
+    if let Some(value) = cli.max_concurrency {
+        cmd.arg("--max-concurrency").arg(value.to_string());
+    }
+    if let Some(value) = &cli.registry_url {
+        cmd.arg("--registry-url").arg(value);
+    }
+    if let Some(value) = &cli.registry_heartbeat_path {
+        cmd.arg("--registry-heartbeat-path").arg(value);
+    }
+    if let Some(value) = cli.registry_heartbeat_secs {
+        cmd.arg("--registry-heartbeat-secs").arg(value.to_string());
+    }
+    if let Some(value) = &cli.wasm_fetch_base {
+        cmd.arg("--wasm-fetch-base").arg(value);
+    }
+    if let Some(value) = &cli.wasm_fetch_bearer {
+        cmd.arg("--wasm-fetch-bearer").arg(value);
+    }
+    if let Some(value) = cli.wasm_fetch_timeout_secs {
+        cmd.arg("--wasm-fetch-timeout-secs").arg(value.to_string());
+    }
+    if let Some(value) = &cli.region {
+        cmd.arg("--region").arg(value);
+    }
+    if let Some(value) = &cli.name {
+        cmd.arg("--name").arg(value);
+    }
+    if let Some(value) = cli.quota_cpu_percent {
+        cmd.arg("--quota-cpu-percent").arg(value.to_string());
+    }
+    if let Some(value) = cli.quota_memory_mb {
+        cmd.arg("--quota-memory-mb").arg(value.to_string());
+    }
+    if let Some(value) = cli.quota_pids_max {
+        cmd.arg("--quota-pids-max").arg(value.to_string());
+    }
+    if let Some(value) = cli.quota_nice {
+        cmd.arg("--quota-nice").arg(value.to_string());
+    }
+}
+
+fn start_background(cli: &Args, argv: &[String]) -> Result<()> {
+    #[cfg(not(unix))]
+    {
+        let _ = (cli, argv);
+        anyhow::bail!("daemon lifecycle commands are currently supported on Linux and macOS only");
+    }
+
+    #[cfg(unix)]
+    {
+        let (config_path, settings) = load_worker_settings(cli, argv)?;
+        fs::create_dir_all(&settings.wasm_cache_dir)
+            .with_context(|| format!("create `{}`", settings.wasm_cache_dir.display()))?;
+
+        #[cfg(target_os = "macos")]
+        if settings.backend == WorkerBackend::Vm {
+            let exe = std::env::current_exe().context("resolve current executable")?;
+            let cwd = std::env::current_dir().context("resolve working directory")?;
+            let log_path = cwd.join("logs").join("beenet-worker.log");
+            backend::start_vm_launch_agent(&settings, &config_path, &exe, &cwd, &log_path)?;
+            let _ = fs::remove_file(worker_pid_path(&settings.wasm_cache_dir));
+            return Ok(());
+        }
+
+        let pid_path = worker_pid_path(&settings.wasm_cache_dir);
+        if let Some(pid) = read_pid(&pid_path)? {
+            if worker_pid_is_running(pid) {
+                anyhow::bail!("worker is already running with pid {pid}");
+            }
+            let _ = fs::remove_file(&pid_path);
+        }
+
+        let exe = std::env::current_exe().context("resolve current executable")?;
+        let mut cmd = Command::new(exe);
+        append_runtime_args(&mut cmd, &config_path, cli);
+        cmd.arg("run-internal")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let child = cmd.spawn().context("spawn background worker")?;
+        let pid = child.id();
+        fs::write(&pid_path, format!("{pid}\n"))
+            .with_context(|| format!("write `{}`", pid_path.display()))?;
+        println!("worker started with pid {pid}");
+        Ok(())
+    }
+}
+
+fn stop_background(cli: &Args, argv: &[String]) -> Result<()> {
+    let (_, settings) = load_worker_settings(cli, argv)?;
+    #[cfg(target_os = "macos")]
+    if settings.backend == WorkerBackend::Vm {
+        backend::stop_vm_launch_agent()?;
+        let _ = fs::remove_file(worker_pid_path(&settings.wasm_cache_dir));
+        return Ok(());
+    }
+    let pid_path = worker_pid_path(&settings.wasm_cache_dir);
+    let Some(pid) = read_pid(&pid_path)? else {
+        println!("worker is not running");
+        return Ok(());
+    };
+    if !worker_pid_is_running(pid) {
+        let _ = fs::remove_file(&pid_path);
+        println!("worker is not running");
+        return Ok(());
+    }
+    terminate_process(pid)?;
+    for _ in 0..50 {
+        if !worker_pid_is_running(pid) {
+            let _ = fs::remove_file(&pid_path);
+            println!("worker stopped");
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    anyhow::bail!("worker pid {pid} did not stop after SIGTERM")
+}
+
+fn status_background(cli: &Args, argv: &[String]) -> Result<()> {
+    let (_, settings) = load_worker_settings(cli, argv)?;
+    let pid_path = worker_pid_path(&settings.wasm_cache_dir);
+    let identity_path = settings.wasm_cache_dir.join("identity.key");
+    let display_name_path = settings
+        .wasm_cache_dir
+        .join(beenet_common::display_name::DISPLAY_NAME_FILE);
+    #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
+    let mut pid = read_pid(&pid_path)?;
+    #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
+    let mut running = pid.map(worker_pid_is_running).unwrap_or(false);
+    #[cfg(target_os = "macos")]
+    if settings.backend == WorkerBackend::Vm {
+        println!("backend: vm");
+        println!("launch_agent: {}", backend::VM_LAUNCH_AGENT_LABEL);
+        match backend::vm_launch_agent_status()? {
+            Some(status) => {
+                running = status.running;
+                pid = status.pid.or(pid);
+            }
+            None => {
+                running = false;
+            }
+        }
+    }
+    let name = fs::read_to_string(&display_name_path)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    println!("joined: {}", identity_path.exists());
+    println!("running: {running}");
+    if let Some(pid) = pid {
+        println!("pid: {pid}");
+    }
+    if let Some(name) = name {
+        println!("name: {name}");
+    }
+    println!("registry_url: {}", settings.registry_url);
+    println!("wasm_cache_dir: {}", settings.wasm_cache_dir.display());
+    Ok(())
+}
+
+fn remove_worker(cli: &Args, argv: &[String]) -> Result<()> {
+    let (_, settings) = load_worker_settings(cli, argv)?;
+    let pid_path = worker_pid_path(&settings.wasm_cache_dir);
+    if let Some(pid) = read_pid(&pid_path)? {
+        if worker_pid_is_running(pid) {
+            anyhow::bail!("worker is running with pid {pid}; stop it before remove");
+        }
+    }
+
+    let identity_path = settings.wasm_cache_dir.join("identity.key");
+    let display_name_path = settings
+        .wasm_cache_dir
+        .join(beenet_common::display_name::DISPLAY_NAME_FILE);
+    for path in [&pid_path, &identity_path, &display_name_path] {
+        if path.exists() {
+            fs::remove_file(path).with_context(|| format!("remove `{}`", path.display()))?;
+        }
+    }
+    println!("worker local identity removed");
+    Ok(())
 }
 
 // ── Identity persistence ───────────────────────────────────────────────────
@@ -1027,20 +1517,26 @@ async fn main() -> Result<()> {
 
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let cli = Args::parse();
-    let path = resolve_config_path_with_cli(cli.config.clone(), &argv);
-    if !path.exists() {
-        anyhow::bail!(
-            "missing config file `{}` (add a [worker] table or pass --config)",
-            path.display()
-        );
+    match cli.command.clone().unwrap_or(WorkerCommand::Join) {
+        WorkerCommand::Join | WorkerCommand::RunInternal => run_worker(cli, &argv).await,
+        WorkerCommand::Start => start_background(&cli, &argv),
+        WorkerCommand::Stop => stop_background(&cli, &argv),
+        WorkerCommand::Status => status_background(&cli, &argv),
+        WorkerCommand::Remove | WorkerCommand::Rm => remove_worker(&cli, &argv),
     }
+}
+
+async fn run_worker(cli: Args, argv: &[String]) -> Result<()> {
+    let path = ensure_config_for_run(&cli, argv)?;
     let mut file_cfg = beenet_common::config::load_file(&path)?;
-    let legacy_config_token = file_cfg
+    if file_cfg
         .worker
         .as_mut()
-        .and_then(|worker| worker.join_token.take());
-    let (mut bootstrap_token, token_from_legacy_config) =
-        bootstrap_token(&cli, legacy_config_token)?;
+        .and_then(|worker| worker.join_token.take())
+        .is_some()
+    {
+        warn!("[worker].join_token is ignored; pass --join-token-stdin or --join-token-file");
+    }
     let overrides = WorkerCliOverrides {
         listen_addr: cli.listen_addr.clone(),
         wasm_cache_dir: cli.wasm_cache_dir.clone(),
@@ -1057,27 +1553,36 @@ async fn main() -> Result<()> {
         wasm_fetch_timeout_secs: cli.wasm_fetch_timeout_secs,
         region: cli.region.clone(),
         name: cli.name.clone(),
+        quota: cli_quota(&cli),
     };
     let settings = beenet_common::config::resolve_worker_settings(&file_cfg, &overrides)?;
+    if settings.backend == WorkerBackend::Vm {
+        #[cfg(target_os = "macos")]
+        return run_vm_backend(&settings, &path, &cli);
+
+        #[cfg(not(target_os = "macos"))]
+        if std::env::var_os("BEENET_VM_GUEST").as_deref() != Some(std::ffi::OsStr::new("1")) {
+            anyhow::bail!("worker backend=vm is a macOS host mode");
+        }
+    } else {
+        backend::validate(&settings)?;
+    }
+    // After the macOS vfkit supervisor returns, any guest worker exit must power
+    // off Linux so vfkit exits and launchd KeepAlive can restart the VM.
+    let _guest_shutdown = GuestShutdownOnDrop::from_env();
+    let bootstrap_token = bootstrap_token(&cli)?;
     let listen_addr: Multiaddr = settings
         .listen_addr
         .parse()
         .with_context(|| format!("invalid listen multiaddr `{}`", settings.listen_addr))?;
     fs::create_dir_all(&settings.wasm_cache_dir)
         .with_context(|| format!("create `{}`", settings.wasm_cache_dir.display()))?;
+    write_current_pid(&settings.wasm_cache_dir)?;
+    apply_os_quota(&settings.quota)?;
     let worker_name = beenet_common::display_name::resolve_persistent_display_name(
         &settings.wasm_cache_dir,
         settings.name.as_deref(),
     )?;
-
-    let identity_key_path = settings.wasm_cache_dir.join("identity.key");
-    if token_from_legacy_config && identity_key_path.exists() {
-        warn!(
-            path = %identity_key_path.display(),
-            "ignoring deprecated config join token because this worker already has an identity"
-        );
-        bootstrap_token = None;
-    }
 
     // Load or generate a persistent Ed25519 keypair from wasm_cache_dir/identity.key.
     let local_key = load_or_create_keypair(&settings.wasm_cache_dir)?;
@@ -1191,14 +1696,84 @@ async fn main() -> Result<()> {
     tokio::signal::ctrl_c()
         .await
         .context("wait for worker shutdown signal")?;
+    let _ = fs::remove_file(worker_pid_path(&settings.wasm_cache_dir));
     info!("worker shutdown requested");
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
+fn run_vm_backend(settings: &WorkerSettings, config_path: &Path, cli: &Args) -> Result<()> {
+    use std::os::unix::process::CommandExt;
+
+    if cli.join_token.is_some() || cli.join_token_file.is_some() || cli.join_token_stdin {
+        anyhow::bail!(
+            "backend=vm does not yet forward bootstrap credentials; enroll the persistent \
+             wasm_cache_dir identity before starting the VM"
+        );
+    }
+    let mut cmd = backend::vm_command(settings, config_path)?;
+    info!(
+        vfkit = %settings.vm.vfkit_path.display(),
+        cpus = settings.vm.cpus,
+        memory_mb = settings.vm.memory_mb,
+        "starting Beenet Linux microVM"
+    );
+    // Replace this process with vfkit so a LaunchAgent KeepAlive watches the
+    // hypervisor. Guest poweroff then exits vfkit and launchd restarts it.
+    let error = cmd.exec();
+    Err(error).context("exec vfkit")
+}
+
+struct GuestShutdownOnDrop {
+    enabled: bool,
+}
+
+impl GuestShutdownOnDrop {
+    fn from_env() -> Self {
+        Self {
+            enabled: guest_env_requests_power_off(std::env::var_os("BEENET_VM_GUEST").as_deref()),
+        }
+    }
+}
+
+impl Drop for GuestShutdownOnDrop {
+    fn drop(&mut self) {
+        if self.enabled {
+            request_guest_power_off();
+        }
+    }
+}
+
+fn guest_env_requests_power_off(value: Option<&std::ffi::OsStr>) -> bool {
+    value == Some(std::ffi::OsStr::new("1"))
+}
+
+fn request_guest_power_off() {
+    #[cfg(target_os = "linux")]
+    {
+        info!("guest worker exiting; powering off Linux so vfkit can exit");
+        unsafe {
+            libc::sync();
+        }
+        if let Err(error) = fs::write("/proc/sysrq-trigger", "o") {
+            warn!(%error, "failed to write sysrq poweroff");
+        }
+        unsafe {
+            if libc::reboot(libc::LINUX_REBOOT_CMD_POWER_OFF) != 0 {
+                warn!(
+                    error = %std::io::Error::last_os_error(),
+                    "LINUX_REBOOT_CMD_POWER_OFF failed"
+                );
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::wasm_fetch_url;
+    use super::{guest_env_requests_power_off, wasm_fetch_url};
     use beenet_common::BeenetCid;
+    use std::ffi::OsStr;
     use std::str::FromStr;
 
     #[test]
@@ -1210,5 +1785,12 @@ mod tests {
             wasm_fetch_url("https://example.com/wasm/", &cid),
             format!("https://example.com/wasm/{cid}")
         );
+    }
+
+    #[test]
+    fn guest_power_off_only_when_vm_guest_env_is_set() {
+        assert!(guest_env_requests_power_off(Some(OsStr::new("1"))));
+        assert!(!guest_env_requests_power_off(Some(OsStr::new("0"))));
+        assert!(!guest_env_requests_power_off(None));
     }
 }
