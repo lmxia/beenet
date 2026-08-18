@@ -97,7 +97,7 @@ jobs:
         working-directory: beenet
         run: |
           uname -m
-          cargo build --release --locked -p beenet-worker
+          cargo build --release -p beenet-worker
           file target/release/beenet-worker
 
       - name: Package app and DMG

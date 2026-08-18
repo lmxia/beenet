@@ -38,7 +38,7 @@ ENV HTTP_PROXY=$HTTP_PROXY \
 RUN --mount=type=cache,target=/root/.cargo/registry \
     --mount=type=cache,target=/root/.cargo/git \
     --mount=type=cache,target=/src/beenet/target \
-    cargo build --release --locked -p beenet-worker \
+    cargo build --release -p beenet-worker \
     && strip target/release/beenet-worker \
     && file target/release/beenet-worker \
     && scanelf -n target/release/beenet-worker \
