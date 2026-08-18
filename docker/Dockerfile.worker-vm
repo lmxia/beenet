@@ -11,7 +11,9 @@ RUN apk add --no-cache \
     clang \
     cmake \
     file \
+    linux-headers \
     lld \
+    openssl-dev \
     perl \
     pkgconf \
     rust \
