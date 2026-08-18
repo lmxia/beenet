@@ -4,7 +4,9 @@ use std::path::Path;
 #[cfg(target_os = "macos")]
 use std::path::PathBuf;
 #[cfg(target_os = "macos")]
-use std::process::Command;
+use std::process::{Command, Stdio};
+#[cfg(target_os = "macos")]
+use std::time::{Duration, Instant};
 
 #[cfg(target_os = "macos")]
 use anyhow::Context;
@@ -215,7 +217,6 @@ fn xml_escape(value: &str) -> String {
         .replace('\'', "&apos;")
 }
 
-#[cfg(target_os = "macos")]
 pub(crate) struct LaunchAgentRuntime {
     pub running: bool,
     pub pid: Option<u32>,
@@ -231,16 +232,7 @@ pub(crate) fn start_launch_agent(
 ) -> Result<()> {
     validate(settings)?;
     retire_legacy_launch_agent();
-    if let Some(status) = inspect_launch_agent()? {
-        if status.running {
-            let pid = status
-                .pid
-                .map(|pid| pid.to_string())
-                .unwrap_or_else(|| "unknown".to_string());
-            anyhow::bail!("worker launch agent {LAUNCH_AGENT_LABEL} is already running with pid {pid}");
-        }
-        let _ = bootout_launch_agent(LAUNCH_AGENT_LABEL);
-    }
+    unload_launch_agent(LAUNCH_AGENT_LABEL)?;
 
     let plist_path = launch_agent_path(LAUNCH_AGENT_LABEL)?;
     if let Some(parent) = plist_path.parent() {
@@ -273,6 +265,7 @@ pub(crate) fn start_launch_agent(
         ),
     )
     .with_context(|| format!("write `{}`", plist_path.display()))?;
+    enable_launch_agent(LAUNCH_AGENT_LABEL)?;
     bootstrap_launch_agent(&plist_path)?;
     kickstart_launch_agent(LAUNCH_AGENT_LABEL)?;
     println!("worker launch agent {LAUNCH_AGENT_LABEL} started");
@@ -286,19 +279,9 @@ pub(crate) fn stop_launch_agent() -> Result<()> {
         println!("worker is not running");
         return Ok(());
     }
-    bootout_launch_agent(LAUNCH_AGENT_LABEL)?;
-    for _ in 0..50 {
-        match inspect_launch_agent()? {
-            Some(status) if status.running => {
-                std::thread::sleep(std::time::Duration::from_millis(100));
-            }
-            _ => {
-                println!("worker stopped");
-                return Ok(());
-            }
-        }
-    }
-    anyhow::bail!("worker launch agent {LAUNCH_AGENT_LABEL} did not stop")
+    unload_launch_agent(LAUNCH_AGENT_LABEL)?;
+    println!("worker stopped");
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]
@@ -308,7 +291,7 @@ pub(crate) fn inspect_launch_agent() -> Result<Option<LaunchAgentRuntime>> {
 
 #[cfg(target_os = "macos")]
 fn retire_legacy_launch_agent() {
-    let _ = bootout_launch_agent(LEGACY_LAUNCH_AGENT_LABEL);
+    let _ = unload_launch_agent(LEGACY_LAUNCH_AGENT_LABEL);
     if let Ok(path) = launch_agent_path(LEGACY_LAUNCH_AGENT_LABEL) {
         let _ = fs::remove_file(path);
     }
@@ -331,56 +314,131 @@ fn service_target(label: &str) -> String {
 fn inspect_label(label: &str) -> Result<Option<LaunchAgentRuntime>> {
     let output = Command::new("launchctl")
         .args(["print", &service_target(label)])
+        .stderr(Stdio::null())
         .output()
         .context("launchctl print")?;
     if !output.status.success() {
         return Ok(None);
     }
-    let text = String::from_utf8_lossy(&output.stdout);
+    Ok(Some(parse_launchctl_print(&String::from_utf8_lossy(
+        &output.stdout,
+    ))))
+}
+
+fn parse_launchctl_print(text: &str) -> LaunchAgentRuntime {
     let running = text.lines().any(|line| line.trim() == "state = running");
     let pid = text.lines().find_map(|line| {
         line.trim()
             .strip_prefix("pid = ")
             .and_then(|pid| pid.parse().ok())
     });
-    Ok(Some(LaunchAgentRuntime { running, pid }))
+    LaunchAgentRuntime { running, pid }
+}
+
+#[cfg(target_os = "macos")]
+fn run_launchctl(args: &[&str]) -> Result<(bool, String)> {
+    let output = Command::new("launchctl")
+        .args(args)
+        .output()
+        .with_context(|| format!("launchctl {}", args.join(" ")))?;
+    let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
+    let err = String::from_utf8_lossy(&output.stderr);
+    if !err.is_empty() {
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str(&err);
+    }
+    Ok((output.status.success(), text))
+}
+
+fn launchctl_already_gone(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("no such process") || lower.contains("could not find service")
+}
+
+#[cfg(target_os = "macos")]
+fn disable_launch_agent(label: &str) -> Result<()> {
+    let (ok, text) = run_launchctl(&["disable", &service_target(label)])?;
+    if ok || launchctl_already_gone(&text) {
+        return Ok(());
+    }
+    anyhow::bail!("launchctl disable {} failed: {}", service_target(label), text.trim());
+}
+
+#[cfg(target_os = "macos")]
+fn enable_launch_agent(label: &str) -> Result<()> {
+    let (ok, text) = run_launchctl(&["enable", &service_target(label)])?;
+    if ok || launchctl_already_gone(&text) {
+        return Ok(());
+    }
+    anyhow::bail!("launchctl enable {} failed: {}", service_target(label), text.trim());
 }
 
 #[cfg(target_os = "macos")]
 fn bootout_launch_agent(label: &str) -> Result<()> {
-    let status = Command::new("launchctl")
-        .args(["bootout", &service_target(label)])
-        .status()
-        .context("launchctl bootout")?;
-    if !status.success() && inspect_label(label)?.is_some() {
-        anyhow::bail!("launchctl bootout {} failed", service_target(label));
+    let (ok, text) = run_launchctl(&["bootout", &service_target(label)])?;
+    if ok || launchctl_already_gone(&text) {
+        return Ok(());
     }
-    Ok(())
+    anyhow::bail!("launchctl bootout {} failed: {}", service_target(label), text.trim());
+}
+
+#[cfg(target_os = "macos")]
+fn wait_until_unloaded(label: &str) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        if inspect_label(label)?.is_none() {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!(
+                "launch agent {label} is still loaded after bootout; wait for the VM to power off and try again"
+            );
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn unload_launch_agent(label: &str) -> Result<()> {
+    if inspect_label(label)?.is_none() {
+        return Ok(());
+    }
+    let _ = disable_launch_agent(label);
+    bootout_launch_agent(label)?;
+    wait_until_unloaded(label)
 }
 
 #[cfg(target_os = "macos")]
 fn bootstrap_launch_agent(plist_path: &Path) -> Result<()> {
     let domain = format!("gui/{}", unsafe { libc::getuid() });
-    let status = Command::new("launchctl")
-        .args(["bootstrap", &domain, &plist_path.display().to_string()])
-        .status()
-        .context("launchctl bootstrap")?;
-    if !status.success() {
-        anyhow::bail!("launchctl bootstrap `{}` failed", plist_path.display());
+    let (ok, text) = run_launchctl(&[
+        "bootstrap",
+        &domain,
+        &plist_path.display().to_string(),
+    ])?;
+    if ok {
+        return Ok(());
     }
-    Ok(())
+    anyhow::bail!(
+        "launchctl bootstrap `{}` failed: {}",
+        plist_path.display(),
+        text.trim()
+    );
 }
 
 #[cfg(target_os = "macos")]
 fn kickstart_launch_agent(label: &str) -> Result<()> {
-    let status = Command::new("launchctl")
-        .args(["kickstart", "-k", &service_target(label)])
-        .status()
-        .context("launchctl kickstart")?;
-    if !status.success() {
-        anyhow::bail!("launchctl kickstart {} failed", service_target(label));
+    let (ok, text) = run_launchctl(&["kickstart", "-k", &service_target(label)])?;
+    if ok {
+        return Ok(());
     }
-    Ok(())
+    anyhow::bail!(
+        "launchctl kickstart {} failed: {}",
+        service_target(label),
+        text.trim()
+    );
 }
 
 #[cfg(test)]
@@ -441,5 +499,17 @@ mod tests {
         );
         assert!(plist.contains("/tmp/beenet &amp; worker"));
         assert!(plist.contains("/tmp/a&lt;b&gt;.toml"));
+    }
+
+    #[test]
+    fn launchctl_sigtermed_is_loaded_but_not_running() {
+        let status = super::parse_launchctl_print(
+            "\tstate = SIGTERMed\n\tpid = 57906\n\tactive count = 1\n",
+        );
+        assert!(!status.running);
+        assert_eq!(status.pid, Some(57906));
+        let running = super::parse_launchctl_print("\tstate = running\n\tpid = 12\n");
+        assert!(running.running);
+        assert_eq!(running.pid, Some(12));
     }
 }

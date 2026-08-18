@@ -70,12 +70,10 @@ make -C ../beenet-cloud storage-up
 # 或: make docker-up / make docker-down
 ```
 
-宿主机启动 Worker：
+宿主机启动 Worker（控制面已在 Docker 里；这里只编 worker，不要编 registry/gateway）：
 
 ```bash
-cargo build --release -p beenet-worker
-
-./target/release/beenet-worker \
+cargo run --release -p beenet-worker -- \
   join \
   --config examples/local-dev-config.toml \
   --registry-url http://127.0.0.1:3030 \
@@ -85,29 +83,20 @@ cargo build --release -p beenet-worker
 
 如果 `--config` 指向的文件不存在，`join` 会用参数初始化本机 worker 配置，包括显式传入的
 quota，但不会写入 join token。`join` 成功后会直接运行并承接任务。首次 join 成功后可删除
-临时 token 文件；后续后台启动复用 `wasm_cache_dir/identity.key`：
+临时 token 文件；之后用同一份配置：
 
 ```bash
-./target/release/beenet-worker --config examples/local-dev-config.toml start
-./target/release/beenet-worker --config examples/local-dev-config.toml status
-./target/release/beenet-worker --config examples/local-dev-config.toml stop
+cargo run --release -p beenet-worker -- --config examples/local-dev-config.toml start
+cargo run --release -p beenet-worker -- --config examples/local-dev-config.toml status
+cargo run --release -p beenet-worker -- --config examples/local-dev-config.toml stop
 ```
 
-启动方式约定：
+macOS 贡献者请用 App / DMG，不要依赖仓库里的 `target/release`。LaunchAgent 由 App 写入，
+`ProgramArguments` 指向包内的 `Contents/MacOS/beenet-worker … run-internal`。
 
-- 人在终端里手动启动：使用 `start`，它会在后台拉起 worker 并返回 shell。
-- 系统服务管理器启动：使用隐藏入口 `run-internal`，让 launchd/systemd 直接守护真正的 worker 进程。
+Linux 服务器用 systemd `ExecStart=… run-internal`，同样不要用 `start`。
 
-macOS LaunchAgent 示例中的 `ProgramArguments` 应指向：
-
-```text
-/path/to/beenet-worker --config /path/to/config.toml run-internal
-```
-
-Linux systemd service 的 `ExecStart` 也应使用同样形式，而不是 `start`。
-
-`--join-token-stdin` 亦可；避免把明文写进 shell history。当前 daemon 生命周期命令优先支持
-macOS / Linux，并按本机唯一 worker 管理。
+`--join-token-stdin` 亦可；避免把明文写进 shell history。
 
 ## 配置文件
 
@@ -168,12 +157,34 @@ scripts/build-macos-vm-image.sh
 
 The script verifies the Alpine 3.24.1 virt ISO checksum, builds `beenet-worker` in the
 multi-stage [`docker/Dockerfile.worker-vm`](docker/Dockerfile.worker-vm), and writes artifacts
-under `~/Library/Caches/beenet/vm/alpine-3.24.1`. The Docker build needs the sibling Spin checkout
-at `../spin`; proxy settings can be passed as `BEENET_DOCKER_HTTP_PROXY` and
-`BEENET_DOCKER_HTTPS_PROXY`. Do not pass credentials as build arguments. Configure
-`kernel_path` with the extracted Alpine `boot/Image` and `initrd_path` with the generated
-`beenet-alpine-3.24.1-aarch64-initramfs.img`. A raw root disk is optional because this image boots
-entirely from initramfs and keeps persistent state in the virtio-fs state share.
+under `~/Library/Caches/beenet/vm/alpine-3.24.1` — not into git. The Docker build needs the sibling
+Spin checkout at `../spin` (revision in [`scripts/spin.rev`](scripts/spin.rev)); proxy settings can
+be passed as `BEENET_DOCKER_HTTP_PROXY` and `BEENET_DOCKER_HTTPS_PROXY`. Do not pass credentials as
+build arguments. Configure `kernel_path` with the extracted Alpine `boot/Image` and `initrd_path`
+with the generated `beenet-alpine-3.24.1-aarch64-initramfs.img`. A raw root disk is optional
+because this image boots entirely from initramfs and keeps persistent state in the virtio-fs
+state share.
+
+### macOS 贡献者 App
+
+源码在 `apps/macos-contributor/`（要进 git）。`dist/` 和 DMG 不进 git。
+
+本地：
+
+```bash
+make dmg
+open apps/macos-contributor/dist/Beenet-0.1.0-darwin-arm64.dmg
+```
+
+发版：`git tag v0.1.0 && git push origin v0.1.0`。  
+[`.github/workflows/macos-contributor.yml`](.github/workflows/macos-contributor.yml) 分两台机器：
+
+| Job | Runner | 编什么 |
+| --- | --- | --- |
+| `guest-image` | `ubuntu-24.04-arm` | Linux aarch64 内核 + musl guest worker + initramfs |
+| `dmg` | `macos-15`（Apple Silicon，不是 Intel） | Mach-O 宿主 `beenet-worker` + Swift App + vfkit + DMG |
+
+GitHub 托管的 `macos-15` / `macos-latest` 默认就是 ARM Mac。Intel 要用显式的 `macos-15-intel`，本仓库不发 Intel DMG。未打 tag 时可在 Actions 里手动 `workflow_dispatch`。当前 ad-hoc 签名，第一次打开需右键「打开」。
 
 The supervisor attaches NAT networking and two virtio-fs shares:
 
@@ -218,10 +229,6 @@ compression). Product bundles should still budget 80-200 MB for a dedicated mini
 200-500 MB with debugging tools, rollback data, and update caches. It contains no Docker daemon,
 containerd, or OpenSSL runtime; TLS uses rustls with native CA roots.
 
-```text
-/path/to/beenet-worker --config /path/to/config.toml start
-```
-
 ## 端到端示例
 
 假定仓库根目录；Beenet Cloud Artifact Store 与本地运行时栈已经拉起：
@@ -261,8 +268,10 @@ Artifact 的对象 key 是 CID 本身，不带 `.wasm` 后缀；Builder 容器�
 
 ### 3. 启动 Worker 并调用
 
+macOS 用贡献者 App 开始贡献即可。命令行联调：
+
 ```bash
-./target/release/beenet-worker \
+cargo run --release -p beenet-worker -- \
   join \
   --config examples/local-dev-config.toml \
   --registry-url http://127.0.0.1:3030 \
@@ -331,6 +340,7 @@ curl -s -H "Authorization: Bearer beenet-dev-admin-token" \
 | `crates/beenet-worker` | libp2p Worker（宿主机） |
 | `crates/beenet-gateway` | HTTP → libp2p Gateway |
 | `crates/beenet-frontdoor` | 统一公网 HTTP 入口；按 Registry 路由到持有 Worker 连接的 Gateway |
+| `apps/macos-contributor` | macOS 贡献者 App 源码（`dist/` 不入库） |
 | `scripts/dev-up.sh` | 本地分阶段 Docker 启动 |
 | `docker/` | Dockerfile + `docker-compose.dev.yml` |
 | `examples/fair-red-packet-http` | 可复算的公平拼手气红包（推荐端到端示例） |

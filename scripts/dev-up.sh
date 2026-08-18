@@ -126,9 +126,9 @@ Stack is up.
 Gateway join token:  ${GW_TOKEN_FILE}
 Worker join token:   ${WORKER_TOKEN_FILE}
 
-Start Worker on the host (after cargo build --release -p beenet-worker):
+Start Worker on the host:
 
-  ./target/release/beenet-worker \\
+  cargo run --release -p beenet-worker -- \\
     --config examples/local-dev-config.toml \\
     --join-token-file ${WORKER_TOKEN_FILE}
 

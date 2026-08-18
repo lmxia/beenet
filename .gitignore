@@ -2,11 +2,14 @@
 /examples/**/target/
 /.tmp-builder-output/
 /dist
+/out/
 **/Cargo.lock.bak
 .DS_Store
 .env
 .env.*
 !.env.example
+/apps/macos-contributor/dist/
+*.dmg
 .vscode/*
 !.vscode/launch.json
 *.swp
@@ -15,3 +18,7 @@
 /logs/
 gateway_cache/
 .beenet-dev/
+/cloud-hk-worker.toml
+/cloud-hk-worker-cache/
+**/identity.key
+**/worker.pid

@@ -1,0 +1,125 @@
+name: macos-contributor
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  guest-image:
+    name: Linux guest image
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - name: Checkout Beenet
+        uses: actions/checkout@v4
+        with:
+          path: beenet
+
+      - name: Read Spin revision
+        id: spin
+        run: echo "rev=$(tr -d '[:space:]' < beenet/scripts/spin.rev)" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout Spin
+        uses: actions/checkout@v4
+        with:
+          repository: spinframework/spin
+          ref: ${{ steps.spin.outputs.rev }}
+          path: spin
+          submodules: recursive
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build kernel and initramfs
+        working-directory: beenet
+        env:
+          BEENET_VM_CACHE_DIR: ${{ runner.temp }}/beenet-vm
+          BEENET_SPIN_DIR: ${{ github.workspace }}/spin
+        run: scripts/build-macos-vm-image.sh
+
+      - name: Stage guest image
+        run: |
+          mkdir -p beenet/out/guest
+          cp "${{ runner.temp }}/beenet-vm/extracted/boot/Image" beenet/out/guest/Image
+          cp "${{ runner.temp }}/beenet-vm/beenet-alpine-3.24.1-aarch64-initramfs.img" \
+            beenet/out/guest/initrd.img
+
+      - name: Upload guest image
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-guest-image
+          path: beenet/out/guest/*
+          if-no-files-found: error
+
+  dmg:
+    name: macOS arm64 DMG
+    needs: guest-image
+    # macos-15 is Apple Silicon (M-series). Intel is macos-15-intel; we do not ship that.
+    runs-on: macos-15
+    steps:
+      - name: Checkout Beenet
+        uses: actions/checkout@v4
+        with:
+          path: beenet
+
+      - name: Read Spin revision
+        id: spin
+        run: echo "rev=$(tr -d '[:space:]' < beenet/scripts/spin.rev)" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout Spin
+        uses: actions/checkout@v4
+        with:
+          repository: spinframework/spin
+          ref: ${{ steps.spin.outputs.rev }}
+          path: spin
+          submodules: recursive
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install vfkit
+        run: brew install vfkit
+
+      - name: Download guest image
+        uses: actions/download-artifact@v4
+        with:
+          name: macos-guest-image
+          path: ${{ github.workspace }}/guest
+
+      - name: Build host Mach-O worker
+        working-directory: beenet
+        run: |
+          uname -m
+          cargo build --release --locked -p beenet-worker
+          file target/release/beenet-worker
+
+      - name: Package app and DMG
+        working-directory: beenet
+        env:
+          BEENET_KERNEL_PATH: ${{ github.workspace }}/guest/Image
+          BEENET_INITRD_PATH: ${{ github.workspace }}/guest/initrd.img
+        run: |
+          make dmg
+          ls -lh apps/macos-contributor/dist/*.dmg
+
+      - name: Upload DMG artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Beenet-macos-arm64
+          path: beenet/apps/macos-contributor/dist/*.dmg
+          if-no-files-found: error
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        working-directory: beenet
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ github.ref_name }}" \
+            apps/macos-contributor/dist/*.dmg \
+            --title "Beenet ${{ github.ref_name }}" \
+            --generate-notes

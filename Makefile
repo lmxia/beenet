@@ -30,6 +30,16 @@ build-debug: ## Build debug binaries (registry + gateway)
 test: ## Run all workspace tests
 	cargo test --workspace
 
+.PHONY: app-macos
+app-macos: ## Build the unsigned macOS contributor app
+	chmod +x apps/macos-contributor/build.sh
+	apps/macos-contributor/build.sh
+
+.PHONY: dmg
+dmg: app-macos ## Wrap the macOS contributor app into a DMG
+	chmod +x scripts/package-macos-dmg.sh
+	scripts/package-macos-dmg.sh
+
 .PHONY: fmt
 fmt: ## Format all code with rustfmt
 	cargo fmt --all

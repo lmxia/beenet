@@ -12,16 +12,37 @@ ALPINE_URL="https://dl-cdn.alpinelinux.org/alpine/v3.24/releases/aarch64/alpine-
 ALPINE_SHA256=c81699152db11d2a6dbb7d75348d632fcf5811eff414d7e71876a8bb6d48bc02
 ISO="$CACHE_DIR/alpine-virt-${ALPINE_VERSION}-aarch64.iso"
 WORK="$CACHE_DIR/build"
+SPIN_DIR=${BEENET_SPIN_DIR:-"$ROOT_DIR/../spin"}
+
+sha256_of() {
+    if command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$1" | awk '{print $1}'
+    else
+        sha256sum "$1" | awk '{print $1}'
+    fi
+}
 
 mkdir -p "$CACHE_DIR" "$WORK/root"
 if [ ! -f "$ISO" ]; then
     curl -fL --retry 5 -C - -o "$ISO" "$ALPINE_URL"
 fi
-actual_sha=$(shasum -a 256 "$ISO" | awk '{print $1}')
+actual_sha=$(sha256_of "$ISO")
 [ "$actual_sha" = "$ALPINE_SHA256" ] || {
     echo "Alpine SHA-256 mismatch: $actual_sha" >&2
     exit 1
 }
+
+mkdir -p "$CACHE_DIR/extracted/boot"
+tar -xOf "$ISO" boot/vmlinuz-virt > "$CACHE_DIR/extracted/boot/vmlinuz-virt"
+python3 - "$CACHE_DIR/extracted/boot/vmlinuz-virt" "$CACHE_DIR/extracted/boot/Image" <<'PY'
+import sys, zlib
+src, dst = sys.argv[1], sys.argv[2]
+data = open(src, "rb").read()
+idx = data.find(b"\x1f\x8b")
+if idx < 0:
+    raise SystemExit("gzip payload not found in vmlinuz-virt")
+open(dst, "wb").write(zlib.decompress(data[idx:], 16 + zlib.MAX_WBITS))
+PY
 
 rm -rf "$WORK/root"
 mkdir -p "$WORK/root"
@@ -33,10 +54,22 @@ tar -xOf "$ISO" apks/aarch64/ca-certificates-bundle-20260611-r0.apk \
 
 rm -rf "$WORK/worker-artifact"
 mkdir -p "$WORK/worker-artifact"
+if [ ! -d "$SPIN_DIR" ]; then
+    echo "error: Spin checkout not found at $SPIN_DIR" >&2
+    echo "clone https://github.com/spinframework/spin at the revision in scripts/spin.rev" >&2
+    exit 1
+fi
+
+BUILDX_BUILDER_ARGS=""
+if [ -n "${BEENET_BUILDX_BUILDER:-}" ]; then
+    BUILDX_BUILDER_ARGS="--builder $BEENET_BUILDX_BUILDER"
+fi
+
+# shellcheck disable=SC2086
 docker buildx build \
-    --builder "${BEENET_BUILDX_BUILDER:-desktop-linux}" \
+    $BUILDX_BUILDER_ARGS \
     --platform linux/arm64 \
-    --build-context "spin=$ROOT_DIR/../spin" \
+    --build-context "spin=$SPIN_DIR" \
     --build-arg "HTTP_PROXY=${BEENET_DOCKER_HTTP_PROXY:-${HTTP_PROXY:-}}" \
     --build-arg "HTTPS_PROXY=${BEENET_DOCKER_HTTPS_PROXY:-${HTTPS_PROXY:-}}" \
     --file "$ROOT_DIR/docker/Dockerfile.worker-vm" \
@@ -54,7 +87,9 @@ install -m 0755 "$ROOT_DIR/vm/alpine-init" "$WORK/root/init"
     | gzip -9 > "$CACHE_DIR/beenet-alpine-${ALPINE_VERSION}-aarch64-initramfs.img"
 cp "$WORK/root/usr/local/bin/beenet-worker" "$CACHE_DIR/beenet-worker-aarch64-linux-musl"
 
+echo "kernel:    $CACHE_DIR/extracted/boot/Image"
 echo "initramfs: $CACHE_DIR/beenet-alpine-${ALPINE_VERSION}-aarch64-initramfs.img"
 echo "worker:    $CACHE_DIR/beenet-worker-aarch64-linux-musl"
-ls -lh "$CACHE_DIR/beenet-alpine-${ALPINE_VERSION}-aarch64-initramfs.img" \
+ls -lh "$CACHE_DIR/extracted/boot/Image" \
+    "$CACHE_DIR/beenet-alpine-${ALPINE_VERSION}-aarch64-initramfs.img" \
     "$CACHE_DIR/beenet-worker-aarch64-linux-musl"

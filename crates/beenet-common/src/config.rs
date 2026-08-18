@@ -86,8 +86,34 @@ pub struct WorkerVmSection {
     pub initrd_path: Option<String>,
     pub root_disk_path: Option<String>,
     pub cpus: Option<u16>,
-    /// Guest RAM. This is the VM envelope, separate from `[worker.quota].memory_mb`.
+    /// Guest RAM. If omitted, derived from `[worker.quota].memory_mb` plus kernel headroom.
     pub memory_mb: Option<u32>,
+}
+
+/// Extra guest RAM reserved for kernel, init, and page cache when deriving the vfkit envelope.
+pub const VM_ENVELOPE_HEADROOM_MB: u32 = 320;
+
+/// vfkit CPU count and guest RAM derived from the product-level worker quota.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VmEnvelope {
+    pub cpus: u16,
+    pub memory_mb: u32,
+}
+
+/// Map `[worker.quota]` onto a VM envelope. Fractional CPU becomes at least one vCPU;
+/// guest RAM is the worker memory cap plus [`VM_ENVELOPE_HEADROOM_MB`].
+pub fn derive_vm_envelope(quota: &WorkerQuotaSettings) -> VmEnvelope {
+    let cpus = quota
+        .cpu_percent
+        .map(|percent| percent.div_ceil(100) as u16)
+        .unwrap_or(1)
+        .max(1);
+    let memory_mb = quota
+        .memory_mb
+        .unwrap_or(256)
+        .saturating_add(VM_ENVELOPE_HEADROOM_MB)
+        .max(256);
+    VmEnvelope { cpus, memory_mb }
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -203,8 +229,8 @@ impl Default for WorkerVmSettings {
             kernel_path: None,
             initrd_path: None,
             root_disk_path: None,
-            cpus: 2,
-            memory_mb: 1024,
+            cpus: 1,
+            memory_mb: 256 + VM_ENVELOPE_HEADROOM_MB,
         }
     }
 }
@@ -271,6 +297,15 @@ pub fn resolve_worker_settings(
     )
     .unwrap_or_else(|| DEFAULT_REGISTRY_HEARTBEAT_PATH.to_string());
 
+    let quota = merge_worker_quota(
+        w.quota
+            .as_ref()
+            .map(resolve_worker_quota)
+            .unwrap_or_default(),
+        &cli.quota,
+    );
+    let vm = resolve_worker_vm(w.vm.as_ref(), &quota);
+
     Ok(WorkerSettings {
         backend: w.backend.unwrap_or_default(),
         listen_addr,
@@ -309,20 +344,22 @@ pub fn resolve_worker_settings(
         .max(1),
         region: opt_merge(cli.region.clone(), w.region.as_ref()),
         name: opt_merge(cli.name.clone(), w.name.as_ref()),
-        quota: merge_worker_quota(
-            w.quota
-                .as_ref()
-                .map(resolve_worker_quota)
-                .unwrap_or_default(),
-            &cli.quota,
-        ),
-        vm: resolve_worker_vm(w.vm.as_ref()),
+        quota,
+        vm,
     })
 }
 
-fn resolve_worker_vm(vm: Option<&WorkerVmSection>) -> WorkerVmSettings {
+fn resolve_worker_vm(vm: Option<&WorkerVmSection>, quota: &WorkerQuotaSettings) -> WorkerVmSettings {
+    let derived = derive_vm_envelope(quota);
     let Some(vm) = vm else {
-        return WorkerVmSettings::default();
+        return WorkerVmSettings {
+            vfkit_path: PathBuf::from("vfkit"),
+            kernel_path: None,
+            initrd_path: None,
+            root_disk_path: None,
+            cpus: derived.cpus,
+            memory_mb: derived.memory_mb,
+        };
     };
     WorkerVmSettings {
         vfkit_path: vm
@@ -346,8 +383,11 @@ fn resolve_worker_vm(vm: Option<&WorkerVmSection>) -> WorkerVmSettings {
             .as_deref()
             .and_then(trim_nonempty)
             .map(PathBuf::from),
-        cpus: vm.cpus.unwrap_or(2).max(1),
-        memory_mb: vm.memory_mb.unwrap_or(1024).max(256),
+        cpus: vm.cpus.unwrap_or(derived.cpus).max(derived.cpus),
+        memory_mb: vm
+            .memory_mb
+            .unwrap_or(derived.memory_mb)
+            .max(derived.memory_mb),
     }
 }
 
@@ -677,5 +717,72 @@ mod tests {
             settings.vm.root_disk_path,
             Some(PathBuf::from("/opt/beenet/root.raw"))
         );
+    }
+
+    #[test]
+    fn vm_envelope_is_derived_from_quota_when_unspecified() {
+        assert_eq!(
+            derive_vm_envelope(&WorkerQuotaSettings {
+                cpu_percent: Some(10),
+                memory_mb: Some(512),
+                pids_max: Some(128),
+                nice: None,
+            }),
+            VmEnvelope {
+                cpus: 1,
+                memory_mb: 512 + VM_ENVELOPE_HEADROOM_MB,
+            }
+        );
+        assert_eq!(
+            derive_vm_envelope(&WorkerQuotaSettings {
+                cpu_percent: Some(150),
+                memory_mb: Some(2048),
+                ..WorkerQuotaSettings::default()
+            })
+            .cpus,
+            2
+        );
+
+        let config: BeenetConfigFile = toml::from_str(
+            r#"
+            [worker]
+            backend = "vm"
+            registry_url = "https://registry.example"
+
+            [worker.quota]
+            cpu_percent = 25
+            memory_mb = 512
+
+            [worker.vm]
+            kernel_path = "/opt/beenet/vmlinuz"
+            "#,
+        )
+        .unwrap();
+        let settings = resolve_worker_settings(&config, &WorkerCliOverrides::default()).unwrap();
+        assert_eq!(settings.vm.cpus, 1);
+        assert_eq!(settings.vm.memory_mb, 512 + VM_ENVELOPE_HEADROOM_MB);
+    }
+
+    #[test]
+    fn vm_envelope_never_shrinks_below_derived_quota() {
+        let config: BeenetConfigFile = toml::from_str(
+            r#"
+            [worker]
+            backend = "vm"
+            registry_url = "https://registry.example"
+
+            [worker.quota]
+            cpu_percent = 150
+            memory_mb = 1024
+
+            [worker.vm]
+            cpus = 1
+            memory_mb = 256
+            "#,
+        )
+        .unwrap();
+        let settings = resolve_worker_settings(&config, &WorkerCliOverrides::default()).unwrap();
+        assert_eq!(settings.vm.cpus, 2);
+        assert_eq!(settings.vm.memory_mb, 1024 + VM_ENVELOPE_HEADROOM_MB);
     }
 }
