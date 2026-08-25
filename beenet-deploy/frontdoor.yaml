@@ -46,6 +46,13 @@ spec:
             httpGet:
               path: /health
               port: http
+          resources:
+            requests:
+              cpu: 25m
+              memory: 64Mi
+            limits:
+              cpu: 250m
+              memory: 512Mi
 ---
 apiVersion: v1
 kind: Service

@@ -33,7 +33,7 @@ spec:
     spec:
       containers:
         - name: registry
-          image: teethlink-global-registry.cn-hongkong.cr.aliyuncs.com/beenet/registry:hk-20260811-v3
+          image: teethlink-global-registry.cn-hongkong.cr.aliyuncs.com/beenet/registry:hk-20260819-contrib-v1
           imagePullPolicy: Always
           command:
             - /bin/sh
@@ -76,11 +76,11 @@ spec:
             periodSeconds: 5
           resources:
             requests:
-              cpu: 50m
+              cpu: 25m
               memory: 64Mi
             limits:
-              cpu: 500m
-              memory: 128Mi
+              cpu: 250m
+              memory: 512Mi
 ---
 apiVersion: v1
 kind: Service

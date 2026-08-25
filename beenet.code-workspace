@@ -8,6 +8,9 @@
 		},
 		{
 			"path": "../beenet-web"
+		},
+		{
+			"path": "../spin"
 		}
 	],
 	"settings": {}

@@ -22,12 +22,17 @@ final class ContributorModel: ObservableObject {
     @Published var memoryHistory: [Double] = []
     @Published var recentInvokes: [InvokeEvent] = []
     @Published var showSettings = false
+    @Published var cloudSessionToken: String
+    @Published var cloudEmail: String
+    @Published var cloudUserCode: String?
+    @Published var cloudLoginURL: URL?
+    @Published var cloudPoints: Int?
 
     private var refreshTask: Task<Void, Never>? = nil
+    private var loginTask: Task<Void, Never>? = nil
 
     init() {
         let defaults = UserDefaults.standard
-        let support = Paths.supportDirectory
         var configURL = defaults.string(forKey: "configPath").map(URL.init(fileURLWithPath:))
             ?? Paths.defaultConfigURL
         var snapshotValue: WorkerConfigSnapshot
@@ -36,17 +41,20 @@ final class ContributorModel: ObservableObject {
         {
             snapshotValue = WorkerConfigSnapshot.parse(toml: text)
         } else {
-            snapshotValue = WorkerConfigSnapshot.fresh(supportDir: support)
+            snapshotValue = WorkerConfigSnapshot.fresh()
             configURL = Paths.defaultConfigURL
             BundledRuntime.apply(to: &snapshotValue)
             try? snapshotValue.toml().write(to: configURL, atomically: true, encoding: .utf8)
             defaults.set(configURL.path, forKey: "configPath")
         }
         BundledRuntime.apply(to: &snapshotValue)
+        snapshotValue.wasmCacheDir = Paths.identityDirectory.path
         snapshot = snapshotValue
         configPath = configURL.path
         workingDirectory = Paths.supportDirectory.path
         workerPath = WorkerProcess.locateBinary()?.path ?? ""
+        cloudSessionToken = defaults.string(forKey: "cloudSessionToken") ?? ""
+        cloudEmail = defaults.string(forKey: "cloudEmail") ?? ""
         saveConfig()
         refreshTask = Task { [weak self] in
             while !Task.isCancelled {
@@ -78,7 +86,11 @@ final class ContributorModel: ObservableObject {
     }
 
     var hasIdentity: Bool {
-        Paths.isIdentityDirectory(URL(fileURLWithPath: snapshot.wasmCacheDir))
+        Paths.hasLocalIdentity
+    }
+
+    var hasCloudSession: Bool {
+        !cloudSessionToken.isEmpty
     }
 
     func applyPreset(_ preset: QuotaPreset) {
@@ -91,6 +103,7 @@ final class ContributorModel: ObservableObject {
 
     func saveConfig() {
         BundledRuntime.apply(to: &snapshot)
+        snapshot.wasmCacheDir = Paths.identityDirectory.path
         let url = URL(fileURLWithPath: configPath)
         try? FileManager.default.createDirectory(
             at: url.deletingLastPathComponent(),
@@ -104,17 +117,148 @@ final class ContributorModel: ObservableObject {
 
     func start() {
         saveConfig()
-        guard hasIdentity else {
-            message = "请先选择包含 identity.key 的身份目录"
+        guard hasCloudSession else {
+            message = "请先登录 Cloud 平台"
             openSettings()
             return
         }
-        runWorker("start") { [weak self] in
+        if hasIdentity {
+            runWorker("start") { [weak self] in
+                guard let self else { return }
+                if await self.waitUntilRunning() {
+                    self.message = "已开始贡献"
+                } else {
+                    self.message = self.startFailureMessage()
+                }
+            }
+            return
+        }
+        enrollThenStart()
+    }
+
+    func loginCloud() {
+        loginTask?.cancel()
+        busy = true
+        cloudLoginURL = nil
+        message = "正在连接 Cloud…"
+        LoginLog.write("loginCloud tapped")
+        loginTask = Task { [weak self] in
             guard let self else { return }
-            if await self.waitUntilRunning() {
-                self.message = "已开始贡献"
-            } else {
-                self.message = self.startFailureMessage()
+            do {
+                let started = try await CloudClient.startDeviceLogin()
+                try Task.checkCancellation()
+                self.cloudUserCode = started.user_code
+                guard let url = URL(string: started.verification_uri) else {
+                    throw CloudError.badURL
+                }
+                self.cloudLoginURL = url
+                let opened = Browser.open(url)
+                LoginLog.write("browser open \(opened) \(url.absoluteString)")
+                self.message = opened
+                    ? "已打开浏览器，登录后回到 App。配对码 \(started.user_code)"
+                    : "请点击下面的链接完成登录。配对码 \(started.user_code)"
+                let deadline = Date().addingTimeInterval(TimeInterval(started.expires_in))
+                while Date() < deadline {
+                    try Task.checkCancellation()
+                    let polled = try await CloudClient.pollDeviceLogin(deviceCode: started.device_code)
+                    if polled.status == "approved", let token = polled.token, let user = polled.user {
+                        self.persistCloudSession(token: token, email: user.email)
+                        self.cloudUserCode = nil
+                        self.cloudLoginURL = nil
+                        self.message = "已登录 \(user.email)"
+                        self.refreshCloudPoints()
+                        self.busy = false
+                        LoginLog.write("login approved \(user.email)")
+                        return
+                    }
+                    try await Task.sleep(nanoseconds: 2_000_000_000)
+                }
+                self.cloudUserCode = nil
+                self.message = "登录超时，请再点一次登录"
+            } catch is CancellationError {
+                self.cloudUserCode = nil
+                LoginLog.write("login cancelled")
+            } catch {
+                self.cloudUserCode = nil
+                self.message = error.localizedDescription
+                LoginLog.write("login failed: \(error.localizedDescription)")
+            }
+            self.busy = false
+        }
+    }
+
+    func logoutCloud() {
+        loginTask?.cancel()
+        persistCloudSession(token: "", email: "")
+        cloudUserCode = nil
+        cloudLoginURL = nil
+        cloudPoints = nil
+        message = "已退出 Cloud"
+    }
+
+    func refreshCloudPoints() {
+        let token = cloudSessionToken
+        guard !token.isEmpty else { return }
+        Task { [weak self] in
+            self?.cloudPoints = try? await CloudClient.points(session: token)
+        }
+    }
+
+    private func persistCloudSession(token: String, email: String) {
+        cloudSessionToken = token
+        cloudEmail = email
+        UserDefaults.standard.set(token, forKey: "cloudSessionToken")
+        UserDefaults.standard.set(email, forKey: "cloudEmail")
+    }
+
+    private func enrollThenStart() {
+        guard let binary = resolvedBinary() else {
+            message = WorkerError.missingBinary.errorDescription
+            return
+        }
+        busy = true
+        message = "正在向 Cloud 申请入网凭证…"
+        let session = cloudSessionToken
+        let config = URL(fileURLWithPath: configPath)
+        let cwd = URL(fileURLWithPath: workingDirectory)
+        let name = snapshot.name
+        let region = snapshot.region
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                let minted = try await CloudClient.mintBootstrapToken(session: session)
+                let output = try await Task.detached(priority: .userInitiated) {
+                    try WorkerProcess.run(
+                        binary: binary,
+                        config: config,
+                        workingDirectory: cwd,
+                        command: "enroll",
+                        extraArguments: ["--join-token-stdin"],
+                        stdin: minted.token_value + "\n"
+                    )
+                }.value
+                guard let peerId = WorkerProcess.parseEnroll(output) else {
+                    throw CloudError.decode(output.isEmpty ? "入网成功但没有返回 peer_id" : output)
+                }
+                try await CloudClient.claimWorker(
+                    session: session,
+                    peerId: peerId,
+                    name: name,
+                    region: region,
+                    tokenId: minted.id
+                )
+                self.message = "入网完成，正在开始贡献"
+                self.runWorker("start") { [weak self] in
+                    guard let self else { return }
+                    if await self.waitUntilRunning() {
+                        self.message = "已开始贡献"
+                    } else {
+                        self.message = self.startFailureMessage()
+                    }
+                }
+            } catch {
+                self.busy = false
+                self.message = error.localizedDescription
             }
         }
     }
@@ -153,28 +297,6 @@ final class ContributorModel: ObservableObject {
             liveSample = nil
         }
         recentInvokes = InvokeLog.recent(in: snapshot.wasmCacheDir)
-    }
-
-    func importIdentityDirectory() {
-        let panel = NSOpenPanel()
-        panel.canChooseFiles = false
-        panel.canChooseDirectories = true
-        panel.allowsMultipleSelection = false
-        panel.message = "选择已有的 wasm_cache_dir（目录中需包含 identity.key）"
-        panel.prompt = "导入"
-        guard panel.runModal() == .OK, let url = panel.url else {
-            return
-        }
-        let directory = url.standardizedFileURL
-        guard Paths.isIdentityDirectory(directory) else {
-            message = "该目录没有 identity.key，不能作为节点身份"
-            return
-        }
-        snapshot.wasmCacheDir = directory.path
-        workingDirectory = Paths.supportDirectory.path
-        saveConfig()
-        message = "已使用身份目录 \(directory.lastPathComponent)"
-        Task { await refreshStatus() }
     }
 
     func openSettings() {

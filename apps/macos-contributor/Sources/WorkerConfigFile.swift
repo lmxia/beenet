@@ -19,11 +19,11 @@ struct WorkerConfigSnapshot: Equatable {
     var registryURL: String { NetworkEndpoints.registryURL }
     var wasmFetchBase: String { NetworkEndpoints.wasmFetchBase }
 
-    static func fresh(supportDir: URL) -> WorkerConfigSnapshot {
+    static func fresh() -> WorkerConfigSnapshot {
         var snapshot = WorkerConfigSnapshot(
             name: "",
             region: "",
-            wasmCacheDir: supportDir.appendingPathComponent("cache").path,
+            wasmCacheDir: Paths.identityDirectory.path,
             vfkitPath: "",
             kernelPath: "",
             initrdPath: "",
@@ -69,12 +69,10 @@ struct WorkerConfigSnapshot: Equatable {
     }
 
     static func parse(toml: String) -> WorkerConfigSnapshot {
-        var snapshot = WorkerConfigSnapshot.fresh(
-            supportDir: Paths.supportDirectory
-        )
+        var snapshot = WorkerConfigSnapshot.fresh()
         snapshot.name = string(named: "name", in: toml) ?? snapshot.name
         snapshot.region = string(named: "region", in: toml) ?? snapshot.region
-        snapshot.wasmCacheDir = string(named: "wasm_cache_dir", in: toml) ?? snapshot.wasmCacheDir
+        snapshot.wasmCacheDir = Paths.identityDirectory.path
         snapshot.cpuPercent = int(named: "cpu_percent", in: toml) ?? snapshot.cpuPercent
         snapshot.memoryMb = int(named: "memory_mb", in: toml) ?? snapshot.memoryMb
         snapshot.pidsMax = int(named: "pids_max", in: toml) ?? snapshot.pidsMax
@@ -171,9 +169,13 @@ enum Paths {
         supportDirectory.appendingPathComponent("config.toml")
     }
 
-    static func isIdentityDirectory(_ url: URL) -> Bool {
+    static var identityDirectory: URL {
+        supportDirectory.appendingPathComponent("cache")
+    }
+
+    static var hasLocalIdentity: Bool {
         FileManager.default.fileExists(
-            atPath: url.appendingPathComponent("identity.key").path
+            atPath: identityDirectory.appendingPathComponent("identity.key").path
         )
     }
 }

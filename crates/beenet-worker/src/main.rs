@@ -37,7 +37,9 @@ use spin_factors_executor::{ComponentLoader, FactorsExecutor};
 use tokio::sync::{watch, RwLock, Semaphore};
 use tracing::{info, warn};
 
-use crate::executor::{invoke_prepared, load_factors_app, ExecOutcome};
+use crate::executor::{
+    invoke_prepared, load_factors_app, BeenetExecutor, BeenetExecutorApp, CpuMeter, ExecOutcome,
+};
 use crate::quota::apply_os_quota;
 
 /// CLI overrides for fields also set in `config.toml` under `[worker]`.
@@ -139,6 +141,8 @@ enum WorkerCommand {
     Stop,
     /// Show local worker status.
     Status,
+    /// Enroll this identity with a join token and exit. Does not start the VM.
+    Enroll,
     /// Remove local worker state. The worker must be stopped first.
     Remove,
     /// Alias for `remove`.
@@ -189,13 +193,13 @@ fn bootstrap_token(cli: &Args) -> Result<Option<String>> {
 
 pub struct TaskEntry {
     pub manifest: Manifest,
-    pub factors_app: Arc<spin_factors_executor::FactorsExecutorApp<BeenetFactors, ()>>,
+    pub factors_app: Arc<BeenetExecutorApp>,
     pub component_id: String,
     pub supported_cids: Vec<String>,
 }
 
 struct Runtime {
-    factors_executor: Arc<FactorsExecutor<BeenetFactors, ()>>,
+    factors_executor: Arc<BeenetExecutor>,
     wasm_cache_dir: PathBuf,
     wasm_fetch_base: Option<String>,
     wasm_fetch_bearer: Option<String>,
@@ -214,7 +218,7 @@ struct BeenetComponentLoader {
 }
 
 #[async_trait]
-impl ComponentLoader<BeenetFactors, ()> for BeenetComponentLoader {
+impl ComponentLoader<BeenetFactors, CpuMeter> for BeenetComponentLoader {
     async fn load_component(
         &self,
         engine: &spin_core::wasmtime::Engine,
@@ -230,7 +234,7 @@ impl ComponentLoader<BeenetFactors, ()> for BeenetComponentLoader {
 
 impl Runtime {
     fn new(
-        factors_executor: Arc<FactorsExecutor<BeenetFactors, ()>>,
+        factors_executor: Arc<BeenetExecutor>,
         s: &WorkerSettings,
         worker_peer_id: String,
         worker_keypair: Arc<identity::Keypair>,
@@ -436,6 +440,7 @@ impl Runtime {
             body,
             stdout,
             stderr,
+            cpu_ns,
             mem_bytes,
             ai_usage,
         } = outcome;
@@ -449,6 +454,7 @@ impl Runtime {
 
         let usage = Usage {
             wall_ns: started.elapsed().as_nanos() as u64,
+            cpu_ns,
             mem_bytes,
             chargeable_memory_mb,
             ai_infer_calls: ai_usage.infer_calls,
@@ -1519,11 +1525,91 @@ async fn main() -> Result<()> {
     let cli = Args::parse();
     match cli.command.clone().unwrap_or(WorkerCommand::Join) {
         WorkerCommand::Join | WorkerCommand::RunInternal => run_worker(cli, &argv).await,
+        WorkerCommand::Enroll => enroll_worker(cli, &argv).await,
         WorkerCommand::Start => start_background(&cli, &argv),
         WorkerCommand::Stop => stop_background(&cli, &argv),
         WorkerCommand::Status => status_background(&cli, &argv),
         WorkerCommand::Remove | WorkerCommand::Rm => remove_worker(&cli, &argv),
     }
+}
+
+async fn enroll_worker(cli: Args, argv: &[String]) -> Result<()> {
+    let path = ensure_config_for_run(&cli, argv)?;
+    let mut file_cfg = beenet_common::config::load_file(&path)?;
+    if file_cfg
+        .worker
+        .as_mut()
+        .and_then(|worker| worker.join_token.take())
+        .is_some()
+    {
+        warn!("[worker].join_token is ignored; pass --join-token-stdin or --join-token-file");
+    }
+    let overrides = WorkerCliOverrides {
+        listen_addr: cli.listen_addr.clone(),
+        wasm_cache_dir: cli.wasm_cache_dir.clone(),
+        default_deadline_ms: cli.default_deadline_ms,
+        default_memory_mb: cli.default_memory_mb,
+        max_instance_memory_mb: cli.max_instance_memory_mb,
+        max_concurrency: cli.max_concurrency,
+        registry_url: cli.registry_url.clone(),
+        registry_heartbeat_path: cli.registry_heartbeat_path.clone(),
+        join_token: None,
+        registry_heartbeat_secs: cli.registry_heartbeat_secs,
+        wasm_fetch_base: cli.wasm_fetch_base.clone(),
+        wasm_fetch_bearer: cli.wasm_fetch_bearer.clone(),
+        wasm_fetch_timeout_secs: cli.wasm_fetch_timeout_secs,
+        region: cli.region.clone(),
+        name: cli.name.clone(),
+        quota: cli_quota(&cli),
+    };
+    let settings = beenet_common::config::resolve_worker_settings(&file_cfg, &overrides)?;
+    let token = bootstrap_token(&cli)?.context(
+        "enroll requires a bootstrap token through --join-token-stdin, --join-token-file, or --join-token",
+    )?;
+    fs::create_dir_all(&settings.wasm_cache_dir)
+        .with_context(|| format!("create `{}`", settings.wasm_cache_dir.display()))?;
+    let worker_name = beenet_common::display_name::resolve_persistent_display_name(
+        &settings.wasm_cache_dir,
+        settings.name.as_deref(),
+    )?;
+    let local_key = load_or_create_keypair(&settings.wasm_cache_dir)?;
+    let local_peer_id = PeerId::from(local_key.public());
+    let keypair_arc = Arc::new(local_key);
+    let peer_s = local_peer_id.to_string();
+    let join_url = registry_url(&settings.registry_url, "/v1/workers/join");
+    let heartbeat_url = registry_url(&settings.registry_url, &settings.registry_heartbeat_path);
+    let http = reqwest::Client::new();
+    do_join(
+        &http,
+        &join_url,
+        &keypair_arc,
+        &peer_s,
+        Vec::new(),
+        Vec::new(),
+        &token,
+        settings.region.as_deref(),
+        Some(worker_name.as_str()),
+    )
+    .await
+    .context("worker enrollment failed")?;
+    drop(token);
+    do_heartbeat(
+        &http,
+        &heartbeat_url,
+        &keypair_arc,
+        &peer_s,
+        Vec::new(),
+        Vec::new(),
+        settings.region.as_deref(),
+        Some(worker_name.as_str()),
+    )
+    .await?
+    .context("worker joined but heartbeat still reports it as unregistered")?;
+    println!("ok: true");
+    println!("peer_id: {local_peer_id}");
+    println!("name: {worker_name}");
+    println!("wasm_cache_dir: {}", settings.wasm_cache_dir.display());
+    Ok(())
 }
 
 async fn run_worker(cli: Args, argv: &[String]) -> Result<()> {

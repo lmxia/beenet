@@ -4,6 +4,7 @@ import SwiftUI
 final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
+        NSApp.applicationIconImage = BeenetIcon.app
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
@@ -30,18 +31,16 @@ struct BeenetApp: App {
                 }
                 .keyboardShortcut(",", modifiers: .command)
             }
-            CommandGroup(after: .appSettings) {
-                Button("导入身份目录…") {
-                    model.importIdentityDirectory()
-                }
-            }
         }
 
         MenuBarExtra {
             MenuBarView()
                 .environmentObject(model)
         } label: {
-            Label(model.menuTitle, systemImage: model.status.running ? "hexagon.fill" : "hexagon")
+            Image(nsImage: BeenetIcon.menuBar)
+                .renderingMode(.original)
+                .opacity(model.status.running ? 1 : 0.55)
+                .help(model.menuTitle)
         }
     }
 }

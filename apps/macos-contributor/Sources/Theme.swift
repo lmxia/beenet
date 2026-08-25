@@ -6,57 +6,49 @@ enum BeenetPalette {
     static let honeySoft = Color(red: 0.83, green: 0.48, blue: 0.16).opacity(0.16)
 }
 
-struct HexShape: Shape {
-    func path(in rect: CGRect) -> Path {
-        let w = rect.width
-        let h = rect.height
-        let points = [
-            CGPoint(x: w * 0.50, y: 0),
-            CGPoint(x: w, y: h * 0.25),
-            CGPoint(x: w, y: h * 0.75),
-            CGPoint(x: w * 0.50, y: h),
-            CGPoint(x: 0, y: h * 0.75),
-            CGPoint(x: 0, y: h * 0.25),
-        ]
-        var path = Path()
-        path.move(to: points[0])
-        for point in points.dropFirst() {
-            path.addLine(to: point)
+enum BeenetIcon {
+    static var app: NSImage {
+        if let url = Bundle.main.url(forResource: "AppIcon", withExtension: "icns"),
+           let image = NSImage(contentsOf: url) {
+            return image
         }
-        path.closeSubpath()
-        return path
+        return NSApp.applicationIconImage
+    }
+
+    static var menuBar: NSImage {
+        let image = app.copy() as? NSImage ?? app
+        image.size = NSSize(width: 18, height: 18)
+        image.isTemplate = false
+        return image
     }
 }
 
-struct HexMark: View {
+struct AppMark: View {
     let active: Bool
     @State private var pulse = false
 
     var body: some View {
-        ZStack {
-            HexShape()
-                .fill(BeenetPalette.honey.opacity(active ? 0.14 : 0.04))
-            HexShape()
-                .stroke(
-                    active ? BeenetPalette.honey : Color.primary.opacity(0.18),
-                    lineWidth: 1.2
-                )
-        }
-        .frame(width: 42, height: 46)
-        .opacity(active && pulse ? 1 : 0.82)
-        .onAppear {
-            guard active else { return }
-            withAnimation(.easeInOut(duration: 1.6).repeatForever(autoreverses: true)) {
-                pulse = true
-            }
-        }
-        .onChange(of: active) { nowActive in
-            pulse = false
-            if nowActive {
+        Image(nsImage: BeenetIcon.app)
+            .resizable()
+            .interpolation(.high)
+            .aspectRatio(contentMode: .fit)
+            .frame(width: 88, height: 88)
+            .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
+            .shadow(color: .black.opacity(active ? 0.2 : 0.1), radius: active ? 12 : 8, y: 4)
+            .opacity(active && pulse ? 1 : (active ? 0.94 : 0.88))
+            .onAppear {
+                guard active else { return }
                 withAnimation(.easeInOut(duration: 1.6).repeatForever(autoreverses: true)) {
                     pulse = true
                 }
             }
-        }
+            .onChange(of: active) { nowActive in
+                pulse = false
+                if nowActive {
+                    withAnimation(.easeInOut(duration: 1.6).repeatForever(autoreverses: true)) {
+                        pulse = true
+                    }
+                }
+            }
     }
 }

@@ -30,8 +30,22 @@ build-debug: ## Build debug binaries (registry + gateway)
 test: ## Run all workspace tests
 	cargo test --workspace
 
+GUEST_VM_CACHE ?= $(HOME)/Library/Caches/beenet/vm/alpine-3.24.1
+GUEST_KERNEL := $(GUEST_VM_CACHE)/extracted/boot/Image
+GUEST_INITRD := $(GUEST_VM_CACHE)/beenet-alpine-3.24.1-aarch64-initramfs.img
+
+.PHONY: guest-image
+guest-image: ## Build the Alpine kernel + musl guest worker initramfs
+	chmod +x scripts/build-macos-vm-image.sh
+	scripts/build-macos-vm-image.sh
+
 .PHONY: app-macos
 app-macos: ## Build the unsigned macOS contributor app
+	@if [ ! -f "$(GUEST_KERNEL)" ] || [ ! -f "$(GUEST_INITRD)" ]; then \
+	  echo "guest image missing; building with scripts/build-macos-vm-image.sh"; \
+	  $(MAKE) guest-image; \
+	fi
+	cargo build --release -p beenet-worker
 	chmod +x apps/macos-contributor/build.sh
 	apps/macos-contributor/build.sh
 

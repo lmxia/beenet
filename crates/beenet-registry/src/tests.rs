@@ -86,6 +86,7 @@ mod join_token_tests {
         JoinTokenRecord {
             id: "token-id".to_string(),
             description: "test".to_string(),
+            issued_by: None,
             token_hash: hash_join_token(token_value),
             created_at_unix_ms: 1,
             expires_at: Instant::now() + Duration::from_secs(60),

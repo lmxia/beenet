@@ -342,6 +342,7 @@ async fn redis_gateway_load_all(
 struct JoinTokenRecord {
     id: String,
     description: String,
+    issued_by: Option<String>,
     token_hash: [u8; 32],
     created_at_unix_ms: u64,
     expires_at: Instant,
@@ -402,6 +403,9 @@ struct ActiveGateway {
 struct CreateTokenBody {
     #[serde(default)]
     description: String,
+    /// Cloud user id, `admin`, or other issuer label recorded with the token.
+    #[serde(default)]
+    issued_by: Option<String>,
     ttl_secs: Option<u64>,
 }
 
@@ -409,6 +413,8 @@ struct CreateTokenBody {
 struct TokenView {
     id: String,
     description: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    issued_by: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     token_value: Option<String>,
     created_at_unix_ms: u64,
@@ -421,6 +427,7 @@ impl From<&JoinTokenRecord> for TokenView {
         TokenView {
             id: r.id.clone(),
             description: r.description.clone(),
+            issued_by: r.issued_by.clone(),
             token_value: None,
             created_at_unix_ms: r.created_at_unix_ms,
             expires_at_unix_ms: r.expires_at_unix_ms,
@@ -687,13 +694,22 @@ async fn admin_auth_middleware(
 
 // ── Admin: join token CRUD ─────────────────────────────────────────────────
 
-fn mint_join_token(description: String, ttl_secs: u64) -> (JoinTokenRecord, String) {
+fn mint_join_token(
+    description: String,
+    issued_by: Option<String>,
+    ttl_secs: u64,
+) -> (JoinTokenRecord, String) {
     let now_instant = Instant::now();
     let now_unix_ms = unix_ms_now();
     let token_value = format!("{}.{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+    let issued_by = issued_by.and_then(|value| {
+        let value = value.trim().to_string();
+        (!value.is_empty()).then_some(value)
+    });
     let record = JoinTokenRecord {
         id: Uuid::new_v4().to_string(),
         description,
+        issued_by,
         token_hash: hash_join_token(&token_value),
         created_at_unix_ms: now_unix_ms,
         expires_at: now_instant + Duration::from_secs(ttl_secs),
@@ -710,12 +726,12 @@ async fn create_token(
         Ok(ttl_secs) => ttl_secs,
         Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
     };
-    let (record, token_value) = mint_join_token(body.description, ttl_secs);
+    let (record, token_value) = mint_join_token(body.description, body.issued_by, ttl_secs);
     let mut view = TokenView::from(&record);
     view.token_value = Some(token_value);
     let id = record.id.clone();
     state.join_tokens.write().await.insert(id.clone(), record);
-    info!(%id, ttl_secs, "worker join token created");
+    info!(%id, ttl_secs, issued_by = ?view.issued_by, "worker join token created");
     (StatusCode::CREATED, Json(view)).into_response()
 }
 
@@ -742,7 +758,7 @@ async fn create_gateway_token(
         Ok(ttl_secs) => ttl_secs,
         Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
     };
-    let (record, token_value) = mint_join_token(body.description, ttl_secs);
+    let (record, token_value) = mint_join_token(body.description, body.issued_by, ttl_secs);
     let mut view = TokenView::from(&record);
     view.token_value = Some(token_value);
     let id = record.id.clone();

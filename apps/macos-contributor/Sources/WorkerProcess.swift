@@ -42,17 +42,29 @@ enum WorkerProcess {
         binary: URL,
         config: URL,
         workingDirectory: URL,
-        command: String
+        command: String,
+        extraArguments: [String] = [],
+        stdin: String? = nil
     ) throws -> String {
         let process = Process()
         process.executableURL = binary
-        process.arguments = ["--config", config.path, command]
+        process.arguments = extraArguments + ["--config", config.path, command]
         process.currentDirectoryURL = workingDirectory
         let stdout = Pipe()
         let stderr = Pipe()
         process.standardOutput = stdout
         process.standardError = stderr
-        try process.run()
+        if let stdin {
+            let input = Pipe()
+            process.standardInput = input
+            try process.run()
+            if let data = stdin.data(using: .utf8) {
+                input.fileHandleForWriting.write(data)
+            }
+            try input.fileHandleForWriting.close()
+        } else {
+            try process.run()
+        }
         process.waitUntilExit()
         let out = String(data: stdout.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
         let err = String(data: stderr.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
@@ -61,6 +73,18 @@ enum WorkerProcess {
             throw WorkerError.commandFailed(command, combined)
         }
         return combined
+    }
+
+    static func parseEnroll(_ text: String) -> String? {
+        for line in text.split(whereSeparator: \.isNewline) {
+            let parts = line.split(separator: ":", maxSplits: 1).map {
+                $0.trimmingCharacters(in: .whitespaces)
+            }
+            if parts.count == 2, parts[0] == "peer_id" {
+                return parts[1]
+            }
+        }
+        return nil
     }
 
     static func parseStatus(_ text: String) -> WorkerStatus {

@@ -30,10 +30,12 @@ struct MainView: View {
         }
         .onAppear {
             WindowChrome.apply()
-            if !model.hasIdentity {
-                model.message = "请先选择包含 identity.key 的身份目录"
-                model.showSettings = true
+            if !model.hasCloudSession {
+                model.message = "请先登录 Cloud 平台"
+            } else if !model.hasIdentity {
+                model.message = "点「开始贡献」，会向 Cloud 申请入网"
             }
+            model.refreshCloudPoints()
         }
         .sheet(isPresented: $model.showSettings) {
             SettingsView()
@@ -50,7 +52,7 @@ struct ContributePage: View {
         VStack(spacing: 0) {
             Spacer(minLength: 8)
             VStack(spacing: 14) {
-                HexMark(active: model.status.running)
+                AppMark(active: model.status.running)
                 Text(model.status.running ? "贡献中" : "已暂停")
                     .font(.system(size: 34, weight: .regular, design: .serif))
                     .tracking(1)
@@ -68,20 +70,27 @@ struct ContributePage: View {
                     .multilineTextAlignment(.center)
                     .padding(.top, 16)
             }
+            if let url = model.cloudLoginURL {
+                Link("打不开浏览器的话，点这里打开登录页", destination: url)
+                    .font(.system(size: 12, weight: .medium))
+                    .padding(.top, 8)
+            }
             Spacer(minLength: 24)
             Button {
-                if model.status.running {
+                if !model.hasCloudSession {
+                    model.loginCloud()
+                } else if model.status.running {
                     model.stop()
                 } else {
                     model.start()
                 }
             } label: {
-                Text(model.busy ? "正在切换…" : (model.status.running ? "停止贡献" : "开始贡献"))
+                Text(primaryButtonTitle)
                     .font(.system(size: 15, weight: .semibold))
                     .frame(maxWidth: .infinity)
                     .frame(height: 46)
             }
-            .buttonStyle(HoneyButtonStyle(emphasized: !model.status.running))
+            .buttonStyle(HoneyButtonStyle(emphasized: !model.status.running || !model.hasCloudSession))
             .disabled(model.busy)
             HStack(spacing: 20) {
                 Button("设置") { model.openSettings() }
@@ -93,6 +102,19 @@ struct ContributePage: View {
             .foregroundStyle(.secondary)
             .padding(.top, 16)
         }
+    }
+
+    private var primaryButtonTitle: String {
+        if !model.hasCloudSession {
+            if !model.busy {
+                return "登录 Cloud 平台"
+            }
+            return model.cloudUserCode == nil ? "正在连接 Cloud…" : "等待浏览器登录…"
+        }
+        if model.busy {
+            return "正在切换…"
+        }
+        return model.status.running ? "停止贡献" : "开始贡献"
     }
 
     private var quota: some View {
@@ -140,11 +162,13 @@ struct ContributePage: View {
         if !model.snapshot.region.isEmpty {
             parts.append(model.snapshot.region)
         }
-        if !model.hasIdentity {
-            parts.append("未选择身份")
+        if !model.hasCloudSession {
+            parts.append("未登录 Cloud")
+        } else if !model.hasIdentity {
+            parts.append("尚未入网")
         }
         if parts.isEmpty {
-            return "在设置里填写名称、地区，并选择身份目录"
+            return model.hasCloudSession ? "已登录 Cloud" : "在设置里登录 Cloud，再开始贡献"
         }
         return parts.joined(separator: "  ·  ")
     }
@@ -347,8 +371,10 @@ struct MenuBarView: View {
     @EnvironmentObject var model: ContributorModel
 
     var body: some View {
-        Button(model.status.running ? "停止贡献" : "开始贡献") {
-            if model.status.running {
+        Button(model.status.running ? "停止贡献" : (model.hasCloudSession ? "开始贡献" : "登录 Cloud 平台")) {
+            if !model.hasCloudSession {
+                model.loginCloud()
+            } else if model.status.running {
                 model.stop()
             } else {
                 model.start()
@@ -372,7 +398,6 @@ struct MenuBarView: View {
         }
         Divider()
         Button("设置…") { model.openSettings() }
-        Button("导入身份目录…") { model.importIdentityDirectory() }
         Divider()
         Button("退出 Beenet") {
             NSApplication.shared.terminate(nil)
@@ -390,13 +415,48 @@ struct SettingsView: View {
                     .font(.headline)
                 Spacer()
                 Button("完成") { model.showSettings = false }
-                    .keyboardShortcut(.defaultAction)
             }
             .padding(.horizontal, 20)
             .padding(.vertical, 14)
             Divider()
             ScrollView {
                 VStack(alignment: .leading, spacing: 22) {
+                    VStack(alignment: .leading, spacing: 10) {
+                        Text("Cloud")
+                            .font(.system(size: 11, weight: .semibold))
+                            .tracking(1.4)
+                            .foregroundStyle(.secondary)
+                        if model.hasCloudSession {
+                            labeled("账号") {
+                                Text(model.cloudEmail)
+                                    .font(.caption)
+                                    .textSelection(.enabled)
+                            }
+                            if let points = model.cloudPoints {
+                                labeled("积分") {
+                                    Text("\(points)")
+                                        .font(.system(size: 20, weight: .medium, design: .serif))
+                                }
+                            }
+                            HStack {
+                                Button("刷新积分") { model.refreshCloudPoints() }
+                                Button("退出登录") { model.logoutCloud() }
+                            }
+                        } else {
+                            Text(settingsLoginHint)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            Button(loginButtonTitle) {
+                                model.loginCloud()
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .disabled(model.busy)
+                            if let url = model.cloudLoginURL {
+                                Link("打开登录页 \(url.absoluteString)", destination: url)
+                                    .font(.caption)
+                            }
+                        }
+                    }
                     VStack(alignment: .leading, spacing: 10) {
                         Text("节点")
                             .font(.system(size: 11, weight: .semibold))
@@ -410,14 +470,10 @@ struct SettingsView: View {
                             TextField("cn-hongkong", text: $model.snapshot.region)
                                 .textFieldStyle(.roundedBorder)
                         }
-                        labeled("身份") {
-                            VStack(alignment: .leading, spacing: 8) {
-                                Text(identityCaption)
-                                    .font(.caption)
-                                    .foregroundStyle(model.hasIdentity ? .secondary : Color.red)
-                                    .textSelection(.enabled)
-                                Button("选择身份目录…") { model.importIdentityDirectory() }
-                            }
+                        labeled("入网") {
+                            Text(identityCaption)
+                                .font(.caption)
+                                .foregroundStyle(model.hasIdentity ? .secondary : Color.primary)
                         }
                     }
                     VStack(alignment: .leading, spacing: 10) {
@@ -459,13 +515,30 @@ struct SettingsView: View {
         }
     }
 
+    private var settingsLoginHint: String {
+        if let message = model.displayMessage, !message.isEmpty {
+            return message
+        }
+        if let code = model.cloudUserCode {
+            return "已打开浏览器，配对码 \(code)"
+        }
+        return "登录后才能申请入网并开始贡献。"
+    }
+
+    private var loginButtonTitle: String {
+        if !model.busy {
+            return "登录 Cloud 平台"
+        }
+        return model.cloudUserCode == nil ? "正在连接 Cloud…" : "等待浏览器登录…"
+    }
+
     private var identityCaption: String {
+        if !model.hasCloudSession {
+            return "登录 Cloud 后，开始贡献时会自动申请入网。"
+        }
         if model.hasIdentity {
-            return model.snapshot.wasmCacheDir
+            return "本机节点已入网，密钥由 Cloud 签发后保存在本机。"
         }
-        if model.snapshot.wasmCacheDir.isEmpty {
-            return "还没有选择，目录里需要有 identity.key"
-        }
-        return "\(model.snapshot.wasmCacheDir)\n这个目录没有 identity.key"
+        return "尚未入网。开始贡献时会向 Cloud 申请凭证并完成本机登记。"
     }
 }

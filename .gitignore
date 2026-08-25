@@ -9,6 +9,7 @@
 .env.*
 !.env.example
 /apps/macos-contributor/dist/
+/apps/macos-contributor/Assets/AppIcon.png
 *.dmg
 .vscode/*
 !.vscode/launch.json

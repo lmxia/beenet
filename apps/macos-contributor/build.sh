@@ -30,6 +30,7 @@ swiftc \
     "$SRC/Sources/Quota.swift" \
     "$SRC/Sources/Theme.swift" \
     "$SRC/Sources/WorkerConfigFile.swift" \
+    "$SRC/Sources/CloudClient.swift" \
     "$SRC/Sources/WorkerProcess.swift" \
     "$SRC/Sources/ProcessMeter.swift" \
     "$SRC/Sources/ContributorModel.swift" \
@@ -39,11 +40,32 @@ swiftc \
 cp "$SRC/Info.plist" "$DIST/Contents/Info.plist"
 printf 'APPL????' > "$DIST/Contents/PkgInfo"
 
-WORKER_BIN=${BEENET_WORKER_BIN:-"$ROOT_DIR/target/release/beenet-worker"}
+ICON_SRC="$SRC/Assets/AppIcon-source.png"
+ICON_ICNS="$SRC/Assets/AppIcon.icns"
+if [ ! -f "$ICON_ICNS" ] || { [ -f "$ICON_SRC" ] && [ "$ICON_SRC" -nt "$ICON_ICNS" ]; }; then
+    "$SRC/scripts/make-appicon.sh" "$ICON_SRC" "$SRC/Assets/AppIcon.png" "$ICON_ICNS"
+fi
+if [ ! -f "$ICON_ICNS" ]; then
+    echo "error: missing $ICON_ICNS" >&2
+    exit 1
+fi
+cp "$ICON_ICNS" "$RESOURCES/AppIcon.icns"
+echo "bundled icon: $RESOURCES/AppIcon.icns"
+
+WORKER_BIN=${BEENET_WORKER_BIN:-}
+if [ -z "$WORKER_BIN" ]; then
+    echo "building host worker: cargo build --release -p beenet-worker"
+    (cd "$ROOT_DIR" && cargo build --release -p beenet-worker)
+    WORKER_BIN="$ROOT_DIR/target/release/beenet-worker"
+fi
 if [ -x "$WORKER_BIN" ]; then
     cp "$WORKER_BIN" "$MACOS/beenet-worker"
     chmod +x "$MACOS/beenet-worker"
     echo "bundled worker: $MACOS/beenet-worker"
+    "$MACOS/beenet-worker" --help | grep -q enroll || {
+        echo "error: bundled beenet-worker is missing the enroll subcommand" >&2
+        exit 1
+    }
 else
     echo "error: $WORKER_BIN not found; build with cargo build --release -p beenet-worker" >&2
     exit 1
@@ -86,6 +108,7 @@ if command -v codesign >/dev/null 2>&1; then
     codesign --sign - --force --timestamp=none --entitlements "$ENTITLEMENTS" "$MACOS/vfkit" >/dev/null
     codesign --sign - --force --timestamp=none --entitlements "$ENTITLEMENTS" "$MACOS/beenet-worker" >/dev/null
     codesign --sign - --force --timestamp=none --entitlements "$ENTITLEMENTS" "$MACOS/Beenet" >/dev/null
+    codesign --sign - --force --timestamp=none --entitlements "$ENTITLEMENTS" "$DIST" >/dev/null
     echo "signed with virtualization entitlement"
 fi
 

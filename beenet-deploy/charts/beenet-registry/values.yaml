@@ -14,11 +14,11 @@ service:
 
 resources:
   requests:
-    cpu: 50m
+    cpu: 25m
     memory: 64Mi
   limits:
-    cpu: 500m
-    memory: 128Mi
+    cpu: 250m
+    memory: 512Mi
 
 # ── Redis ───────────────────────────────────────────────────────────────────
 # enabled=true  → deploy a single-pod Redis alongside the registry (default).

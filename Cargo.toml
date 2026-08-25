@@ -28,7 +28,7 @@ beenet-artifact = { path = "crates/beenet-artifact" }
 beenet-factors = { path = "crates/beenet-factors" }
 
 # ---- core runtime ----
-wasmtime          = { version = "43", features = ["component-model-async"] }
+wasmtime          = { version = "43", features = ["component-model-async", "call-hook"] }
 wasmtime-wasi     = { version = "43", features = ["p2", "p3"] }
 wasmtime-wasi-http = { version = "43", features = ["p2", "p3", "component-model-async"] }
 wasm-encoder      = "0.245"
@@ -89,7 +89,7 @@ redis = { version = "1", features = ["tokio-comp", "connection-manager"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 # Spin host embedding (M1.5): checkout `spin` as sibling of `beenet` (see `beenet.code-workspace`).
 spin-app = { path = "../spin/crates/app" }
-spin-core = { path = "../spin/crates/core" }
+spin-core = { path = "../spin/crates/core", features = ["call-hook"] }
 spin-factors = { path = "../spin/crates/factors" }
 spin-factors-executor = { path = "../spin/crates/factors-executor" }
 spin-locked-app = { path = "../spin/crates/locked-app" }
