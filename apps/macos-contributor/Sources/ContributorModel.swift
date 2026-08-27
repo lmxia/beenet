@@ -65,8 +65,18 @@ final class ContributorModel: ObservableObject {
         }
     }
 
+    var isContributing: Bool {
+        status.running && status.heartbeat
+    }
+
     var menuTitle: String {
-        status.running ? "Beenet · 贡献中" : "Beenet · 已暂停"
+        if isContributing {
+            return "Beenet · 贡献中"
+        }
+        if status.running {
+            return "Beenet · 未在线"
+        }
+        return "Beenet · 已暂停"
     }
 
     var displayMessage: String? {

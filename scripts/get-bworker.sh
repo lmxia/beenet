@@ -58,6 +58,11 @@ Defaults (CLI flags override; existing config values are kept unless overridden)
   --quota-cpu-percent       ${DEFAULT_CPU_PERCENT}
   --quota-memory-mb         ${DEFAULT_MEMORY_MB}
   --quota-pids-max          ${DEFAULT_PIDS_MAX}
+
+Quota writes cgroup v2 (cpu.max / memory.max / pids.max) from bworker itself.
+systemd only starts the process — use Delegate=yes, do not set CPUQuota/MemoryMax.
+Needs a writable cgroup subtree (root, sudo, or systemd Delegate=yes).
+
   --name NAME               display name (default: Docker-style auto name)
   --region REGION           registry affinity, e.g. cn-hongkong (default: empty)
 
@@ -450,6 +455,9 @@ echo "alias     ${PREFIX}/bworker"
 
 write_worker_config
 echo "config    ${CONFIG}"
+if [[ "$(id -u)" -ne 0 ]]; then
+  echo "note: [worker.quota] is applied by bworker via cgroup v2; systemd should only Delegate=yes" >&2
+fi
 
 if [[ "${INSTALL_ONLY}" -eq 1 ]]; then
   echo "later runs: bworker"

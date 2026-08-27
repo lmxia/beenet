@@ -39,7 +39,7 @@ struct BeenetApp: App {
         } label: {
             Image(nsImage: BeenetIcon.menuBar)
                 .renderingMode(.original)
-                .opacity(model.status.running ? 1 : 0.55)
+                .opacity(model.isContributing ? 1 : 0.55)
                 .help(model.menuTitle)
         }
     }

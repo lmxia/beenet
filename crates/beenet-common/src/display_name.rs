@@ -2,6 +2,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result};
 
@@ -36,6 +37,40 @@ pub fn clear_registry_joined(dir: &Path) -> Result<()> {
         fs::remove_file(&path).with_context(|| format!("remove `{}`", path.display()))?;
     }
     Ok(())
+}
+
+/// Written on each successful registry heartbeat. Cloud online uses a 60s lease.
+pub const REGISTRY_HEARTBEAT_FILE: &str = "registry-heartbeat";
+pub const REGISTRY_HEARTBEAT_FRESH: Duration = Duration::from_secs(60);
+
+pub fn registry_heartbeat_path(dir: &Path) -> PathBuf {
+    dir.join(REGISTRY_HEARTBEAT_FILE)
+}
+
+pub fn mark_registry_heartbeat(dir: &Path) -> Result<()> {
+    fs::create_dir_all(dir).with_context(|| format!("create `{}`", dir.display()))?;
+    let path = registry_heartbeat_path(dir);
+    fs::write(&path, "1\n").with_context(|| format!("write `{}`", path.display()))?;
+    Ok(())
+}
+
+pub fn clear_registry_heartbeat(dir: &Path) -> Result<()> {
+    let path = registry_heartbeat_path(dir);
+    if path.exists() {
+        fs::remove_file(&path).with_context(|| format!("remove `{}`", path.display()))?;
+    }
+    Ok(())
+}
+
+/// Seconds since the last successful heartbeat marker, if present.
+pub fn registry_heartbeat_age_secs(dir: &Path) -> Option<u64> {
+    let meta = fs::metadata(registry_heartbeat_path(dir)).ok()?;
+    let modified = meta.modified().ok()?;
+    Some(SystemTime::now().duration_since(modified).ok()?.as_secs())
+}
+
+pub fn is_registry_heartbeat_fresh(dir: &Path) -> bool {
+    registry_heartbeat_age_secs(dir).is_some_and(|age| age <= REGISTRY_HEARTBEAT_FRESH.as_secs())
 }
 
 /// Left half — inspired by Docker's `names-generator` adjectives.
@@ -501,6 +536,23 @@ mod tests {
         assert!(is_registry_joined(&dir));
         clear_registry_joined(&dir).unwrap();
         assert!(!is_registry_joined(&dir));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn registry_heartbeat_marker_is_fresh() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("beenet-registry-heartbeat-{nanos}"));
+        fs::create_dir_all(&dir).unwrap();
+        assert!(!is_registry_heartbeat_fresh(&dir));
+        mark_registry_heartbeat(&dir).unwrap();
+        assert!(is_registry_heartbeat_fresh(&dir));
+        assert!(registry_heartbeat_age_secs(&dir).unwrap() < 5);
+        clear_registry_heartbeat(&dir).unwrap();
+        assert!(!is_registry_heartbeat_fresh(&dir));
         let _ = fs::remove_dir_all(&dir);
     }
 }

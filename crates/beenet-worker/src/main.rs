@@ -61,7 +61,7 @@ fn worker_log_path(wasm_cache_dir: &Path) -> PathBuf {
 #[command(
     name = "beenet-worker",
     about = "Beenet worker",
-    after_help = "bworker is a PATH alias of beenet-worker.\nLinux (no subcommand): first run enrolls, later runs start the daemon.\n  curl -fsSL -o get-bworker.sh https://github.com/lmxia/beenet/releases/latest/download/get-bworker.sh\n  ./get-bworker.sh --join-token-file ./join-token\n  bworker"
+    after_help = "bworker is a PATH alias of beenet-worker.\nLinux (no subcommand): first run enrolls, later runs start the daemon.\n  curl -fsSL -o get-bworker.sh https://github.com/lmxia/beenet/releases/latest/download/get-bworker.sh\n  ./get-bworker.sh --join-token-file ./join-token\n  bworker\nLinux [worker.quota] CPU/memory/pids write cgroup v2 and need sudo, or systemd Delegate=yes."
 )]
 struct Args {
     /// `config.toml` path (default: platform config dir `beenet/config.toml`).
@@ -133,15 +133,15 @@ struct Args {
     #[arg(long, global = true)]
     name: Option<String>,
 
-    /// Whole-worker CPU budget as a percentage of one logical CPU.
+    /// Whole-worker CPU budget as a percentage of one logical CPU (Linux cgroup v2; needs sudo or systemd Delegate=yes).
     #[arg(long, global = true)]
     quota_cpu_percent: Option<u32>,
 
-    /// Whole-worker memory cap in MB.
+    /// Whole-worker memory cap in MB (Linux cgroup v2; needs sudo or systemd Delegate=yes).
     #[arg(long, global = true)]
     quota_memory_mb: Option<u32>,
 
-    /// Whole-worker process/thread cap.
+    /// Whole-worker process/thread cap (Linux cgroup v2; needs sudo or systemd Delegate=yes).
     #[arg(long, global = true)]
     quota_pids_max: Option<u32>,
 
@@ -944,7 +944,7 @@ fn pid_matches_worker(pid: u32) -> bool {
         return false;
     }
     let command = String::from_utf8_lossy(&output.stdout);
-    command.contains("beenet-worker") || command.contains("vfkit")
+    command.contains("beenet-worker") || command.contains("bworker") || command.contains("vfkit")
 }
 
 #[cfg(not(unix))]
@@ -1081,6 +1081,10 @@ fn start_background(cli: &Args, argv: &[String]) -> Result<()> {
         let (config_path, settings) = load_worker_settings(cli, argv)?;
         fs::create_dir_all(&settings.wasm_cache_dir)
             .with_context(|| format!("create `{}`", settings.wasm_cache_dir.display()))?;
+        #[cfg(target_os = "linux")]
+        if crate::quota::linux_cgroup_quota_needs_sudo(&settings.quota) {
+            eprintln!("{}", crate::quota::LINUX_CGROUP_QUOTA_HINT);
+        }
 
         #[cfg(target_os = "macos")]
         if settings.backend == WorkerBackend::Vm {
@@ -1123,9 +1127,92 @@ fn start_background(cli: &Args, argv: &[String]) -> Result<()> {
         let pid = child.id();
         fs::write(&pid_path, format!("{pid}\n"))
             .with_context(|| format!("write `{}`", pid_path.display()))?;
+        std::thread::sleep(Duration::from_millis(800));
+        if !worker_pid_is_running(pid) {
+            let _ = fs::remove_file(&pid_path);
+            let tail = last_log_lines(&log_path, 16);
+            anyhow::bail!(
+                "worker pid {pid} exited immediately; see `{}`{}",
+                log_path.display(),
+                if tail.is_empty() {
+                    String::new()
+                } else {
+                    format!(":\n{tail}")
+                }
+            );
+        }
         println!("worker started with pid {pid}");
         Ok(())
     }
+}
+
+fn last_log_lines(path: &Path, n: usize) -> String {
+    let Ok(text) = fs::read_to_string(path) else {
+        return String::new();
+    };
+    let lines: Vec<&str> = text.lines().collect();
+    let start = lines.len().saturating_sub(n);
+    lines[start..].join("\n")
+}
+
+fn guest_log_heartbeat_fresh(wasm_cache_dir: &Path) -> bool {
+    let log = wasm_cache_dir.join("logs").join("worker.log");
+    let Ok(text) = fs::read_to_string(&log) else {
+        return false;
+    };
+    let Some(line) = text
+        .lines()
+        .rev()
+        .find(|line| line.contains("registry heartbeat ok"))
+    else {
+        return false;
+    };
+    let Some(stamp) = line.split_whitespace().next() else {
+        return false;
+    };
+    let Some(when) = parse_utc_stamp(stamp) else {
+        return false;
+    };
+    SystemTime::now()
+        .duration_since(when)
+        .ok()
+        .is_some_and(|age| age.as_secs() <= beenet_common::display_name::REGISTRY_HEARTBEAT_FRESH.as_secs())
+}
+
+fn parse_utc_stamp(stamp: &str) -> Option<SystemTime> {
+    let stamp = stamp.trim_end_matches('Z');
+    let (date, time) = stamp.split_once('T')?;
+    let mut date = date.split('-');
+    let year: i32 = date.next()?.parse().ok()?;
+    let month: u32 = date.next()?.parse().ok()?;
+    let day: u32 = date.next()?.parse().ok()?;
+    let time = time.split(['.', '+']).next()?;
+    let mut time = time.split(':');
+    let hour: u32 = time.next()?.parse().ok()?;
+    let minute: u32 = time.next()?.parse().ok()?;
+    let second: u32 = time.next()?.parse().ok()?;
+    let days = unix_days(year, month, day)?;
+    let secs = days
+        .checked_mul(86400)?
+        .checked_add(i64::from(hour) * 3600)?
+        .checked_add(i64::from(minute) * 60)?
+        .checked_add(i64::from(second))?;
+    Some(UNIX_EPOCH + Duration::from_secs(u64::try_from(secs).ok()?))
+}
+
+fn unix_days(year: i32, month: u32, day: u32) -> Option<i64> {
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    let y = i64::from(year);
+    let m = i64::from(month);
+    let d = i64::from(day);
+    let (y, m) = if m <= 2 { (y - 1, m + 9) } else { (y, m - 3) };
+    let era = y.div_euclid(400);
+    let yoe = y.rem_euclid(400);
+    let doy = (153 * m + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    Some(era * 146097 + doe - 719468)
 }
 
 fn stop_background(cli: &Args, argv: &[String]) -> Result<()> {
@@ -1193,9 +1280,26 @@ fn status_background(cli: &Args, argv: &[String]) -> Result<()> {
         "enrolled: {}",
         beenet_common::display_name::is_registry_joined(&settings.wasm_cache_dir)
     );
+    let heartbeat = beenet_common::display_name::is_registry_heartbeat_fresh(&settings.wasm_cache_dir)
+        || guest_log_heartbeat_fresh(&settings.wasm_cache_dir);
+    println!("heartbeat: {heartbeat}");
+    if let Some(age) = beenet_common::display_name::registry_heartbeat_age_secs(&settings.wasm_cache_dir)
+    {
+        println!("heartbeat_age_secs: {age}");
+    }
     println!("running: {running}");
     if let Some(pid) = pid {
         println!("pid: {pid}");
+    }
+    if !running {
+        let log_path = worker_log_path(&settings.wasm_cache_dir);
+        if log_path.exists() {
+            println!("log: {}", log_path.display());
+        }
+    }
+    #[cfg(target_os = "linux")]
+    if !running && crate::quota::linux_cgroup_quota_needs_sudo(&settings.quota) {
+        println!("quota: needs sudo (cgroup v2) or systemd Delegate=yes");
     }
     if let Some(name) = name {
         println!("name: {name}");
@@ -1219,11 +1323,13 @@ fn remove_worker(cli: &Args, argv: &[String]) -> Result<()> {
         .wasm_cache_dir
         .join(beenet_common::display_name::DISPLAY_NAME_FILE);
     let enrolled_path = beenet_common::display_name::registry_joined_path(&settings.wasm_cache_dir);
+    let heartbeat_path = beenet_common::display_name::registry_heartbeat_path(&settings.wasm_cache_dir);
     for path in [
         &pid_path,
         &identity_path,
         &display_name_path,
         &enrolled_path,
+        &heartbeat_path,
     ] {
         if path.exists() {
             fs::remove_file(path).with_context(|| format!("remove `{}`", path.display()))?;
@@ -1453,6 +1559,9 @@ async fn registry_heartbeat_loop(
                 if *gateway_tx.borrow() != merged {
                     let _ = gateway_tx.send(merged);
                 }
+                let _ = beenet_common::display_name::mark_registry_heartbeat(
+                    &runtime.wasm_cache_dir,
+                );
                 info!("registry heartbeat ok");
             }
             Ok(None) => {
@@ -1465,7 +1574,7 @@ async fn registry_heartbeat_loop(
                 );
             }
             Err(e) => {
-                warn!(error = %e, "registry heartbeat request error");
+                warn!(error = %format!("{e:#}"), "registry heartbeat request error");
             }
         }
     }
@@ -1849,6 +1958,7 @@ async fn enroll_worker(cli: Args, argv: &[String]) -> Result<()> {
     .await?
     .context("worker joined but heartbeat still reports it as unregistered")?;
     beenet_common::display_name::mark_registry_joined(&settings.wasm_cache_dir)?;
+    let _ = beenet_common::display_name::mark_registry_heartbeat(&settings.wasm_cache_dir);
     println!("ok: true");
     println!("peer_id: {local_peer_id}");
     println!("name: {worker_name}");
@@ -1951,6 +2061,7 @@ async fn run_worker(cli: Args, argv: &[String]) -> Result<()> {
     {
         Ok(Some(tip)) => {
             info!(peer_id = %local_peer_id, name = %worker_name, "worker already registered with registry");
+            let _ = beenet_common::display_name::mark_registry_heartbeat(&settings.wasm_cache_dir);
             tip
         }
         Ok(None) => {
@@ -1968,7 +2079,7 @@ async fn run_worker(cli: Args, argv: &[String]) -> Result<()> {
                 )
                 .await
                 .context("initial worker registration failed")?;
-                do_heartbeat(
+                let tip = do_heartbeat(
                     &http,
                     &heartbeat_url,
                     &keypair_arc,
@@ -1979,7 +2090,9 @@ async fn run_worker(cli: Args, argv: &[String]) -> Result<()> {
                     Some(worker_name.as_str()),
                 )
                 .await?
-                .context("worker joined but heartbeat still reports it as unregistered")?
+                .context("worker joined but heartbeat still reports it as unregistered")?;
+                let _ = beenet_common::display_name::mark_registry_heartbeat(&settings.wasm_cache_dir);
+                tip
             } else {
                 anyhow::bail!(
                     "worker is not registered; provide a fresh bootstrap token through \

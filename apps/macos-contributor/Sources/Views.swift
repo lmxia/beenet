@@ -52,8 +52,8 @@ struct ContributePage: View {
         VStack(spacing: 0) {
             Spacer(minLength: 8)
             VStack(spacing: 14) {
-                AppMark(active: model.status.running)
-                Text(model.status.running ? "贡献中" : "已暂停")
+                AppMark(active: model.isContributing)
+                Text(contributeTitle)
                     .font(.system(size: 34, weight: .regular, design: .serif))
                     .tracking(1)
                 Text(statusLine)
@@ -117,6 +117,16 @@ struct ContributePage: View {
         return model.status.running ? "停止贡献" : "开始贡献"
     }
 
+    private var contributeTitle: String {
+        if model.isContributing {
+            return "贡献中"
+        }
+        if model.status.running {
+            return "未在线"
+        }
+        return "已暂停"
+    }
+
     private var quota: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(alignment: .firstTextBaseline) {
@@ -166,6 +176,8 @@ struct ContributePage: View {
             parts.append("未登录 Cloud")
         } else if !model.hasIdentity {
             parts.append("尚未入网")
+        } else if model.status.running && !model.status.heartbeat {
+            parts.append("本机已启动，Cloud 未看到心跳")
         }
         if parts.isEmpty {
             return model.hasCloudSession ? "已登录 Cloud" : "在设置里登录 Cloud，再开始贡献"

@@ -3,6 +3,7 @@ import Foundation
 struct WorkerStatus: Equatable {
     var running = false
     var joined = false
+    var heartbeat = false
     var pid: Int?
     var name: String?
     var backend: String?
@@ -99,6 +100,8 @@ enum WorkerProcess {
                 status.running = parts[1] == "true"
             case "joined":
                 status.joined = parts[1] == "true"
+            case "heartbeat":
+                status.heartbeat = parts[1] == "true"
             case "pid":
                 status.pid = Int(parts[1])
             case "name":

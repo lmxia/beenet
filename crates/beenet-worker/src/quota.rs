@@ -7,6 +7,10 @@ use anyhow::{Context, Result};
 use beenet_common::config::WorkerQuotaSettings;
 use tracing::info;
 
+/// Shown when CPU/memory/pids quota is configured but this process cannot write cgroup v2.
+#[cfg(target_os = "linux")]
+pub const LINUX_CGROUP_QUOTA_HINT: &str = "warning: [worker.quota] writes cgroup v2 (cpu.max / memory.max / pids.max) and needs sudo, or a systemd unit with Delegate=yes";
+
 pub fn apply_os_quota(q: &WorkerQuotaSettings) -> Result<()> {
     if !quota_configured(q) {
         return Ok(());
@@ -14,7 +18,10 @@ pub fn apply_os_quota(q: &WorkerQuotaSettings) -> Result<()> {
 
     #[cfg(target_os = "linux")]
     {
-        apply_linux_cgroup_v2(q)?;
+        apply_linux_cgroup_v2(q).map_err(|err| {
+            eprintln!("{LINUX_CGROUP_QUOTA_HINT}");
+            err.context("Linux cgroup v2 quota is required; systemd must only start the process (Delegate=yes), bworker applies cpu/memory/pids")
+        })?;
         apply_unix_nice(q)?;
         return Ok(());
     }
@@ -37,6 +44,41 @@ fn quota_configured(q: &WorkerQuotaSettings) -> bool {
     q.cpu_percent.is_some() || q.memory_mb.is_some() || q.pids_max.is_some() || q.nice.is_some()
 }
 
+/// True when CPU/memory/pids quota is set and this process cannot write its cgroup subtree.
+#[cfg(target_os = "linux")]
+pub fn linux_cgroup_quota_needs_sudo(q: &WorkerQuotaSettings) -> bool {
+    if q.cpu_percent.is_none() && q.memory_mb.is_none() && q.pids_max.is_none() {
+        return false;
+    }
+    !cgroup_v2_subtree_writable()
+}
+
+#[cfg(target_os = "linux")]
+fn cgroup_v2_subtree_writable() -> bool {
+    let root = Path::new("/sys/fs/cgroup");
+    if !root.join("cgroup.controllers").exists() {
+        return false;
+    }
+    let Ok(current) = current_cgroup_v2_path(root) else {
+        return false;
+    };
+    if fs::OpenOptions::new()
+        .write(true)
+        .open(current.join("cgroup.subtree_control"))
+        .is_ok()
+    {
+        return true;
+    }
+    let probe = current.join(format!(".beenet-quota-probe-{}", std::process::id()));
+    match fs::create_dir(&probe) {
+        Ok(()) => {
+            let _ = fs::remove_dir(&probe);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn apply_linux_cgroup_v2(q: &WorkerQuotaSettings) -> Result<()> {
     if q.cpu_percent.is_none() && q.memory_mb.is_none() && q.pids_max.is_none() {
@@ -51,9 +93,13 @@ fn apply_linux_cgroup_v2(q: &WorkerQuotaSettings) -> Result<()> {
     let current = current_cgroup_v2_path(root)?;
     let pid = std::process::id();
     let worker_cgroup = current.join(format!("beenet-worker-{pid}"));
-    enable_requested_controllers(&current, q)?;
     fs::create_dir_all(&worker_cgroup)
         .with_context(|| format!("create cgroup `{}`", worker_cgroup.display()))?;
+    // cgroup v2 forbids enabling controllers while this cgroup still has
+    // processes (EBUSY). Move out first, then enable on the parent, then
+    // write limits on the child. systemd Delegate=yes hits this path.
+    write_cgroup_file(&worker_cgroup, "cgroup.procs", &pid.to_string())?;
+    enable_requested_controllers(&current, q)?;
 
     if let Some(memory_mb) = q.memory_mb {
         let bytes = (memory_mb as u64)
@@ -76,7 +122,6 @@ fn apply_linux_cgroup_v2(q: &WorkerQuotaSettings) -> Result<()> {
         write_cgroup_file(&worker_cgroup, "pids.max", &pids_max.to_string())?;
     }
 
-    write_cgroup_file(&worker_cgroup, "cgroup.procs", &pid.to_string())?;
     info!(
         cgroup = %worker_cgroup.display(),
         cpu_percent = ?q.cpu_percent,
