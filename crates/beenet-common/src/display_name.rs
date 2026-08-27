@@ -1,12 +1,42 @@
 //! Docker-style display names (`adjective_surname`), persisted next to identity.
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
 /// Filename stored beside `identity.key` (worker wasm cache / gateway identity dir).
 pub const DISPLAY_NAME_FILE: &str = "display_name";
+
+/// Written after a successful registry join/enroll so later starts can skip the token.
+pub const REGISTRY_JOINED_FILE: &str = "registry-joined";
+
+/// `<dir>/registry-joined`.
+pub fn registry_joined_path(dir: &Path) -> PathBuf {
+    dir.join(REGISTRY_JOINED_FILE)
+}
+
+/// True after a successful enroll/join against the registry.
+pub fn is_registry_joined(dir: &Path) -> bool {
+    registry_joined_path(dir).is_file()
+}
+
+/// Persist the enrollment marker next to `identity.key`.
+pub fn mark_registry_joined(dir: &Path) -> Result<()> {
+    fs::create_dir_all(dir).with_context(|| format!("create `{}`", dir.display()))?;
+    let path = registry_joined_path(dir);
+    fs::write(&path, "1\n").with_context(|| format!("write `{}`", path.display()))?;
+    Ok(())
+}
+
+/// Drop the enrollment marker (local identity remove).
+pub fn clear_registry_joined(dir: &Path) -> Result<()> {
+    let path = registry_joined_path(dir);
+    if path.exists() {
+        fs::remove_file(&path).with_context(|| format!("remove `{}`", path.display()))?;
+    }
+    Ok(())
+}
 
 /// Left half — inspired by Docker's `names-generator` adjectives.
 const ADJECTIVES: &[&str] = &[
@@ -456,5 +486,21 @@ mod tests {
     #[test]
     fn name_space_is_nontrivial() {
         assert!(name_space_size() > 10_000);
+    }
+
+    #[test]
+    fn registry_joined_marker_roundtrip() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("beenet-registry-joined-{nanos}"));
+        fs::create_dir_all(&dir).unwrap();
+        assert!(!is_registry_joined(&dir));
+        mark_registry_joined(&dir).unwrap();
+        assert!(is_registry_joined(&dir));
+        clear_registry_joined(&dir).unwrap();
+        assert!(!is_registry_joined(&dir));
+        let _ = fs::remove_dir_all(&dir);
     }
 }

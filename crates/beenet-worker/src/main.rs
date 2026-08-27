@@ -58,7 +58,11 @@ fn worker_log_path(wasm_cache_dir: &Path) -> PathBuf {
 
 /// CLI overrides for fields also set in `config.toml` under `[worker]`.
 #[derive(Parser, Debug, Clone)]
-#[command(name = "beenet-worker", about = "Beenet worker (M1.5 factors)")]
+#[command(
+    name = "beenet-worker",
+    about = "Beenet worker",
+    after_help = "bworker is a PATH alias of beenet-worker.\nLinux (no subcommand): first run enrolls, later runs start the daemon.\n  curl -fsSL -o get-bworker.sh https://github.com/lmxia/beenet/releases/latest/download/get-bworker.sh\n  ./get-bworker.sh --join-token-file ./join-token\n  bworker"
+)]
 struct Args {
     /// `config.toml` path (default: platform config dir `beenet/config.toml`).
     #[arg(long, global = true, value_name = "PATH")]
@@ -103,6 +107,10 @@ struct Args {
     /// Read the bootstrap join token from stdin.
     #[arg(long, global = true)]
     join_token_stdin: bool,
+
+    /// Stay in the foreground instead of daemonizing (systemd / containers).
+    #[arg(long, global = true)]
+    foreground: bool,
 
     #[arg(long, global = true)]
     registry_heartbeat_secs: Option<u64>,
@@ -155,12 +163,21 @@ enum WorkerCommand {
     Stop,
     /// Show local worker status.
     Status,
-    /// Enroll this identity with a join token and exit. Does not start the VM.
+    /// Enroll this identity with a join token and exit. Does not start the worker.
     Enroll,
     /// Remove local worker state. The worker must be stopped first.
     Remove,
     /// Alias for `remove`.
     Rm,
+    /// Copy this binary onto PATH (default `/usr/local/bin/beenet-worker`).
+    Install {
+        /// Directory to install into.
+        #[arg(long, default_value = "/usr/local/bin")]
+        prefix: PathBuf,
+    },
+    /// First run: enroll if needed, then start. Default on Linux when omitted.
+    #[command(hide = true)]
+    Up,
     /// Internal entrypoint used by `start`.
     #[command(hide = true)]
     RunInternal,
@@ -202,7 +219,20 @@ fn bootstrap_token(cli: &Args) -> Result<Option<String>> {
             .context("read join token from stdin")?;
         return Ok(trimmed_token(token));
     }
-    Ok(None)
+    Ok(implicit_join_token())
+}
+
+fn implicit_join_token() -> Option<String> {
+    if let Ok(dir) = std::env::var("CREDENTIALS_DIRECTORY") {
+        let path = Path::new(&dir).join("join_token");
+        if let Ok(token) = fs::read_to_string(&path) {
+            if let Some(token) = trimmed_token(token) {
+                return Some(token);
+            }
+        }
+    }
+    let path = Path::new("/run/secrets/join-token");
+    fs::read_to_string(path).ok().and_then(trimmed_token)
 }
 
 pub struct TaskEntry {
@@ -660,8 +690,15 @@ fn registry_url(base: &str, path: &str) -> String {
     }
 }
 
-fn is_join_command(cli: &Args) -> bool {
-    matches!(cli.command, None | Some(WorkerCommand::Join))
+fn can_bootstrap_config(cli: &Args) -> bool {
+    matches!(
+        cli.command,
+        None | Some(WorkerCommand::Join)
+            | Some(WorkerCommand::Enroll)
+            | Some(WorkerCommand::Start)
+            | Some(WorkerCommand::Up)
+            | Some(WorkerCommand::RunInternal)
+    )
 }
 
 fn ensure_config_for_run(cli: &Args, argv: &[String]) -> Result<PathBuf> {
@@ -669,9 +706,9 @@ fn ensure_config_for_run(cli: &Args, argv: &[String]) -> Result<PathBuf> {
     if path.exists() {
         return Ok(path);
     }
-    if !is_join_command(cli) {
+    if !can_bootstrap_config(cli) {
         anyhow::bail!(
-            "missing config file `{}` (run `beenet-worker join --registry-url ...` first)",
+            "missing config file `{}` (run `beenet-worker enroll --registry-url ...` first)",
             path.display()
         );
     }
@@ -680,23 +717,38 @@ fn ensure_config_for_run(cli: &Args, argv: &[String]) -> Result<PathBuf> {
 }
 
 fn create_join_config(cli: &Args, path: &Path) -> Result<()> {
-    let registry_url = cli.registry_url.as_deref().ok_or_else(|| {
-        anyhow::anyhow!(
-            "missing config file `{}`; pass --registry-url so join can initialize it",
-            path.display()
-        )
-    })?;
+    let registry_url = cli
+        .registry_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(beenet_common::config::DEFAULT_PUBLIC_REGISTRY_URL);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).with_context(|| format!("create `{}`", parent.display()))?;
     }
 
     let mut out = String::from("[worker]\n");
+    #[cfg(target_os = "linux")]
+    push_toml_string(&mut out, "backend", "native");
     push_toml_string(&mut out, "registry_url", registry_url);
     if let Some(value) = cli.listen_addr.as_deref() {
         push_toml_string(&mut out, "listen_addr", value);
+    } else {
+        #[cfg(target_os = "linux")]
+        push_toml_string(
+            &mut out,
+            "listen_addr",
+            beenet_common::config::DEFAULT_WORKER_LISTEN_ADDR,
+        );
     }
     if let Some(value) = cli.wasm_cache_dir.as_ref() {
         push_toml_string(&mut out, "wasm_cache_dir", &value.display().to_string());
+    } else {
+        #[cfg(target_os = "linux")]
+        {
+            let cache = beenet_common::config::default_linux_wasm_cache_dir();
+            push_toml_string(&mut out, "wasm_cache_dir", &cache.display().to_string());
+        }
     }
     if let Some(value) = cli.default_deadline_ms {
         push_toml_number(&mut out, "default_deadline_ms", value);
@@ -715,15 +767,35 @@ fn create_join_config(cli: &Args, path: &Path) -> Result<()> {
     }
     if let Some(value) = cli.registry_heartbeat_secs {
         push_toml_number(&mut out, "registry_heartbeat_secs", value);
+    } else {
+        #[cfg(target_os = "linux")]
+        push_toml_number(
+            &mut out,
+            "registry_heartbeat_secs",
+            beenet_common::config::DEFAULT_REGISTRY_HEARTBEAT_SECS,
+        );
     }
     if let Some(value) = cli.wasm_fetch_base.as_deref() {
         push_toml_string(&mut out, "wasm_fetch_base", value);
+    } else if registry_url == beenet_common::config::DEFAULT_PUBLIC_REGISTRY_URL {
+        push_toml_string(
+            &mut out,
+            "wasm_fetch_base",
+            beenet_common::config::DEFAULT_PUBLIC_WASM_FETCH_BASE,
+        );
     }
     if let Some(value) = cli.wasm_fetch_bearer.as_deref() {
         push_toml_string(&mut out, "wasm_fetch_bearer", value);
     }
     if let Some(value) = cli.wasm_fetch_timeout_secs {
         push_toml_number(&mut out, "wasm_fetch_timeout_secs", value);
+    } else {
+        #[cfg(target_os = "linux")]
+        push_toml_number(
+            &mut out,
+            "wasm_fetch_timeout_secs",
+            beenet_common::config::DEFAULT_WASM_FETCH_TIMEOUT_SECS,
+        );
     }
     if let Some(value) = cli.region.as_deref() {
         push_toml_string(&mut out, "region", value);
@@ -733,6 +805,35 @@ fn create_join_config(cli: &Args, path: &Path) -> Result<()> {
     }
 
     let quota = cli_quota(cli);
+    #[cfg(target_os = "linux")]
+    {
+        out.push_str("\n[worker.quota]\n");
+        push_toml_number(
+            &mut out,
+            "cpu_percent",
+            quota
+                .cpu_percent
+                .unwrap_or(beenet_common::config::DEFAULT_LINUX_QUOTA_CPU_PERCENT),
+        );
+        push_toml_number(
+            &mut out,
+            "memory_mb",
+            quota
+                .memory_mb
+                .unwrap_or(beenet_common::config::DEFAULT_LINUX_QUOTA_MEMORY_MB),
+        );
+        push_toml_number(
+            &mut out,
+            "pids_max",
+            quota
+                .pids_max
+                .unwrap_or(beenet_common::config::DEFAULT_LINUX_QUOTA_PIDS_MAX),
+        );
+        if let Some(value) = quota.nice {
+            push_toml_number(&mut out, "nice", value);
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
     if quota_configured(&quota) {
         out.push_str("\n[worker.quota]\n");
         if let Some(value) = quota.cpu_percent {
@@ -750,7 +851,7 @@ fn create_join_config(cli: &Args, path: &Path) -> Result<()> {
     }
 
     fs::write(path, out).with_context(|| format!("write `{}`", path.display()))?;
-    info!(path = %path.display(), "created worker config from join arguments");
+    info!(path = %path.display(), "created worker config");
     Ok(())
 }
 
@@ -786,6 +887,7 @@ fn cli_quota(cli: &Args) -> WorkerQuotaSettings {
     }
 }
 
+#[cfg(not(target_os = "linux"))]
 fn quota_configured(q: &WorkerQuotaSettings) -> bool {
     q.cpu_percent.is_some() || q.memory_mb.is_some() || q.pids_max.is_some() || q.nice.is_some()
 }
@@ -975,6 +1077,7 @@ fn start_background(cli: &Args, argv: &[String]) -> Result<()> {
 
     #[cfg(unix)]
     {
+        ensure_config_for_run(cli, argv)?;
         let (config_path, settings) = load_worker_settings(cli, argv)?;
         fs::create_dir_all(&settings.wasm_cache_dir)
             .with_context(|| format!("create `{}`", settings.wasm_cache_dir.display()))?;
@@ -1086,6 +1189,10 @@ fn status_background(cli: &Args, argv: &[String]) -> Result<()> {
         .filter(|s| !s.is_empty());
 
     println!("joined: {}", identity_path.exists());
+    println!(
+        "enrolled: {}",
+        beenet_common::display_name::is_registry_joined(&settings.wasm_cache_dir)
+    );
     println!("running: {running}");
     if let Some(pid) = pid {
         println!("pid: {pid}");
@@ -1111,7 +1218,13 @@ fn remove_worker(cli: &Args, argv: &[String]) -> Result<()> {
     let display_name_path = settings
         .wasm_cache_dir
         .join(beenet_common::display_name::DISPLAY_NAME_FILE);
-    for path in [&pid_path, &identity_path, &display_name_path] {
+    let enrolled_path = beenet_common::display_name::registry_joined_path(&settings.wasm_cache_dir);
+    for path in [
+        &pid_path,
+        &identity_path,
+        &display_name_path,
+        &enrolled_path,
+    ] {
         if path.exists() {
             fs::remove_file(path).with_context(|| format!("remove `{}`", path.display()))?;
         }
@@ -1561,13 +1674,105 @@ async fn main() -> Result<()> {
 
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let cli = Args::parse();
-    match cli.command.clone().unwrap_or(WorkerCommand::Join) {
+    match cli.command.clone().unwrap_or_else(default_worker_command) {
         WorkerCommand::Join | WorkerCommand::RunInternal => run_worker(cli, &argv).await,
         WorkerCommand::Enroll => enroll_worker(cli, &argv).await,
+        WorkerCommand::Start if cli.foreground => {
+            let mut cli = cli;
+            cli.command = Some(WorkerCommand::RunInternal);
+            run_worker(cli, &argv).await
+        }
         WorkerCommand::Start => start_background(&cli, &argv),
+        WorkerCommand::Up => auto_up(cli, &argv).await,
         WorkerCommand::Stop => stop_background(&cli, &argv),
         WorkerCommand::Status => status_background(&cli, &argv),
         WorkerCommand::Remove | WorkerCommand::Rm => remove_worker(&cli, &argv),
+        WorkerCommand::Install { prefix } => install_self(&prefix),
+    }
+}
+
+fn default_worker_command() -> WorkerCommand {
+    #[cfg(target_os = "linux")]
+    {
+        WorkerCommand::Up
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        WorkerCommand::Join
+    }
+}
+
+async fn auto_up(mut cli: Args, argv: &[String]) -> Result<()> {
+    ensure_config_for_run(&cli, argv)?;
+    let (_, settings) = load_worker_settings(&cli, argv)?;
+    if !beenet_common::display_name::is_registry_joined(&settings.wasm_cache_dir) {
+        enroll_worker(cli.clone(), argv).await?;
+    }
+    if cli.foreground {
+        cli.command = Some(WorkerCommand::RunInternal);
+        run_worker(cli, argv).await
+    } else {
+        start_background(&cli, argv)
+    }
+}
+
+fn install_self(prefix: &Path) -> Result<()> {
+    #[cfg(not(unix))]
+    {
+        let _ = prefix;
+        anyhow::bail!("install is currently supported on Linux and macOS only");
+    }
+
+    #[cfg(unix)]
+    {
+        use std::io::ErrorKind;
+        use std::os::unix::fs::PermissionsExt;
+
+        let src = std::env::current_exe().context("resolve current executable")?;
+        fs::create_dir_all(prefix).with_context(|| {
+            format!(
+                "create `{}` (try sudo beenet-worker install)",
+                prefix.display()
+            )
+        })?;
+        let dest = prefix.join("beenet-worker");
+        let already_installed = dest.exists()
+            && src
+                .canonicalize()
+                .ok()
+                .zip(dest.canonicalize().ok())
+                .is_some_and(|(src_canon, dest_canon)| src_canon == dest_canon);
+        if !already_installed {
+            fs::copy(&src, &dest).with_context(|| {
+                format!(
+                    "copy `{}` -> `{}` (try sudo beenet-worker install)",
+                    src.display(),
+                    dest.display()
+                )
+            })?;
+            fs::set_permissions(&dest, fs::Permissions::from_mode(0o755))
+                .with_context(|| format!("chmod `{}`", dest.display()))?;
+        }
+        let alias = prefix.join("bworker");
+        match fs::symlink_metadata(&alias) {
+            Ok(_) => fs::remove_file(&alias)
+                .with_context(|| format!("replace existing `{}`", alias.display()))?,
+            Err(err) if err.kind() == ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(err).with_context(|| format!("stat `{}`", alias.display()));
+            }
+        }
+        std::os::unix::fs::symlink("beenet-worker", &alias)
+            .with_context(|| format!("link `{}` -> beenet-worker", alias.display()))?;
+        if already_installed {
+            println!("already installed: {}", dest.display());
+        } else {
+            println!("installed {}", dest.display());
+        }
+        println!("alias     {}", alias.display());
+        println!("first run:  bworker --join-token-file ./join-token");
+        println!("later runs: bworker");
+        Ok(())
     }
 }
 
@@ -1643,6 +1848,7 @@ async fn enroll_worker(cli: Args, argv: &[String]) -> Result<()> {
     )
     .await?
     .context("worker joined but heartbeat still reports it as unregistered")?;
+    beenet_common::display_name::mark_registry_joined(&settings.wasm_cache_dir)?;
     println!("ok: true");
     println!("peer_id: {local_peer_id}");
     println!("name: {worker_name}");
@@ -1785,6 +1991,7 @@ async fn run_worker(cli: Args, argv: &[String]) -> Result<()> {
             return Err(e).context("registry is not reachable during worker enrollment");
         }
     };
+    beenet_common::display_name::mark_registry_joined(&settings.wasm_cache_dir)?;
     drop(bootstrap_token);
 
     let mut swarm = build_swarm((*keypair_arc).clone())?;

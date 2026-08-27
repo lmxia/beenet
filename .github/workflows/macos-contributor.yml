@@ -122,7 +122,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release create "${{ github.ref_name }}" \
-            apps/macos-contributor/dist/*.dmg \
-            --title "Beenet ${{ github.ref_name }}" \
-            --generate-notes
+          tag="${{ github.ref_name }}"
+          gh release view "$tag" >/dev/null 2>&1 || \
+            gh release create "$tag" --title "Beenet ${tag}" --generate-notes
+          gh release upload "$tag" apps/macos-contributor/dist/*.dmg --clobber

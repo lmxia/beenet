@@ -94,7 +94,17 @@ cargo run --release -p beenet-worker -- --config examples/local-dev-config.toml 
 macOS 贡献者请用 App / DMG，不要依赖仓库里的 `target/release`。LaunchAgent 由 App 写入，
 `ProgramArguments` 指向包内的 `Contents/MacOS/beenet-worker … run-internal`。
 
-Linux 服务器用 systemd `ExecStart=… run-internal`，同样不要用 `start`。
+Linux 服务器把 `beenet-worker` 装到 PATH 后，无子命令即：首次 `enroll`，之后 `start`。systemd 用 `ExecStart=… --foreground`。
+
+```bash
+curl -fsSL -o get-bworker.sh \
+  https://github.com/lmxia/beenet/releases/latest/download/get-bworker.sh
+chmod +x get-bworker.sh
+./get-bworker.sh --join-token-file ./join-token
+# 配置写入 ~/.config/beenet/config.toml（可用 --quota-cpu-percent 等覆盖默认配额）
+# 之后：
+bworker
+```
 
 `--join-token-stdin` 亦可；避免把明文写进 shell history。
 

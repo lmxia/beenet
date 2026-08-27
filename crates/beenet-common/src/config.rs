@@ -150,6 +150,10 @@ pub const DEFAULT_MEMORY_MB: u32 = 64;
 pub const DEFAULT_MAX_INSTANCE_MEMORY_MB: u32 = 256;
 pub const DEFAULT_REGISTRY_HEARTBEAT_PATH: &str = "/v1/workers/heartbeat";
 pub const DEFAULT_REGISTRY_HEARTBEAT_SECS: u64 = 30;
+/// Production registry used by the macOS contributor app (`NetworkEndpoints.registryURL`).
+pub const DEFAULT_PUBLIC_REGISTRY_URL: &str = "http://registry.hyperos.online";
+/// Production artifact fetch base (`NetworkEndpoints.wasmFetchBase`).
+pub const DEFAULT_PUBLIC_WASM_FETCH_BASE: &str = "http://cloud.hyperos.online/api/v1/artifacts";
 pub const DEFAULT_WASM_FETCH_TIMEOUT_SECS: u64 = 60;
 pub const DEFAULT_GATEWAY_HTTP_ADDR: &str = "127.0.0.1:8080";
 pub const DEFAULT_GATEWAY_LIBP2P_LISTEN_ADDR: &str = "/ip4/0.0.0.0/tcp/4001";
@@ -614,6 +618,20 @@ pub fn default_config_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
         .join("beenet")
         .join("config.toml")
+}
+
+/// Linux contributor defaults. Keep in sync with macOS `WorkerConfigSnapshot.fresh`
+/// and `scripts/get-bworker.sh`.
+pub const DEFAULT_LINUX_QUOTA_CPU_PERCENT: u32 = 25;
+pub const DEFAULT_LINUX_QUOTA_MEMORY_MB: u32 = 512;
+pub const DEFAULT_LINUX_QUOTA_PIDS_MAX: u32 = 128;
+
+/// Linux product default for `wasm_cache_dir` (`$XDG_DATA_HOME/beenet/wasm_cache`).
+pub fn default_linux_wasm_cache_dir() -> PathBuf {
+    dirs::data_local_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("beenet")
+        .join("wasm_cache")
 }
 
 fn parse_config_arg(args: &[String]) -> Option<PathBuf> {

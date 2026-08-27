@@ -1,0 +1,24 @@
+[Unit]
+Description=Beenet worker
+Documentation=https://github.com/lmxia/beenet
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Give the worker a writable cgroup v2 subtree so [worker.quota] can apply
+# cpu.max / memory.max / pids.max.
+Delegate=yes
+Environment=BEENET_CONFIG=/etc/beenet/config.toml
+Environment=BEENET_WASM_CACHE_DIR=/var/lib/beenet/wasm_cache
+EnvironmentFile=-/etc/beenet/worker.env
+# First boot: put the one-time join token at join_token (see LoadCredential below)
+# or set BEENET_JOIN_TOKEN_FILE in worker.env. Later boots skip enroll.
+# LoadCredential=join_token
+ExecStart=/usr/local/bin/beenet-worker --foreground
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

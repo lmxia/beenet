@@ -130,7 +130,8 @@ Start Worker on the host:
 
   cargo run --release -p beenet-worker -- \\
     --config examples/local-dev-config.toml \\
-    --join-token-file ${WORKER_TOKEN_FILE}
+    --join-token-file ${WORKER_TOKEN_FILE} \\
+    join
 
 Invoke via Docker Gateway:
 

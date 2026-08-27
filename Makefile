@@ -50,6 +50,27 @@ dmg: app-macos ## Wrap the macOS contributor app into a DMG
 	chmod +x scripts/package-macos-dmg.sh
 	scripts/package-macos-dmg.sh
 
+LINUX_ARCH ?= $(shell uname -m)
+LINUX_TARBALL := out/linux/beenet-worker-linux-$(LINUX_ARCH).tar.gz
+
+.PHONY: linux-worker
+linux-worker: ## Build the Linux beenet-worker binary
+	cargo build --release -p beenet-worker
+	chmod +x scripts/install-linux-worker.sh scripts/get-bworker.sh
+
+.PHONY: linux-worker-tarball
+linux-worker-tarball: linux-worker ## Package beenet-worker + install script into a tarball
+	mkdir -p out/linux/beenet-worker-linux-$(LINUX_ARCH)
+	cp target/release/beenet-worker out/linux/beenet-worker-linux-$(LINUX_ARCH)/beenet-worker
+	strip out/linux/beenet-worker-linux-$(LINUX_ARCH)/beenet-worker
+	cp scripts/install-linux-worker.sh out/linux/beenet-worker-linux-$(LINUX_ARCH)/install-linux-worker.sh
+	cp deploy/linux/beenet-worker.service out/linux/beenet-worker-linux-$(LINUX_ARCH)/beenet-worker.service
+	chmod +x out/linux/beenet-worker-linux-$(LINUX_ARCH)/beenet-worker \
+		out/linux/beenet-worker-linux-$(LINUX_ARCH)/install-linux-worker.sh
+	tar -C out/linux -czf $(LINUX_TARBALL) beenet-worker-linux-$(LINUX_ARCH)
+	rm -rf out/linux/beenet-worker-linux-$(LINUX_ARCH)
+	@ls -lh $(LINUX_TARBALL)
+
 .PHONY: fmt
 fmt: ## Format all code with rustfmt
 	cargo fmt --all

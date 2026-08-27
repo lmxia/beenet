@@ -103,13 +103,26 @@ pub async fn invoke_prepared(
         "wasm milestone: instance_builder_prepared"
     );
 
-    let (instance, mut store) = instance_builder.instantiate(CpuMeter::default()).await?;
+    // Split Spin's `instantiate()` so we can time only `InstancePre::instantiate_async`.
+    let instance_pre = app
+        .get_instance_pre(component_id)
+        .context("get_instance_pre")?
+        .clone();
+    let mut store = instance_builder.instantiate_store(CpuMeter::default())?;
     store.as_mut().call_hook(|mut store, hook| {
         store.data_mut().executor_instance_state_mut().on_hook(hook);
         Ok(())
     });
 
-    // Wrap the already-instantiated component before preparing the request.
+    let instantiate_started = Instant::now();
+    let instance = instance_pre.instantiate_async(&mut store).await?;
+    tracing::info!(
+        component_id,
+        timestamp_ms = timestamp_ms(),
+        elapsed_ms = instantiate_started.elapsed().as_secs_f64() * 1000.0,
+        "wasm milestone: instantiate_async"
+    );
+
     let proxy = Proxy::new(&mut store, &instance)
         .map_err(|e| anyhow!("component is not a wasi:http/proxy world: {e}"))?;
     tracing::info!(
