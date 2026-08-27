@@ -39,8 +39,18 @@ guest-image: ## Build the Alpine kernel + musl guest worker initramfs
 	chmod +x scripts/build-macos-vm-image.sh
 	scripts/build-macos-vm-image.sh
 
+# CI already builds the guest image on Linux and passes BEENET_KERNEL_PATH /
+# BEENET_INITRD_PATH into the macOS job. Skip Docker there — macos runners
+# do not have it.
+APP_MACOS_DEPS := guest-image
+ifneq ($(BEENET_KERNEL_PATH),)
+ifneq ($(BEENET_INITRD_PATH),)
+APP_MACOS_DEPS :=
+endif
+endif
+
 .PHONY: app-macos
-app-macos: guest-image ## Build the unsigned macOS contributor app
+app-macos: $(APP_MACOS_DEPS) ## Build the unsigned macOS contributor app
 	cargo build --release -p beenet-worker
 	chmod +x apps/macos-contributor/build.sh
 	apps/macos-contributor/build.sh

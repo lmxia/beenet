@@ -106,6 +106,8 @@ jobs:
           BEENET_KERNEL_PATH: ${{ github.workspace }}/guest/Image
           BEENET_INITRD_PATH: ${{ github.workspace }}/guest/initrd.img
         run: |
+          test -f "$BEENET_KERNEL_PATH"
+          test -f "$BEENET_INITRD_PATH"
           make dmg
           ls -lh apps/macos-contributor/dist/*.dmg
 
