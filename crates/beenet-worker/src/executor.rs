@@ -1,7 +1,7 @@
 //! Spin [`FactorsExecutor`](spin_factors_executor::FactorsExecutor) + wasi:http p2 invoke path (M1.5).
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
 use beenet_common::proto::{InvokeRequest, Status};
@@ -15,7 +15,7 @@ use spin_factors_executor::{FactorsExecutor, FactorsExecutorApp};
 use wasmtime::CallHook;
 use wasmtime_wasi::p2::pipe::MemoryOutputPipe;
 use wasmtime_wasi_http::p2::bindings::http::types::{ErrorCode, Scheme};
-use wasmtime_wasi_http::p2::bindings::ProxyPre;
+use wasmtime_wasi_http::p2::bindings::Proxy;
 use wasmtime_wasi_http::p2::body::{HyperIncomingBody, HyperOutgoingBody};
 
 /// Max stdout/stderr bytes shipped on `InvokeResponse` (M1.5 wire cap).
@@ -75,6 +75,12 @@ pub async fn invoke_prepared(
     deadline_ms: u32,
     max_memory_bytes: usize,
 ) -> Result<ExecOutcome> {
+    let started = Instant::now();
+    let timestamp_ms = || {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis() as u64)
+    };
     let ai_before = ai_usage_snapshot();
     let stdout_pipe = MemoryOutputPipe::new(64 * 1024);
     let stderr_pipe = MemoryOutputPipe::new(64 * 1024);
@@ -90,20 +96,28 @@ pub async fn invoke_prepared(
     wasi.stdout(stdout_pipe.clone());
     wasi.stderr(stderr_pipe.clone());
 
-    let instance_pre = app
-        .get_instance_pre(component_id)
-        .context("get_instance_pre")?
-        .clone();
-    let proxy_pre = ProxyPre::new(instance_pre)
-        .map_err(|e| anyhow!("component is not a wasi:http/proxy world: {e}"))?;
+    tracing::info!(
+        component_id,
+        timestamp_ms = timestamp_ms(),
+        elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+        "wasm milestone: instance_builder_prepared"
+    );
 
-    let (_instance, mut store) = instance_builder
-        .instantiate(CpuMeter::default())
-        .await?;
+    let (instance, mut store) = instance_builder.instantiate(CpuMeter::default()).await?;
     store.as_mut().call_hook(|mut store, hook| {
         store.data_mut().executor_instance_state_mut().on_hook(hook);
         Ok(())
     });
+
+    // Wrap the already-instantiated component before preparing the request.
+    let proxy = Proxy::new(&mut store, &instance)
+        .map_err(|e| anyhow!("component is not a wasi:http/proxy world: {e}"))?;
+    tracing::info!(
+        component_id,
+        timestamp_ms = timestamp_ms(),
+        elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+        "wasm milestone: proxy_ready"
+    );
 
     let deadline = Instant::now() + Duration::from_millis(deadline_ms as u64);
     store.set_deadline(deadline);
@@ -122,7 +136,6 @@ pub async fn invoke_prepared(
         .new_response_outparam(sender)
         .map_err(|e| anyhow!("new_response_outparam failed: {e}"))?;
 
-    let proxy = proxy_pre.instantiate_async(&mut store).await?;
     let task = tokio::spawn(async move {
         proxy
             .wasi_http_incoming_handler()

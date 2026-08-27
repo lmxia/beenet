@@ -52,8 +52,10 @@ pub fn stop_vm_launch_agent() -> Result<()> {
 
 #[cfg(target_os = "macos")]
 pub fn vm_launch_agent_status() -> Result<Option<VmLaunchAgentStatus>> {
-    Ok(vm::inspect_launch_agent()?.map(|status| VmLaunchAgentStatus {
-        running: status.running,
-        pid: status.pid,
-    }))
+    Ok(
+        vm::inspect_launch_agent()?.map(|status| VmLaunchAgentStatus {
+            running: status.running,
+            pid: status.pid,
+        }),
+    )
 }

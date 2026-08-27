@@ -236,12 +236,10 @@ pub(crate) fn start_launch_agent(
 
     let plist_path = launch_agent_path(LAUNCH_AGENT_LABEL)?;
     if let Some(parent) = plist_path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("create `{}`", parent.display()))?;
+        fs::create_dir_all(parent).with_context(|| format!("create `{}`", parent.display()))?;
     }
     if let Some(parent) = log_path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("create `{}`", parent.display()))?;
+        fs::create_dir_all(parent).with_context(|| format!("create `{}`", parent.display()))?;
     }
 
     let config_path = fs::canonicalize(config_path)
@@ -363,7 +361,11 @@ fn disable_launch_agent(label: &str) -> Result<()> {
     if ok || launchctl_already_gone(&text) {
         return Ok(());
     }
-    anyhow::bail!("launchctl disable {} failed: {}", service_target(label), text.trim());
+    anyhow::bail!(
+        "launchctl disable {} failed: {}",
+        service_target(label),
+        text.trim()
+    );
 }
 
 #[cfg(target_os = "macos")]
@@ -372,7 +374,11 @@ fn enable_launch_agent(label: &str) -> Result<()> {
     if ok || launchctl_already_gone(&text) {
         return Ok(());
     }
-    anyhow::bail!("launchctl enable {} failed: {}", service_target(label), text.trim());
+    anyhow::bail!(
+        "launchctl enable {} failed: {}",
+        service_target(label),
+        text.trim()
+    );
 }
 
 #[cfg(target_os = "macos")]
@@ -381,7 +387,11 @@ fn bootout_launch_agent(label: &str) -> Result<()> {
     if ok || launchctl_already_gone(&text) {
         return Ok(());
     }
-    anyhow::bail!("launchctl bootout {} failed: {}", service_target(label), text.trim());
+    anyhow::bail!(
+        "launchctl bootout {} failed: {}",
+        service_target(label),
+        text.trim()
+    );
 }
 
 #[cfg(target_os = "macos")]
@@ -413,11 +423,7 @@ fn unload_launch_agent(label: &str) -> Result<()> {
 #[cfg(target_os = "macos")]
 fn bootstrap_launch_agent(plist_path: &Path) -> Result<()> {
     let domain = format!("gui/{}", unsafe { libc::getuid() });
-    let (ok, text) = run_launchctl(&[
-        "bootstrap",
-        &domain,
-        &plist_path.display().to_string(),
-    ])?;
+    let (ok, text) = run_launchctl(&["bootstrap", &domain, &plist_path.display().to_string()])?;
     if ok {
         return Ok(());
     }

@@ -42,6 +42,20 @@ use crate::executor::{
 };
 use crate::quota::apply_os_quota;
 
+fn unix_timestamp_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_millis() as u64)
+}
+
+fn worker_log_path(wasm_cache_dir: &Path) -> PathBuf {
+    wasm_cache_dir
+        .parent()
+        .unwrap_or(wasm_cache_dir)
+        .join("logs")
+        .join("beenet-worker.log")
+}
+
 /// CLI overrides for fields also set in `config.toml` under `[worker]`.
 #[derive(Parser, Debug, Clone)]
 #[command(name = "beenet-worker", about = "Beenet worker (M1.5 factors)")]
@@ -224,11 +238,18 @@ impl ComponentLoader<BeenetFactors, CpuMeter> for BeenetComponentLoader {
         engine: &spin_core::wasmtime::Engine,
         component: &AppComponent,
     ) -> anyhow::Result<Component> {
+        let started = Instant::now();
+        let component_id = component.id().to_string();
         let path = self.wasm_cache_dir.join(format!("{}.wasm", component.id()));
         // 我们这里不是composed，区别于spin 原生的，带有依赖管理的components。
         let wasm =
             fs::read(&path).map_err(|e| anyhow::anyhow!("read wasm `{}`: {e}", path.display()))?;
-        Component::new(engine, &wasm).map_err(|e| anyhow::anyhow!("compile component: {e}"))
+        info!(%component_id, bytes = wasm.len(), elapsed_ms = started.elapsed().as_secs_f64() * 1000.0, "wasm milestone: loaded_from_cache");
+        let compile_started = Instant::now();
+        let component =
+            Component::new(engine, &wasm).map_err(|e| anyhow::anyhow!("compile component: {e}"))?;
+        info!(%component_id, timestamp_ms = unix_timestamp_ms(), elapsed_ms = compile_started.elapsed().as_secs_f64() * 1000.0, "wasm milestone: component_compiled");
+        Ok(component)
     }
 }
 
@@ -512,6 +533,7 @@ impl Runtime {
 
     async fn load_task(&self, cid: &BeenetCid) -> Result<Arc<TaskEntry>> {
         if let Some(entry) = self.cache.read().await.get(cid).cloned() {
+            info!(%cid, timestamp_ms = unix_timestamp_ms(), "wasm load: in_memory_cache_hit (hot)");
             return Ok(entry);
         }
 
@@ -524,9 +546,11 @@ impl Runtime {
         let loader = BeenetComponentLoader {
             wasm_cache_dir: self.wasm_cache_dir.clone(),
         };
+        let load_started = Instant::now();
         let factors_app = load_factors_app(self.factors_executor.clone(), cid, &manifest, &loader)
             .await
             .context("load_factors_app failed")?;
+        info!(%cid, timestamp_ms = unix_timestamp_ms(), elapsed_ms = load_started.elapsed().as_secs_f64() * 1000.0, "wasm milestone: instance_pre_ready (linker configured)");
         let component_id = cid.to_string();
         let entry = Arc::new(TaskEntry {
             manifest,
@@ -545,6 +569,7 @@ impl Runtime {
     async fn ensure_wasm_cached(&self, cid: &BeenetCid) -> Result<()> {
         let path = self.wasm_path(cid);
         if path.exists() {
+            info!(%cid, path = %path.display(), timestamp_ms = unix_timestamp_ms(), "wasm load: file_cache_hit (warm artifact)");
             return Ok(());
         }
         let Some(base) = self.wasm_fetch_base.as_deref() else {
@@ -554,7 +579,8 @@ impl Runtime {
             );
         };
         let download_url = self.artifact_download_url(base, cid).await?;
-        info!(url = %download_url, %cid, "fetching wasm into cache");
+        let download_started = Instant::now();
+        info!(url = %download_url, %cid, timestamp_ms = unix_timestamp_ms(), "wasm milestone: download_started");
         let client = reqwest::Client::builder()
             .timeout(self.wasm_fetch_timeout)
             .build()
@@ -586,7 +612,7 @@ impl Runtime {
             fs::create_dir_all(parent).with_context(|| format!("create `{}`", parent.display()))?;
         }
         fs::write(&path, &bytes).with_context(|| format!("write `{}`", path.display()))?;
-        info!(path = %path.display(), %cid, "wasm stored in cache after fetch");
+        info!(path = %path.display(), %cid, timestamp_ms = unix_timestamp_ms(), elapsed_ms = download_started.elapsed().as_secs_f64() * 1000.0, "wasm milestone: download_finished");
         Ok(())
     }
 
@@ -957,7 +983,7 @@ fn start_background(cli: &Args, argv: &[String]) -> Result<()> {
         if settings.backend == WorkerBackend::Vm {
             let exe = std::env::current_exe().context("resolve current executable")?;
             let cwd = std::env::current_dir().context("resolve working directory")?;
-            let log_path = cwd.join("logs").join("beenet-worker.log");
+            let log_path = worker_log_path(&settings.wasm_cache_dir);
             backend::start_vm_launch_agent(&settings, &config_path, &exe, &cwd, &log_path)?;
             let _ = fs::remove_file(worker_pid_path(&settings.wasm_cache_dir));
             return Ok(());
@@ -972,12 +998,24 @@ fn start_background(cli: &Args, argv: &[String]) -> Result<()> {
         }
 
         let exe = std::env::current_exe().context("resolve current executable")?;
+        let log_path = worker_log_path(&settings.wasm_cache_dir);
+        if let Some(parent) = log_path.parent() {
+            fs::create_dir_all(parent).with_context(|| format!("create `{}`", parent.display()))?;
+        }
+        let log_file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .with_context(|| format!("open worker log `{}`", log_path.display()))?;
+        let log_file_err = log_file
+            .try_clone()
+            .with_context(|| format!("clone worker log `{}`", log_path.display()))?;
         let mut cmd = Command::new(exe);
         append_runtime_args(&mut cmd, &config_path, cli);
         cmd.arg("run-internal")
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
+            .stdout(Stdio::from(log_file))
+            .stderr(Stdio::from(log_file_err));
         let child = cmd.spawn().context("spawn background worker")?;
         let pid = child.id();
         fs::write(&pid_path, format!("{pid}\n"))

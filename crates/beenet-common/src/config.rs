@@ -349,7 +349,10 @@ pub fn resolve_worker_settings(
     })
 }
 
-fn resolve_worker_vm(vm: Option<&WorkerVmSection>, quota: &WorkerQuotaSettings) -> WorkerVmSettings {
+fn resolve_worker_vm(
+    vm: Option<&WorkerVmSection>,
+    quota: &WorkerQuotaSettings,
+) -> WorkerVmSettings {
     let derived = derive_vm_envelope(quota);
     let Some(vm) = vm else {
         return WorkerVmSettings {
