@@ -41,7 +41,7 @@ trap cleanup EXIT
 echo "copying initramfs root to $WORK"
 mkdir -p "$WORK/config" "$WORK/state/logs"
 cp -a "$BASE_ROOT" "$WORK/root"
-install -m 0755 "$ROOT_DIR/vm/alpine-init" "$WORK/root/init"
+install -m 0755 "$ROOT_DIR/deploy/macos-contributor/guest/alpine-init" "$WORK/root/init"
 cat >"$WORK/root/usr/local/bin/beenet-worker" <<'EOF'
 #!/bin/sh
 mkdir -p /var/lib/beenet/logs

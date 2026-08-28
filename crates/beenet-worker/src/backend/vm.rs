@@ -734,7 +734,7 @@ mod tests {
     use std::path::Path;
     use std::time::Duration;
 
-    const ALPINE_INIT: &str = include_str!("../../../../vm/alpine-init");
+    const ALPINE_INIT: &str = include_str!("../../../../deploy/macos-contributor/guest/alpine-init");
 
     #[test]
     fn guest_init_powers_off_via_sysrq_and_never_reboots() {

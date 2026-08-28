@@ -147,20 +147,20 @@ begin
   ForceDirectories(CacheDir);
   if FileExists(Path) then
     Exit;
+  { Keep #13#10 at end of a token; a line starting with # is an ISPP directive. }
   Contents :=
-    '[worker]' + #13#10 +
-    'backend = "native"' + #13#10 +
-    'listen_addr = "/ip4/0.0.0.0/tcp/0"' + #13#10 +
-    'registry_url = "http://registry.hyperos.online"' + #13#10 +
-    'wasm_fetch_base = "http://cloud.hyperos.online/api/v1/artifacts"' + #13#10 +
-    'wasm_fetch_timeout_secs = 60' + #13#10 +
-    'registry_heartbeat_secs = 30' + #13#10 +
-    'wasm_cache_dir = "' + TomlEscape(CacheDir) + '"' + #13#10 +
-    #13#10 +
-    '[worker.quota]' + #13#10 +
-    'cpu_percent = 25' + #13#10 +
-    'memory_mb = 512' + #13#10 +
-    'pids_max = 128' + #13#10;
+    '[worker]'#13#10 +
+    'backend = "native"'#13#10 +
+    'listen_addr = "/ip4/0.0.0.0/tcp/0"'#13#10 +
+    'registry_url = "http://registry.hyperos.online"'#13#10 +
+    'wasm_fetch_base = "http://cloud.hyperos.online/api/v1/artifacts"'#13#10 +
+    'wasm_fetch_timeout_secs = 60'#13#10 +
+    'registry_heartbeat_secs = 30'#13#10 +
+    'wasm_cache_dir = "' + TomlEscape(CacheDir) + '"'#13#10#13#10 +
+    '[worker.quota]'#13#10 +
+    'cpu_percent = 25'#13#10 +
+    'memory_mb = 512'#13#10 +
+    'pids_max = 128'#13#10;
   SaveStringToFile(Path, Contents, False);
 end;
 

@@ -90,7 +90,7 @@ install -m 0755 "$WORK/worker-artifact/beenet-worker" \
     "$WORK/root/usr/local/bin/beenet-worker"
 install -m 0644 "$WORK/worker-artifact/libgcc_s.so.1" \
     "$WORK/root/usr/lib/libgcc_s.so.1"
-install -m 0755 "$ROOT_DIR/vm/alpine-init" "$WORK/root/init"
+install -m 0755 "$ROOT_DIR/deploy/macos-contributor/guest/alpine-init" "$WORK/root/init"
 
 (cd "$WORK/root" && find . -print | LC_ALL=C sort | cpio -o -H newc 2>/dev/null) \
     | gzip -9 > "$CACHE_DIR/beenet-alpine-${ALPINE_VERSION}-aarch64-initramfs.img"
