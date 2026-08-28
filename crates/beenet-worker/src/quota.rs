@@ -48,6 +48,7 @@ pub fn apply_os_quota(q: &WorkerQuotaSettings) -> Result<()> {
 
 /// Job Object `CpuRate` is tenths of a percent of the **whole machine**.
 /// `cpu_percent` is a percent of **one** logical CPU (same as Linux `cpu.max`).
+#[cfg_attr(not(any(test, target_os = "windows")), allow(dead_code))]
 pub(crate) fn windows_cpu_rate(cpu_percent: u32, logical_cpus: u32) -> u32 {
     let n = u64::from(logical_cpus.max(1));
     let tenths = (u64::from(cpu_percent) * 10 + n / 2) / n;
@@ -233,7 +234,7 @@ fn apply_unix_nice(q: &WorkerQuotaSettings) -> Result<()> {
 #[cfg(target_os = "windows")]
 mod windows_job {
     use super::*;
-    use std::sync::OnceLock;
+    use std::sync::Mutex;
     use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, HANDLE, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::System::JobObjects::{
         AssignProcessToJobObject, CreateJobObjectW, SetInformationJobObject,
@@ -245,12 +246,25 @@ mod windows_job {
     };
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
-    static JOB: OnceLock<HANDLE> = OnceLock::new();
+    /// Process-local Job Object handle. Kept open so `KILL_ON_JOB_CLOSE` lasts
+    /// for the worker lifetime; the numeric value is only used in this process.
+    struct JobHandle(HANDLE);
+    unsafe impl Send for JobHandle {}
+    unsafe impl Sync for JobHandle {}
+
+    static JOB: Mutex<Option<JobHandle>> = Mutex::new(None);
 
     pub(super) fn apply(q: &WorkerQuotaSettings) -> Result<()> {
-        let job = *JOB.get_or_try_init(|| create_job())?;
-        apply_limits(job, q)?;
-        Ok(())
+        let mut guard = JOB.lock().unwrap_or_else(|err| err.into_inner());
+        let job = match guard.as_ref() {
+            Some(handle) => handle.0,
+            None => {
+                let created = create_job()?;
+                *guard = Some(JobHandle(created));
+                created
+            }
+        };
+        apply_limits(job, q)
     }
 
     fn create_job() -> Result<HANDLE> {
@@ -305,6 +319,7 @@ mod windows_job {
             let mut cpu: JOBOBJECT_CPU_RATE_CONTROL_INFORMATION = unsafe { std::mem::zeroed() };
             cpu.ControlFlags =
                 JOB_OBJECT_CPU_RATE_CONTROL_ENABLE | JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP;
+            #[allow(unused_unsafe)]
             unsafe {
                 cpu.Anonymous.CpuRate = super::windows_cpu_rate(cpu_percent, n);
             }

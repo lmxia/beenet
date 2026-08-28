@@ -44,6 +44,7 @@ pub(crate) struct NatRebuildPolicy {
     pub cooldown_cap: Duration,
 }
 
+#[cfg_attr(not(any(test, target_os = "macos")), allow(dead_code))]
 impl NatRebuildPolicy {
     pub const DEFAULT: Self = Self {
         stale_after: Duration::from_secs(90),
@@ -494,6 +495,7 @@ fn xml_escape(value: &str) -> String {
         .replace('\'', "&apos;")
 }
 
+#[cfg_attr(not(any(test, target_os = "macos")), allow(dead_code))]
 pub(crate) struct LaunchAgentRuntime {
     pub running: bool,
     pub pid: Option<u32>,
@@ -600,6 +602,7 @@ fn inspect_label(label: &str) -> Result<Option<LaunchAgentRuntime>> {
     ))))
 }
 
+#[cfg_attr(not(any(test, target_os = "macos")), allow(dead_code))]
 fn parse_launchctl_print(text: &str) -> LaunchAgentRuntime {
     let running = text.lines().any(|line| line.trim() == "state = running");
     let pid = text.lines().find_map(|line| {
@@ -627,6 +630,7 @@ fn run_launchctl(args: &[&str]) -> Result<(bool, String)> {
     Ok((output.status.success(), text))
 }
 
+#[cfg_attr(not(any(test, target_os = "macos")), allow(dead_code))]
 fn launchctl_already_gone(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
     lower.contains("no such process") || lower.contains("could not find service")
