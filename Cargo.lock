@@ -548,6 +548,7 @@ dependencies = [
  "wasmtime",
  "wasmtime-wasi",
  "wasmtime-wasi-http",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

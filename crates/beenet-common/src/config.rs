@@ -119,12 +119,13 @@ pub fn derive_vm_envelope(quota: &WorkerQuotaSettings) -> VmEnvelope {
 #[derive(Debug, Deserialize, Default)]
 pub struct WorkerQuotaSection {
     /// Whole-worker CPU budget as a percentage of one logical CPU.
-    /// Linux cgroup v2 maps this to `cpu.max`; macOS currently ignores it.
+    /// Linux maps this to cgroup v2 `cpu.max`; Windows maps it to a Job Object
+    /// `CpuRate` of the whole machine. See `deploy/windows/job-objects.md`.
     pub cpu_percent: Option<u32>,
     /// Whole-worker resident/virtual memory cap in MB.
     pub memory_mb: Option<u32>,
-    /// Whole-worker process/thread cap. Linux cgroup v2 maps this to `pids.max`;
-    /// macOS currently ignores it.
+    /// Whole-worker process/thread cap. Linux: `pids.max` (PIDs including threads).
+    /// Windows: Job Object `ActiveProcessLimit` (processes only).
     pub pids_max: Option<u32>,
     /// Process niceness adjustment. Positive values lower scheduling priority.
     pub nice: Option<i32>,
@@ -628,6 +629,15 @@ pub const DEFAULT_LINUX_QUOTA_PIDS_MAX: u32 = 128;
 
 /// Linux product default for `wasm_cache_dir` (`$XDG_DATA_HOME/beenet/wasm_cache`).
 pub fn default_linux_wasm_cache_dir() -> PathBuf {
+    native_wasm_cache_dir()
+}
+
+/// Windows product default for `wasm_cache_dir` (`%LOCALAPPDATA%\beenet\wasm_cache`).
+pub fn default_windows_wasm_cache_dir() -> PathBuf {
+    native_wasm_cache_dir()
+}
+
+fn native_wasm_cache_dir() -> PathBuf {
     dirs::data_local_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join("beenet")

@@ -98,9 +98,9 @@ Linux 服务器把 `beenet-worker` 装到 PATH 后，无子命令即：首次 `e
 
 ```bash
 curl -fsSL -o get-bworker.sh \
-  https://github.com/lmxia/beenet/releases/latest/download/get-bworker.sh
+  http://cloud.hyperos.online/api/v1/downloads/get-bworker.sh
 chmod +x get-bworker.sh
-./get-bworker.sh --join-token-file ./join-token
+./get-bworker.sh
 # 配置写入 ~/.config/beenet/config.toml（可用 --quota-cpu-percent 等覆盖默认配额）
 # 之后：
 bworker
@@ -166,7 +166,7 @@ scripts/build-macos-vm-image.sh
 ```
 
 The script verifies the Alpine 3.24.1 virt ISO checksum, builds `beenet-worker` in the
-multi-stage [`docker/Dockerfile.worker-vm`](docker/Dockerfile.worker-vm), and writes artifacts
+multi-stage [`deploy/docker/Dockerfile.worker-vm`](deploy/docker/Dockerfile.worker-vm), and writes artifacts
 under `~/Library/Caches/beenet/vm/alpine-3.24.1` — not into git. The Docker build needs the sibling
 Spin checkout at `../spin` (revision in [`scripts/spin.rev`](scripts/spin.rev)); proxy settings can
 be passed as `BEENET_DOCKER_HTTP_PROXY` and `BEENET_DOCKER_HTTPS_PROXY`. Do not pass credentials as
@@ -177,13 +177,13 @@ state share.
 
 ### macOS 贡献者 App
 
-源码在 `apps/macos-contributor/`（要进 git）。`dist/` 和 DMG 不进 git。
+源码在 `deploy/macos-contributor/`（要进 git）。`dist/` 和 DMG 不进 git。
 
 本地：
 
 ```bash
 make dmg
-open apps/macos-contributor/dist/Beenet-0.1.0-darwin-arm64.dmg
+open deploy/macos-contributor/dist/Beenet-0.1.0-darwin-arm64.dmg
 ```
 
 发版：`git tag v0.1.0 && git push origin v0.1.0`。  
@@ -221,12 +221,13 @@ not wired yet: create/enroll the persistent identity before switching to VM mode
 provisioning flow that reads a temporary secret without placing it on the kernel command line.
 
 The guest init remains PID 1. Alpine virt busybox has no `poweroff` applet, so after
-`run-internal` exits the init writes sysrq `o` to power off Linux. vfkit therefore exits,
-and launchd `KeepAlive` restarts the complete VM instead of leaving an idle Linux guest
-behind. On macOS, `beenet-worker start` with `backend = "vm"` writes
-`~/Library/LaunchAgents/com.beenet.worker.plist` (`KeepAlive` must be unconditional `true`,
-because guest poweroff is a successful vfkit exit) and bootstraps it. The plist still runs
-`run-internal`, not `start`.
+`run-internal` exits the init writes sysrq `o` to power off Linux. vfkit therefore exits.
+On macOS, `beenet-worker start` with `backend = "vm"` writes
+`~/Library/LaunchAgents/com.beenet.worker.plist` and bootstraps it. The plist runs
+`run-internal`, which stays in the foreground and supervises vfkit: it respawns the VM
+after guest poweroff, and rebuilds vfkit NAT when the Mac can reach the registry but the
+guest heartbeat file is stale (sleep/lock leaves vfkit running with a dead virtio-net).
+`KeepAlive` is unconditional `true` so launchd restarts the supervisor if it exits.
 
 Inside Linux, `run-internal` writes `cpu.max`, `memory.max`, and `pids.max` in a cgroup v2 child
 before serving tasks. The guest init must run it as root or delegate a writable cgroup subtree.
@@ -350,9 +351,8 @@ curl -s -H "Authorization: Bearer beenet-dev-admin-token" \
 | `crates/beenet-worker` | libp2p Worker（宿主机） |
 | `crates/beenet-gateway` | HTTP → libp2p Gateway |
 | `crates/beenet-frontdoor` | 统一公网 HTTP 入口；按 Registry 路由到持有 Worker 连接的 Gateway |
-| `apps/macos-contributor` | macOS 贡献者 App 源码（`dist/` 不入库） |
+| `deploy/` | 所有交付物：macOS App、Linux systemd、Docker 镜像、Kubernetes |
 | `scripts/dev-up.sh` | 本地分阶段 Docker 启动 |
-| `docker/` | Dockerfile + `docker-compose.dev.yml` |
 | `examples/fair-red-packet-http` | 可复算的公平拼手气红包（推荐端到端示例） |
 | `examples/checkout-risk-http` | 结构化交易风控任务 |
 | `examples/hello-filter-http` | 最小 HTTP 组件样板 |

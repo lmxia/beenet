@@ -18,7 +18,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
-COMPOSE=(docker compose -f docker/docker-compose.dev.yml)
+COMPOSE=(docker compose -f deploy/docker-compose.dev.yml)
 ADMIN_TOKEN="${BEENET_ADMIN_TOKEN:-beenet-dev-admin-token}"
 SECRET_DIR="${BEENET_DEV_DIR:-$ROOT/.beenet-dev}"
 GW_TOKEN_FILE="$SECRET_DIR/gateway-join-token"
@@ -93,8 +93,8 @@ cmd_up() {
     (
       # Avoid broken compose-proxy defaults like host.docker.internal inside builders.
       unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy ALL_PROXY all_proxy || true
-      docker build --pull=false -f docker/Dockerfile.registry -t beenet/beenet-registry:dev .
-      docker build --pull=false -f docker/Dockerfile.gateway -t beenet/beenet-gateway:dev .
+      docker build --pull=false -f deploy/docker/Dockerfile.registry -t beenet/beenet-registry:dev .
+      docker build --pull=false -f deploy/docker/Dockerfile.gateway -t beenet/beenet-gateway:dev .
     )
   fi
   "${COMPOSE[@]}" up -d redis beenet-registry

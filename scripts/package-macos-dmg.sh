@@ -5,14 +5,14 @@ set -eu
 # stay inside the app bundle; this script does not copy them into git.
 
 ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-SRC="$ROOT_DIR/apps/macos-contributor"
+SRC="$ROOT_DIR/deploy/macos-contributor"
 APP="${BEENET_APP_DIST:-$SRC/dist/Beenet.app}"
 DIST_DIR=$(dirname "$APP")
 ARCH=${BEENET_APP_ARCH:-$(uname -m)}
 VERSION=${BEENET_APP_VERSION:-}
 
 if [ ! -d "$APP" ]; then
-    echo "error: $APP not found; run apps/macos-contributor/build.sh first" >&2
+    echo "error: $APP not found; run deploy/macos-contributor/build.sh first" >&2
     exit 1
 fi
 

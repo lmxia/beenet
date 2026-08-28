@@ -1,0 +1,53 @@
+# Build with the Beenet repo as the main context and the sibling Spin checkout
+# as a named context:
+#   docker buildx build --platform linux/arm64 \
+#     --build-context spin=../spin -f deploy/docker/Dockerfile.worker-vm .
+
+FROM alpine:3.23 AS builder
+
+RUN apk add --no-cache \
+    build-base \
+    cargo \
+    clang \
+    cmake \
+    file \
+    linux-headers \
+    lld \
+    openssl-dev \
+    perl \
+    pkgconf \
+    rust \
+    scanelf
+
+WORKDIR /src
+COPY --from=spin / /src/spin
+COPY . /src/beenet
+WORKDIR /src/beenet
+
+ARG HTTP_PROXY
+ARG HTTPS_PROXY
+ARG CARGO_NET_RETRY=10
+ARG CARGO_HTTP_TIMEOUT=600
+ARG CARGO_HTTP_MULTIPLEXING=false
+ENV HTTP_PROXY=$HTTP_PROXY \
+    HTTPS_PROXY=$HTTPS_PROXY \
+    http_proxy=$HTTP_PROXY \
+    https_proxy=$HTTPS_PROXY \
+    CARGO_NET_RETRY=$CARGO_NET_RETRY \
+    CARGO_HTTP_TIMEOUT=$CARGO_HTTP_TIMEOUT \
+    CARGO_HTTP_MULTIPLEXING=$CARGO_HTTP_MULTIPLEXING
+
+RUN --mount=type=cache,target=/root/.cargo/registry \
+    --mount=type=cache,target=/root/.cargo/git \
+    --mount=type=cache,target=/src/beenet/target \
+    cargo build --release -p beenet-worker \
+    && strip target/release/beenet-worker \
+    && file target/release/beenet-worker \
+    && scanelf -n target/release/beenet-worker \
+    && mkdir -p /out \
+    && cp target/release/beenet-worker /out/beenet-worker \
+    && cp /usr/lib/libgcc_s.so.1 /out/libgcc_s.so.1
+
+FROM scratch AS artifact
+COPY --from=builder /out/beenet-worker /beenet-worker
+COPY --from=builder /out/libgcc_s.so.1 /libgcc_s.so.1

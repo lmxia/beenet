@@ -1,9 +1,6 @@
 mod native;
 mod vm;
 
-#[cfg(target_os = "macos")]
-use std::process::Command;
-
 use anyhow::Result;
 use beenet_common::config::{WorkerBackend, WorkerSettings};
 
@@ -15,8 +12,13 @@ pub fn validate(settings: &WorkerSettings) -> Result<()> {
 }
 
 #[cfg(target_os = "macos")]
-pub fn vm_command(settings: &WorkerSettings, config_path: &std::path::Path) -> Result<Command> {
-    vm::command(settings, config_path)
+pub fn supervise_vm(settings: &WorkerSettings, config_path: &std::path::Path) -> Result<()> {
+    vm::supervise(settings, config_path)
+}
+
+#[cfg(target_os = "macos")]
+pub fn vfkit_pid_path(wasm_cache_dir: &std::path::Path) -> std::path::PathBuf {
+    vm::vfkit_pid_path(wasm_cache_dir)
 }
 
 #[cfg(target_os = "macos")]

@@ -8,8 +8,9 @@
 .env
 .env.*
 !.env.example
-/apps/macos-contributor/dist/
-/apps/macos-contributor/Assets/AppIcon.png
+/deploy/windows/app/target/
+/deploy/macos-contributor/dist/
+/deploy/macos-contributor/Assets/AppIcon.png
 *.dmg
 .vscode/*
 !.vscode/launch.json

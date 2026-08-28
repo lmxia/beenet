@@ -2,9 +2,9 @@
 # Install bworker onto PATH, write ~/.config/beenet/config.toml, then run it.
 #
 #   curl -fsSL -o get-bworker.sh \
-#     https://github.com/lmxia/beenet/releases/latest/download/get-bworker.sh
+#     http://cloud.hyperos.online/api/v1/downloads/get-bworker.sh
 #   chmod +x get-bworker.sh
-#   ./get-bworker.sh --join-token-file ./join-token
+#   ./get-bworker.sh
 #
 # Later:
 #   bworker
@@ -12,6 +12,7 @@ set -euo pipefail
 
 REPO="${BEENET_REPO:-lmxia/beenet}"
 VERSION="${BEENET_VERSION:-latest}"
+DOWNLOAD_BASE="${BEENET_DOWNLOAD_BASE:-http://cloud.hyperos.online/api/v1/downloads}"
 PREFIX="${BEENET_PREFIX:-}"
 INSTALL_ONLY=0
 WORKER_ARGS=()
@@ -68,11 +69,13 @@ Needs a writable cgroup subtree (root, sudo, or systemd Delegate=yes).
 
   --join-token-file PATH    first-run enroll token (also accepts -join-token-file)
   --prefix DIR              install dir (default: /usr/local/bin, else ~/.local/bin)
-  --version TAG             release tag (default: latest)
+  --version TAG             unused with the default Cloud download URL (always latest)
   --install-only            install and write config, do not start
   -h, --help
 
 Environment:
+  BEENET_DOWNLOAD_BASE      asset base URL
+                            (default: http://cloud.hyperos.online/api/v1/downloads)
   BEENET_REPO, BEENET_VERSION, BEENET_PREFIX, BEENET_CONFIG,
   BEENET_WORKER_NAME, BEENET_REGION
 EOF
@@ -109,11 +112,7 @@ download() {
 
 asset_url() {
   local name="$1"
-  if [[ "${VERSION}" == "latest" ]]; then
-    printf 'https://github.com/%s/releases/latest/download/%s\n' "${REPO}" "${name}"
-  else
-    printf 'https://github.com/%s/releases/download/%s/%s\n' "${REPO}" "${VERSION}" "${name}"
-  fi
+  printf '%s/%s\n' "${DOWNLOAD_BASE%/}" "${name}"
 }
 
 run_privileged() {

@@ -1,0 +1,12 @@
+# Build context is the beenet/ workspace root.
+target/
+.git/
+deploy/kubernetes/
+deploy/macos-contributor/
+examples/
+dist/
+wasm_cache/
+*.md
+*.code-workspace
+.vscode/
+.idea/

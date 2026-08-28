@@ -1,200 +1,141 @@
-# Beenet Worker TODO
+# Beenet Worker — decisions and remaining work
 
-This document tracks the product and engineering path for making
-`beenet-worker` suitable for globally distributed, user-operated nodes.
+This is a decision record for the contributor worker, not a backlog from scratch.
+The original plan (native daemon per OS, no Docker at runtime, two-layer quotas)
+still holds. The macOS quota path and the desktop stack diverged on purpose.
 
-## Positioning
+Windows Job Object mapping lives in [`deploy/windows/job-objects.md`](deploy/windows/job-objects.md).
 
-`beenet-worker` should be a lightweight native worker runtime for discrete
-nodes across different operating systems and networks.
+## Decisions
 
-Docker is useful for local development and controlled deployments, but it
-should not be required for ordinary worker nodes. A global worker network needs
-a lower-friction installation path and native resource controls.
+### Runtime is the daemon; UI is not
 
-The preferred shape is:
+`beenet-worker` / `bworker` executes Wasm, heartbeats, and dials the gateway.
+Desktop UI only installs, configures, starts/stops, and displays status.
+Headless CLI/systemd remains a first-class path.
 
-```text
-beenet-worker daemon
-        ^
-        | local API / socket
-        v
-Beenet Desktop App
-```
+### No Docker as a worker runtime
 
-Advanced users and servers can run the daemon directly. Ordinary users can use
-a desktop app to install, configure, pause, resume, and observe the worker.
+Docker is for building images (guest initrd, registry/gateway) and for local
+control-plane compose. Ordinary contributor nodes do not run dockerd.
 
-## Architecture Goals
+### One product quota, OS-specific enforcement
 
-- Keep the core worker as a native daemon / service.
-- Keep desktop UI separate from the execution runtime.
-- Do not require Docker for end-user worker participation.
-- Use Wasm sandbox limits as the first resource boundary.
-- Add OS-level resource quotas as a second boundary.
-- Make worker identity, cache, logs, and configuration explicit and persistent.
-- Support unattended restart through system service integration.
+User-facing `[worker.quota]` is the same everywhere:
 
-## Resource Quota Model
+| Field | Meaning |
+| --- | --- |
+| `cpu_percent` | Budget as a **percentage of one logical CPU** (25 = quarter core, 150 = 1.5 cores) |
+| `memory_mb` | Whole-worker memory cap |
+| `pids_max` | Whole-worker process/thread cap where the OS can express it |
+| `nice` | Optional UNIX niceness; not part of the Windows v1 mapping |
 
-The worker should enforce limits at two layers.
+Wasmtime still applies per-instance memory and wall-clock deadline. OS quota is
+the second boundary around the **whole worker process tree**, not per invoke.
 
-### Wasm Runtime Layer
+If CPU/memory/pids are set and the OS backend cannot apply them, **start fails**.
+Do not warn-and-continue.
 
-- Memory limit per instance.
-- Wall-clock deadline per invocation.
-- Maximum concurrency per worker.
-- Capability policy for outbound HTTP and other factors.
-- Log/output truncation for wire safety.
-- Future: fuel or epoch-based interruption where appropriate.
+### How each OS enforces that quota
 
-### OS Layer
-
-Different operating systems need different quota backends behind a shared
-worker abstraction.
-
-| OS | Preferred Backend | Notes |
+| OS | Process shape | OS quota backend |
 | --- | --- | --- |
-| Linux | cgroup v2 / systemd slice | Best fit for CPU, memory, pids, and IO quotas. |
-| Windows | Job Objects | Good fit for process tree CPU and memory limits. |
-| macOS | rlimit, priority, process policy | Weaker than cgroup; may need conservative defaults. |
+| Linux | Native `beenet-worker` | cgroup v2 written by the daemon (`cpu.max` / `memory.max` / `pids.max`). systemd only starts the process with `Delegate=yes`. |
+| macOS contributors | Host supervisor + vfkit Alpine guest | Guest uses the **same Linux cgroup code**. Host `backend=vm` is required for CPU/memory/pids. Host `backend=native` is nice-only and is not the product path. |
+| Windows | Native `beenet-worker.exe` | Job Objects. **Not** a Hyper-V/WSL copy of the Mac VM. See [`deploy/windows/job-objects.md`](deploy/windows/job-objects.md). |
 
-The initial macOS backend split is now `native` (nice only) and `vm` (vfkit /
-Apple Virtualization.framework supervising a dedicated Linux guest). The guest runs
-`beenet-worker run-internal` and uses the same Linux cgroup v2 implementation. This is
-deliberately not a Docker Desktop runtime dependency. The Linux/arm64 worker is built natively
-inside a multi-stage Alpine Docker build, so macOS does not need a Linux Rust target, Zig, LLVM,
-or another cross toolchain. The initial Alpine initramfs and real vfkit boot have been validated
-with `cpu.max`, `memory.max`, and `pids.max` applied.
-The guest PID 1 also shuts down Linux when the worker exits so launchd can restart vfkit cleanly.
+Linux and Windows stay native because the OS already has a real second boundary.
+macOS does not (nice/rlimit is not cgroup), so contributors pay for a microVM to
+get the same CPU/memory/pids semantics as Linux.
 
-The worker should expose one product-level quota model, then translate it to
-the best local backend.
+Do not add a Windows VM backend unless Job Objects prove insufficient or we
+later need an identical Linux syscall surface.
 
-Example user-facing controls:
+### Desktop stacks stay per-OS
 
-- CPU budget: 10%, 25%, 50%, unlimited.
-- Memory budget: 256 MB, 512 MB, 1 GB, custom.
-- Max concurrent tasks.
-- Run always / run only when idle.
-- Network permission profile.
-- Pause and resume.
+- macOS: Swift App + LaunchAgent (`com.beenet.worker`). Not Tauri.
+- Linux: no desktop app. `get-bworker.sh` / `bworker` / systemd.
+- Windows: tray + optional user service later, talking to the same exe. Do not
+  rewrite the Mac app into a cross-platform shell to get Windows. v1 ships an
+  egui desktop app + Inno Setup wizard (`BeenetSetup-x64.exe`). Cache dir is
+  chosen at install time; name and region are edited in the running app.
 
-## Native Daemon Work
+### Control plane vs process liveness
 
-- Define daemon mode for `beenet-worker`.
-- Add a local control API, preferably over a local-only socket.
-- Expose status:
-  - peer id
-  - display name
-  - registry enrollment state
-  - connected gateway state
-  - supported CIDs
-  - loaded CIDs
-  - recent invocations
-  - quota state
-  - last errors
-- Add commands for:
-  - start
-  - stop
-  - pause
-  - resume
-  - status
-  - rotate / reset identity with explicit confirmation
-  - refresh join token
-- Decide service integration:
-  - Linux: systemd unit.
-  - macOS: launchd plist.
-  - Windows: Windows Service.
+Cloud “online” is a fresh registry heartbeat (60s lease), not “vfkit/systemd
+says running”. The Mac supervisor rebuilds vfkit NAT when the host can reach
+the registry but the guest heartbeat file is stale (sleep/lock).
 
-## Desktop App Work
+### Identity and install
 
-The desktop app should be a control surface, not the runtime itself.
+- Peer identity lives in `wasm_cache_dir` (`identity.key`). Join tokens are not
+  persisted in `config.toml`.
+- Linux config: `~/.config/beenet/config.toml` (XDG).
+- macOS config: `~/Library/Application Support/Beenet/config.toml`.
+- Windows config: `%APPDATA%\beenet\config.toml`. Cache dir is chosen by the
+  installer (`%LOCALAPPDATA%\beenet\wasm_cache` by default).
 
-Recommended stack: Tauri, unless a later reason strongly favors another shell.
+### One worker process, many Wasm instances
 
-Desktop app responsibilities:
+A single worker process runs concurrent instances under one OS quota. That
+matches the product control (“this machine contributes 25% CPU / 512 MB”).
+Per-invoke child processes are a future isolation upgrade, not the current
+model.
 
-- Install or locate the worker daemon.
-- Create and edit worker config.
-- Guide first-time enrollment with a join token.
-- Start, stop, pause, and resume the daemon.
-- Show health, logs, quota usage, and recent tasks.
-- Let users choose CPU, memory, and network limits.
-- Surface upgrade availability.
-- Preserve a path for headless CLI/server operation.
+## Current implementation
 
-## Cross-OS Developer Work
+### Linux
 
-- Add `make build-worker`.
-- Add `make lint-worker`.
-- Add CI matrix for:
-  - Linux
-  - macOS
-  - Windows
-- At minimum, run `cargo check -p beenet-worker` on all three OSes.
-- Document platform config paths:
-  - Linux: `$XDG_CONFIG_HOME/beenet/config.toml` or `~/.config/beenet/config.toml`.
-  - macOS: `~/Library/Application Support/beenet/config.toml`.
-  - Windows: `%APPDATA%\beenet\config.toml`.
-- Add Windows PowerShell startup instructions.
-- Keep Bash scripts for macOS/Linux local development.
-- Consider adding `scripts/dev-up.ps1` only if native Windows local development
-  becomes a priority.
+- Native daemon; default CLI with no subcommand enrolls then starts.
+- `scripts/get-bworker.sh`, alias `bworker`, sample unit
+  `deploy/linux/beenet-worker.service`.
+- Default quota when installed that way: 25% CPU / 512 MB / 128 pids.
+- CI: `.github/workflows/linux-worker.yml` (check on PR; tarball on tag).
+- Packaging today: standalone binary + tarball + unit. No `.deb` / `.rpm` yet.
 
-## Packaging
+### macOS (arm64)
 
-Potential distribution formats:
+- App source and DMG: `deploy/macos-contributor/`.
+- LaunchAgent runs `beenet-worker run-internal`, which supervises vfkit (does
+  not `exec` it). Guest initrd is bundled in the app; users do not run the
+  image-build script for the contributor path.
+- Guest applies Linux cgroup v2. Host envelope is
+  `derive_vm_envelope`: vCPUs = `ceil(cpu_percent / 100)`, RAM =
+  `memory_mb + 320`.
+- Heartbeat marker + log rotation; CI DMG on `macos-15` (Apple Silicon only).
+- Intel Mac is not shipped.
 
-- Linux:
-  - standalone binary
-  - `.deb`
-  - `.rpm`
-  - systemd unit
-- macOS:
-  - signed app bundle for desktop UI
-  - signed daemon/helper
-  - launchd integration
-- Windows:
-  - signed installer
-  - Windows Service
-  - tray app
+### Windows (x64)
 
-The CLI/daemon should remain independently downloadable even after a desktop
-app exists.
+- Native `beenet-worker.exe`; Job Objects apply `[worker.quota]` (see
+  [`deploy/windows/job-objects.md`](deploy/windows/job-objects.md)).
+- Desktop app: `deploy/windows/app` (egui). Login, start/stop, name/region,
+  quota presets. Cache dir is chosen in the Inno Setup wizard, not in the app.
+- Installer: `deploy/windows/Beenet.iss` → `BeenetSetup-x64.exe`.
+- CI: `.github/workflows/windows-contributor.yml` (check on PR; installer on tag).
 
-## Open Questions
+### Still missing (all platforms)
 
-- Should a single worker process run multiple Wasm tasks under one OS quota, or
-  should each task run in a supervised child process for stronger OS isolation?
-- How strict should macOS quotas be in the first version?
-- Should quota enforcement be required before public node onboarding?
-- Should the desktop app require a Beenet Cloud account, or support anonymous /
-  token-only node enrollment?
-- What telemetry is necessary for trust and abuse prevention, and what should
-  remain local only?
+- Local control socket / structured status API (App currently execs CLI).
+- Pause / resume / run-only-when-idle.
+- Quota hot-reload without restart.
+- Windows Service / tray autostart; installer is Inno Setup already.
+- macOS: vsock guest agent, atomic guest-image update/rollback, Intel.
 
-## Suggested Milestones
+## Rejected or deferred
 
-1. Make worker build/check visible in Makefile and CI.
-2. Introduce a small internal quota abstraction.
-3. Implement Linux cgroup v2 backend first.
-4. Add local daemon control API and status command.
-5. Add Windows Job Object backend.
-6. Add macOS conservative quota backend.
-7. Build Tauri desktop control app.
-8. Package native installers and service integration.
+| Idea | Status | Why |
+| --- | --- | --- |
+| macOS native nice as the contributor quota | Rejected | Not a real CPU/memory/pids cap. |
+| systemd `CPUQuota` / `MemoryMax` as the Linux quota | Rejected | Dockerd model: unit starts the daemon; the daemon applies cgroup. |
+| Docker / WSL2 as the Windows worker | Rejected | Friction and extra runtime; contradicts “no Docker for nodes”. |
+| Hyper-V Alpine guest as Windows v1 | Deferred | Job Objects already cap CPU and job memory. Revisit only if needed. |
+| One Tauri app for Mac+Windows+Linux | Deferred | Mac Swift app exists; Linux stays CLI. |
+| Per-task OS process | Deferred | Product quota is whole-worker. |
 
-## macOS VM Follow-ups
+## Next work (order)
 
-- Build, sign, publish, and verify the minimal kernel/initrd/root-disk bundle.
-- Add atomic image updates, rollback, and garbage collection.
-- Package the existing guest init, Docker-built worker, and verified Alpine kernel as a signed
-  release artifact instead of requiring users to run the developer image-build script.
-- Add a guest agent or vsock health protocol so `status` reports worker readiness rather than
-  only the vfkit process state.
-- Add a one-time enrollment flow that passes bootstrap credentials over a temporary protected
-  channel and never uses process arguments, kernel parameters, config logs, or image layers.
-- Validate vfkit device syntax and boot behavior in macOS CI on both Apple Silicon and Intel,
-  where supported.
-- Define host-to-guest networking/DNS for control-plane URLs that currently use localhost.
+1. Optional local control API if pause/hot quota needs it.
+2. Windows Service / signed installer later; the Service must not set Job
+   limits itself (same split as systemd `Delegate=yes`).
+3. Linux `.deb` / macOS guest-image updates only when packaging pain shows up.

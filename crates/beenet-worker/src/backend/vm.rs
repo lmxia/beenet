@@ -1,17 +1,23 @@
 #[cfg(target_os = "macos")]
 use std::fs;
-use std::path::Path;
 #[cfg(target_os = "macos")]
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+use std::path::Path;
 use std::path::PathBuf;
 #[cfg(target_os = "macos")]
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 #[cfg(target_os = "macos")]
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+#[cfg(target_os = "macos")]
+use std::time::{Instant, SystemTime};
 
 #[cfg(target_os = "macos")]
 use anyhow::Context;
 use anyhow::Result;
 use beenet_common::config::WorkerSettings;
+#[cfg(target_os = "macos")]
+use tracing::{info, warn};
 
 #[cfg(target_os = "macos")]
 const CONFIG_MOUNT_TAG: &str = "beenet-config";
@@ -22,6 +28,109 @@ const STATE_MOUNT_TAG: &str = "beenet-state";
 pub(crate) const LAUNCH_AGENT_LABEL: &str = "com.beenet.worker";
 #[cfg(target_os = "macos")]
 const LEGACY_LAUNCH_AGENT_LABEL: &str = "com.beenet.worker-hk";
+
+#[cfg_attr(not(any(test, target_os = "macos")), allow(dead_code))]
+pub(crate) const VFKIT_PID_FILE: &str = "vfkit.pid";
+
+/// Host-side NAT recovery after sleep or network change.
+///
+/// Wall-clock durations: `Instant` pauses across macOS sleep, which would keep
+/// a just-spawned VM inside `boot_grace` after the user wakes and reconnects.
+#[cfg_attr(not(any(test, target_os = "macos")), allow(dead_code))]
+pub(crate) struct NatRebuildPolicy {
+    pub stale_after: Duration,
+    pub boot_grace: Duration,
+    pub restart_cooldown: Duration,
+    pub cooldown_cap: Duration,
+}
+
+impl NatRebuildPolicy {
+    pub const DEFAULT: Self = Self {
+        stale_after: Duration::from_secs(90),
+        boot_grace: Duration::from_secs(90),
+        restart_cooldown: Duration::from_secs(60),
+        cooldown_cap: Duration::from_secs(900),
+    };
+
+    fn cooldown(&self, rebuild_failures: u32) -> Duration {
+        let shift = rebuild_failures.min(4);
+        Duration::from_secs(
+            self.restart_cooldown
+                .as_secs()
+                .saturating_mul(1u64 << shift),
+        )
+        .min(self.cooldown_cap)
+    }
+}
+
+/// Rebuild vfkit NAT when the Mac can reach the registry but the guest heartbeat
+/// is stale. Do not rebuild while the host itself is offline, or inside boot grace.
+#[cfg_attr(not(any(test, target_os = "macos")), allow(dead_code))]
+pub(crate) fn should_rebuild_nat(
+    heartbeat_age: Option<Duration>,
+    time_since_spawn: Duration,
+    time_since_rebuild: Option<Duration>,
+    rebuild_failures: u32,
+    host_registry_reachable: bool,
+    policy: &NatRebuildPolicy,
+) -> bool {
+    if !host_registry_reachable {
+        return false;
+    }
+    if time_since_spawn < policy.boot_grace {
+        return false;
+    }
+    let cooldown = policy.cooldown(rebuild_failures);
+    if time_since_rebuild.is_some_and(|elapsed| elapsed < cooldown) {
+        return false;
+    }
+    match heartbeat_age {
+        None => true,
+        Some(age) => age >= policy.stale_after,
+    }
+}
+
+#[cfg_attr(not(any(test, target_os = "macos")), allow(dead_code))]
+pub(crate) fn vfkit_pid_path(wasm_cache_dir: &Path) -> PathBuf {
+    wasm_cache_dir.join(VFKIT_PID_FILE)
+}
+
+#[cfg_attr(not(any(test, target_os = "macos")), allow(dead_code))]
+pub(crate) fn parse_registry_host_port(registry_url: &str) -> Option<(String, u16)> {
+    let url = registry_url.trim();
+    let (scheme, rest) = url.split_once("://")?;
+    let authority = rest.split('/').next()?.split('@').next_back()?;
+    let default_port = if scheme.eq_ignore_ascii_case("https") {
+        443
+    } else {
+        80
+    };
+    if let Some(rest) = authority.strip_prefix('[') {
+        let (host, port_part) = rest.split_once(']')?;
+        let port = port_part
+            .strip_prefix(':')
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(default_port);
+        return Some((host.to_string(), port));
+    }
+    if let Some((host, port)) = authority.rsplit_once(':') {
+        if !host.is_empty() && host.chars().all(|c| c.is_ascii_digit() || c == '.') {
+            // IPv4:port
+            let port = port.parse().ok()?;
+            return Some((host.to_string(), port));
+        }
+        if host.contains(':') {
+            return None;
+        }
+        if let Ok(port) = port.parse::<u16>() {
+            return Some((host.to_string(), port));
+        }
+    }
+    if authority.is_empty() {
+        return None;
+    }
+    Some((authority.to_string(), default_port))
+}
 
 pub(super) fn validate(_settings: &WorkerSettings) -> Result<()> {
     #[cfg(not(target_os = "macos"))]
@@ -152,11 +261,179 @@ fn reject_vfkit_delimiter(path: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
+static STOP_SUPERVISOR: AtomicBool = AtomicBool::new(false);
+
+#[cfg(target_os = "macos")]
+extern "C" fn handle_supervisor_stop(_: libc::c_int) {
+    STOP_SUPERVISOR.store(true, Ordering::SeqCst);
+}
+
+/// Stay in the foreground and respawn vfkit. launchd KeepAlive watches this
+/// supervisor; guest poweroff still exits vfkit, and this loop starts a new VM.
+/// Sleep/lock kills virtio-net NAT without exiting vfkit — rebuild when the host
+/// can reach the registry but the guest heartbeat file is stale.
+#[cfg(target_os = "macos")]
+pub(crate) fn supervise(settings: &WorkerSettings, config_path: &Path) -> Result<()> {
+    STOP_SUPERVISOR.store(false, Ordering::SeqCst);
+    install_stop_handler();
+
+    let policy = NatRebuildPolicy::DEFAULT;
+    let pid_path = vfkit_pid_path(&settings.wasm_cache_dir);
+    let mut rebuild_failures: u32 = 0;
+    let mut last_rebuild_at: Option<SystemTime> = None;
+
+    loop {
+        if STOP_SUPERVISOR.load(Ordering::SeqCst) {
+            let _ = fs::remove_file(&pid_path);
+            return Ok(());
+        }
+
+        let mut cmd = command(settings, config_path)?;
+        cmd.stdin(Stdio::null());
+        info!(
+            vfkit = %settings.vm.vfkit_path.display(),
+            cpus = settings.vm.cpus,
+            memory_mb = settings.vm.memory_mb,
+            "starting Beenet Linux microVM"
+        );
+        let mut child = cmd.spawn().context("spawn vfkit")?;
+        let spawned_at = SystemTime::now();
+        write_vfkit_pid(&pid_path, child.id())?;
+
+        loop {
+            if STOP_SUPERVISOR.load(Ordering::SeqCst) {
+                terminate_child(&mut child);
+                let _ = fs::remove_file(&pid_path);
+                return Ok(());
+            }
+
+            match child.try_wait().context("wait vfkit")? {
+                Some(status) => {
+                    let _ = fs::remove_file(&pid_path);
+                    if STOP_SUPERVISOR.load(Ordering::SeqCst) {
+                        return Ok(());
+                    }
+                    warn!(?status, "vfkit exited; launching a new VM");
+                    std::thread::sleep(Duration::from_secs(1));
+                    break;
+                }
+                None => {}
+            }
+
+            let heartbeat_age = beenet_common::display_name::registry_heartbeat_age_secs(
+                &settings.wasm_cache_dir,
+            )
+            .map(Duration::from_secs);
+            if heartbeat_age.is_some_and(|age| age < policy.stale_after) {
+                rebuild_failures = 0;
+            }
+
+            let time_since_spawn = wall_elapsed(spawned_at);
+            let time_since_rebuild = last_rebuild_at.map(wall_elapsed);
+            let host_reachable = host_can_reach_registry(&settings.registry_url, Duration::from_secs(3));
+            if should_rebuild_nat(
+                heartbeat_age,
+                time_since_spawn,
+                time_since_rebuild,
+                rebuild_failures,
+                host_reachable,
+                &policy,
+            ) {
+                warn!(
+                    heartbeat_age_secs = heartbeat_age.map(|age| age.as_secs()),
+                    "host can reach registry but guest heartbeat is stale; rebuilding vfkit NAT"
+                );
+                terminate_child(&mut child);
+                let _ = fs::remove_file(&pid_path);
+                last_rebuild_at = Some(SystemTime::now());
+                rebuild_failures = rebuild_failures.saturating_add(1);
+                break;
+            }
+
+            interruptible_sleep(Duration::from_secs(5));
+            crate::log_rotate::tick(&settings.wasm_cache_dir);
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn install_stop_handler() {
+    unsafe {
+        libc::signal(
+            libc::SIGTERM,
+            handle_supervisor_stop as *const () as libc::sighandler_t,
+        );
+        libc::signal(
+            libc::SIGINT,
+            handle_supervisor_stop as *const () as libc::sighandler_t,
+        );
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn interruptible_sleep(total: Duration) {
+    let mut waited = Duration::ZERO;
+    while waited < total {
+        if STOP_SUPERVISOR.load(Ordering::SeqCst) {
+            return;
+        }
+        let slice = Duration::from_millis(200).min(total - waited);
+        std::thread::sleep(slice);
+        waited += slice;
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn wall_elapsed(since: SystemTime) -> Duration {
+    SystemTime::now()
+        .duration_since(since)
+        .unwrap_or(Duration::from_secs(0))
+}
+
+#[cfg(target_os = "macos")]
+fn write_vfkit_pid(path: &Path, pid: u32) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("create `{}`", parent.display()))?;
+    }
+    fs::write(path, format!("{pid}\n")).with_context(|| format!("write `{}`", path.display()))
+}
+
+#[cfg(target_os = "macos")]
+fn terminate_child(child: &mut Child) {
+    let pid = child.id() as i32;
+    unsafe {
+        libc::kill(pid, libc::SIGTERM);
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) => std::thread::sleep(Duration::from_millis(100)),
+            Err(_) => break,
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[cfg(target_os = "macos")]
+fn host_can_reach_registry(registry_url: &str, timeout: Duration) -> bool {
+    let Some((host, port)) = parse_registry_host_port(registry_url) else {
+        return false;
+    };
+    let Ok(mut addrs) = (host.as_str(), port).to_socket_addrs() else {
+        return false;
+    };
+    addrs.any(|addr: SocketAddr| TcpStream::connect_timeout(&addr, timeout).is_ok())
+}
+
 /// Generate a launchd LaunchAgent plist for the host supervisor.
 ///
-/// `KeepAlive` is unconditional: guest poweroff is a successful vfkit exit, and
-/// launchd must still restart the VM. `ProgramArguments` must use `run-internal`
-/// so launchd supervises the foreground process after `exec vfkit`.
+/// `KeepAlive` is unconditional so launchd restarts this supervisor if it
+/// exits. The supervisor itself respawns vfkit on guest poweroff and when
+/// host networking is back but the guest heartbeat has gone stale.
+/// `ProgramArguments` must use `run-internal` (not `start`).
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn launch_agent_plist(
     label: &str,
@@ -451,6 +728,7 @@ fn kickstart_launch_agent(label: &str) -> Result<()> {
 mod tests {
     use super::launch_agent_plist;
     use std::path::Path;
+    use std::time::Duration;
 
     const ALPINE_INIT: &str = include_str!("../../../../vm/alpine-init");
 
@@ -517,5 +795,96 @@ mod tests {
         let running = super::parse_launchctl_print("\tstate = running\n\tpid = 12\n");
         assert!(running.running);
         assert_eq!(running.pid, Some(12));
+    }
+
+    #[test]
+    fn parse_registry_host_port_defaults_and_overrides() {
+        assert_eq!(
+            super::parse_registry_host_port("http://registry.hyperos.online"),
+            Some(("registry.hyperos.online".into(), 80))
+        );
+        assert_eq!(
+            super::parse_registry_host_port("https://example.com/api"),
+            Some(("example.com".into(), 443))
+        );
+        assert_eq!(
+            super::parse_registry_host_port("http://127.0.0.1:3030/v1"),
+            Some(("127.0.0.1".into(), 3030))
+        );
+        assert_eq!(
+            super::parse_registry_host_port("http://[::1]:8080/"),
+            Some(("::1".into(), 8080))
+        );
+    }
+
+    #[test]
+    fn rebuild_nat_when_host_is_online_and_heartbeat_is_stale() {
+        let policy = super::NatRebuildPolicy::DEFAULT;
+        let stale = Some(policy.stale_after + Duration::from_secs(1));
+        let spawned = policy.boot_grace + Duration::from_secs(1);
+        assert!(super::should_rebuild_nat(
+            stale, spawned, None, 0, true, &policy
+        ));
+        assert!(
+            !super::should_rebuild_nat(stale, spawned, None, 0, false, &policy),
+            "Mac still offline: do not recycle the VM"
+        );
+        assert!(
+            !super::should_rebuild_nat(
+                stale,
+                Duration::from_secs(10),
+                None,
+                0,
+                true,
+                &policy
+            ),
+            "guest still booting"
+        );
+        assert!(!super::should_rebuild_nat(
+            Some(Duration::from_secs(5)),
+            spawned,
+            None,
+            0,
+            true,
+            &policy
+        ));
+        assert!(
+            !super::should_rebuild_nat(
+                stale,
+                spawned,
+                Some(Duration::from_secs(10)),
+                0,
+                true,
+                &policy
+            ),
+            "cooldown after a rebuild"
+        );
+        assert!(
+            super::should_rebuild_nat(None, spawned, None, 0, true, &policy),
+            "no heartbeat file after grace means the guest never came online"
+        );
+    }
+
+    #[test]
+    fn rebuild_nat_backoff_lengthens_cooldown() {
+        let policy = super::NatRebuildPolicy::DEFAULT;
+        let stale = Some(policy.stale_after);
+        let spawned = policy.boot_grace;
+        assert!(!super::should_rebuild_nat(
+            stale,
+            spawned,
+            Some(Duration::from_secs(90)),
+            1,
+            true,
+            &policy
+        ));
+        assert!(super::should_rebuild_nat(
+            stale,
+            spawned,
+            Some(Duration::from_secs(120)),
+            1,
+            true,
+            &policy
+        ));
     }
 }

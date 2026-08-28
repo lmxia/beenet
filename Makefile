@@ -52,8 +52,8 @@ endif
 .PHONY: app-macos
 app-macos: $(APP_MACOS_DEPS) ## Build the unsigned macOS contributor app
 	cargo build --release -p beenet-worker
-	chmod +x apps/macos-contributor/build.sh
-	apps/macos-contributor/build.sh
+	chmod +x deploy/macos-contributor/build.sh
+	deploy/macos-contributor/build.sh
 
 .PHONY: dmg
 dmg: app-macos ## Wrap the macOS contributor app into a DMG
@@ -81,6 +81,18 @@ linux-worker-tarball: linux-worker ## Package beenet-worker + install script int
 	rm -rf out/linux/beenet-worker-linux-$(LINUX_ARCH)
 	@ls -lh $(LINUX_TARBALL)
 
+.PHONY: windows-installer
+windows-installer: ## Build Beenet.exe + beenet-worker.exe + Inno Setup installer (Windows)
+	cargo build --release -p beenet-worker
+	cargo build --release --manifest-path deploy/windows/app/Cargo.toml --target-dir target
+	mkdir -p out/windows
+	iscc /DMyAppVersion=$(VERSION) \
+		/DBeenetWorkerExe="$(CURDIR)/target/release/beenet-worker.exe" \
+		/DBeenetAppExe="$(CURDIR)/target/release/Beenet.exe" \
+		/DBeenetOutputDir="$(CURDIR)/out/windows" \
+		deploy/windows/Beenet.iss
+	@ls -lh out/windows/BeenetSetup-x64.exe
+
 .PHONY: fmt
 fmt: ## Format all code with rustfmt
 	cargo fmt --all
@@ -105,7 +117,7 @@ docker-build-registry: ## Build beenet-registry Docker image
 	docker build \
 		--build-arg HTTP_PROXY=$(HTTP_PROXY) \
 		--build-arg HTTPS_PROXY=$(HTTPS_PROXY) \
-		-f docker/Dockerfile.registry \
+		-f deploy/docker/Dockerfile.registry \
 		-t $(REGISTRY_IMAGE) \
 		$(DOCKER_CTX)
 
@@ -114,13 +126,13 @@ docker-build-gateway: ## Build beenet-gateway Docker image
 	docker build \
 		--build-arg HTTP_PROXY=$(HTTP_PROXY) \
 		--build-arg HTTPS_PROXY=$(HTTPS_PROXY) \
-		-f docker/Dockerfile.gateway \
+		-f deploy/docker/Dockerfile.gateway \
 		-t $(GATEWAY_IMAGE) \
 		$(DOCKER_CTX)
 
 .PHONY: docker-build-frontdoor
 docker-build-frontdoor: ## Build beenet-frontdoor Docker image
-	docker build -f docker/Dockerfile.frontdoor -t $(FRONTDOOR_IMAGE) $(DOCKER_CTX)
+	docker build -f deploy/docker/Dockerfile.frontdoor -t $(FRONTDOOR_IMAGE) $(DOCKER_CTX)
 
 .PHONY: docker-push
 docker-push: ## Push images to the registry
@@ -152,30 +164,30 @@ ensure-routing-secret: ## Create routing tokens once; preserve them on subsequen
 
 .PHONY: deploy
 deploy: ensure-routing-secret ## Apply Kubernetes manifests (registry + gateway + frontdoor)
-	kubectl apply -f beenet-deploy/registry.yaml
-	kubectl apply -f beenet-deploy/gateway.yaml
-	kubectl apply -f beenet-deploy/frontdoor.yaml
-	kubectl apply -f beenet-deploy/ingress.yaml
+	kubectl apply -f deploy/kubernetes/registry.yaml
+	kubectl apply -f deploy/kubernetes/gateway.yaml
+	kubectl apply -f deploy/kubernetes/frontdoor.yaml
+	kubectl apply -f deploy/kubernetes/ingress.yaml
 
 .PHONY: deploy-registry
 deploy-registry: ensure-routing-secret ## Deploy only beenet-registry
-	kubectl apply -f beenet-deploy/redis.yaml
-	kubectl apply -f beenet-deploy/registry.yaml
+	kubectl apply -f deploy/kubernetes/redis.yaml
+	kubectl apply -f deploy/kubernetes/registry.yaml
 
 .PHONY: deploy-gateway
 deploy-gateway: ensure-routing-secret ## Deploy only beenet-gateway
-	kubectl apply -f beenet-deploy/gateway.yaml
+	kubectl apply -f deploy/kubernetes/gateway.yaml
 
 .PHONY: deploy-frontdoor
 deploy-frontdoor: ensure-routing-secret ## Deploy only beenet-frontdoor
-	kubectl apply -f beenet-deploy/frontdoor.yaml
+	kubectl apply -f deploy/kubernetes/frontdoor.yaml
 
 .PHONY: undeploy
 undeploy: ## Remove all beenet Kubernetes resources
-	kubectl delete -f beenet-deploy/gateway.yaml  --ignore-not-found
-	kubectl delete -f beenet-deploy/frontdoor.yaml --ignore-not-found
-	kubectl delete -f beenet-deploy/ingress.yaml --ignore-not-found
-	kubectl delete -f beenet-deploy/registry.yaml --ignore-not-found
+	kubectl delete -f deploy/kubernetes/gateway.yaml  --ignore-not-found
+	kubectl delete -f deploy/kubernetes/frontdoor.yaml --ignore-not-found
+	kubectl delete -f deploy/kubernetes/ingress.yaml --ignore-not-found
+	kubectl delete -f deploy/kubernetes/registry.yaml --ignore-not-found
 
 .PHONY: status
 status: ## Show running pods in the beenet namespace

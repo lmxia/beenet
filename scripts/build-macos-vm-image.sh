@@ -81,7 +81,7 @@ docker buildx build \
     --build-context "spin=$SPIN_DIR" \
     --build-arg "HTTP_PROXY=${BEENET_DOCKER_HTTP_PROXY:-${HTTP_PROXY:-}}" \
     --build-arg "HTTPS_PROXY=${BEENET_DOCKER_HTTPS_PROXY:-${HTTPS_PROXY:-}}" \
-    --file "$ROOT_DIR/docker/Dockerfile.worker-vm" \
+    --file "$ROOT_DIR/deploy/docker/Dockerfile.worker-vm" \
     --target artifact \
     --output "type=local,dest=$WORK/worker-artifact" \
     "$ROOT_DIR"

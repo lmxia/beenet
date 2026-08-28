@@ -33,11 +33,25 @@ pub fn apply_os_quota(q: &WorkerQuotaSettings) -> Result<()> {
         return Ok(());
     }
 
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(target_os = "windows")]
+    {
+        apply_windows_job_object(q)?;
+        return Ok(());
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     {
         let _ = q;
-        anyhow::bail!("OS quota is currently supported on Linux and macOS only");
+        anyhow::bail!("OS quota is currently supported on Linux, macOS, and Windows");
     }
+}
+
+/// Job Object `CpuRate` is tenths of a percent of the **whole machine**.
+/// `cpu_percent` is a percent of **one** logical CPU (same as Linux `cpu.max`).
+pub(crate) fn windows_cpu_rate(cpu_percent: u32, logical_cpus: u32) -> u32 {
+    let n = u64::from(logical_cpus.max(1));
+    let tenths = (u64::from(cpu_percent) * 10 + n / 2) / n;
+    tenths.clamp(1, 10_000) as u32
 }
 
 fn quota_configured(q: &WorkerQuotaSettings) -> bool {
@@ -195,6 +209,14 @@ fn apply_macos_quota(q: &WorkerQuotaSettings) -> Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "windows")]
+fn apply_windows_job_object(q: &WorkerQuotaSettings) -> Result<()> {
+    if q.cpu_percent.is_none() && q.memory_mb.is_none() && q.pids_max.is_none() {
+        return Ok(());
+    }
+    windows_job::apply(q)
+}
+
 #[cfg(unix)]
 fn apply_unix_nice(q: &WorkerQuotaSettings) -> Result<()> {
     let Some(nice) = q.nice else {
@@ -206,4 +228,120 @@ fn apply_unix_nice(q: &WorkerQuotaSettings) -> Result<()> {
     }
     info!(nice, "applied worker nice priority");
     Ok(())
+}
+
+#[cfg(target_os = "windows")]
+mod windows_job {
+    use super::*;
+    use std::sync::OnceLock;
+    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, HANDLE, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, SetInformationJobObject,
+        JobObjectCpuRateControlInformation, JobObjectExtendedLimitInformation,
+        JOBOBJECT_CPU_RATE_CONTROL_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_CPU_RATE_CONTROL_ENABLE, JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP,
+        JOB_OBJECT_LIMIT_ACTIVE_PROCESS, JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION,
+        JOB_OBJECT_LIMIT_JOB_MEMORY, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+    static JOB: OnceLock<HANDLE> = OnceLock::new();
+
+    pub(super) fn apply(q: &WorkerQuotaSettings) -> Result<()> {
+        let job = *JOB.get_or_try_init(|| create_job())?;
+        apply_limits(job, q)?;
+        Ok(())
+    }
+
+    fn create_job() -> Result<HANDLE> {
+        let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+        if job.is_null() || job == INVALID_HANDLE_VALUE {
+            return Err(std::io::Error::from_raw_os_error(unsafe { GetLastError() } as i32))
+                .context("CreateJobObjectW");
+        }
+        let current = unsafe { GetCurrentProcess() };
+        if unsafe { AssignProcessToJobObject(job, current) } == 0 {
+            let err = std::io::Error::from_raw_os_error(unsafe { GetLastError() } as i32);
+            unsafe { CloseHandle(job) };
+            return Err(err).context(
+                "AssignProcessToJobObject; this process may already be in a job that cannot nest",
+            );
+        }
+        Ok(job)
+    }
+
+    fn apply_limits(job: HANDLE, q: &WorkerQuotaSettings) -> Result<()> {
+        let mut ext: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+        ext.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+            | JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION;
+        if let Some(pids_max) = q.pids_max {
+            ext.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_ACTIVE_PROCESS;
+            ext.BasicLimitInformation.ActiveProcessLimit = pids_max;
+        }
+        if let Some(memory_mb) = q.memory_mb {
+            let bytes = (memory_mb as usize)
+                .checked_mul(1024 * 1024)
+                .context("worker quota memory_mb is too large")?;
+            ext.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_JOB_MEMORY;
+            ext.JobMemoryLimit = bytes;
+        }
+        let ok = unsafe {
+            SetInformationJobObject(
+                job,
+                JobObjectExtendedLimitInformation,
+                &ext as *const _ as *const _,
+                std::mem::size_of_val(&ext) as u32,
+            )
+        };
+        if ok == 0 {
+            return Err(std::io::Error::from_raw_os_error(unsafe { GetLastError() } as i32))
+                .context("SetInformationJobObject extended limits");
+        }
+
+        if let Some(cpu_percent) = q.cpu_percent {
+            let n = std::thread::available_parallelism()
+                .map(|value| value.get() as u32)
+                .unwrap_or(1);
+            let mut cpu: JOBOBJECT_CPU_RATE_CONTROL_INFORMATION = unsafe { std::mem::zeroed() };
+            cpu.ControlFlags =
+                JOB_OBJECT_CPU_RATE_CONTROL_ENABLE | JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP;
+            unsafe {
+                cpu.Anonymous.CpuRate = super::windows_cpu_rate(cpu_percent, n);
+            }
+            let ok = unsafe {
+                SetInformationJobObject(
+                    job,
+                    JobObjectCpuRateControlInformation,
+                    &cpu as *const _ as *const _,
+                    std::mem::size_of_val(&cpu) as u32,
+                )
+            };
+            if ok == 0 {
+                return Err(std::io::Error::from_raw_os_error(unsafe { GetLastError() } as i32))
+                    .context("SetInformationJobObject CPU rate");
+            }
+        }
+
+        info!(
+            cpu_percent = ?q.cpu_percent,
+            memory_mb = ?q.memory_mb,
+            pids_max = ?q.pids_max,
+            "applied Windows Job Object quota"
+        );
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::windows_cpu_rate;
+
+    #[test]
+    fn windows_cpu_rate_is_one_cpu_share_of_the_machine() {
+        assert_eq!(windows_cpu_rate(25, 1), 250);
+        assert_eq!(windows_cpu_rate(25, 8), 31);
+        assert_eq!(windows_cpu_rate(150, 8), 188);
+        assert_eq!(windows_cpu_rate(100, 16), 63);
+        assert_eq!(windows_cpu_rate(1, 64), 1);
+    }
 }

@@ -109,13 +109,15 @@ jobs:
           test -f "$BEENET_KERNEL_PATH"
           test -f "$BEENET_INITRD_PATH"
           make dmg
-          ls -lh apps/macos-contributor/dist/*.dmg
+          stable="deploy/macos-contributor/dist/Beenet-macos-arm64.dmg"
+          cp deploy/macos-contributor/dist/Beenet-*-darwin-arm64.dmg "$stable"
+          ls -lh deploy/macos-contributor/dist/*.dmg
 
       - name: Upload DMG artifact
         uses: actions/upload-artifact@v4
         with:
           name: Beenet-macos-arm64
-          path: beenet/apps/macos-contributor/dist/*.dmg
+          path: beenet/deploy/macos-contributor/dist/*.dmg
           if-no-files-found: error
 
       - name: Publish GitHub Release
@@ -127,4 +129,5 @@ jobs:
           tag="${{ github.ref_name }}"
           gh release view "$tag" >/dev/null 2>&1 || \
             gh release create "$tag" --title "Beenet ${tag}" --generate-notes
-          gh release upload "$tag" apps/macos-contributor/dist/*.dmg --clobber
+          gh release upload "$tag" deploy/macos-contributor/dist/*.dmg --clobber
+          gh release upload "$tag" deploy/macos-contributor/dist/Beenet-macos-arm64.dmg --clobber
