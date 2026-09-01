@@ -186,6 +186,28 @@ make dmg
 open deploy/macos-contributor/dist/Beenet-0.1.0-darwin-arm64.dmg
 ```
 
+本地公开发版不能使用 `make dmg`，它只适合开发测试，当前会生成 ad-hoc 签名包。安全发版需要：
+
+1. 在 Apple Developer 里创建 `Developer ID Application` 证书并安装到发布机钥匙串。不要把 `.p12`、私钥或 Apple ID 密码提交到仓库。
+2. 为公证创建一次钥匙串 profile（密码建议使用 App 专用密码）：
+
+```bash
+xcrun notarytool store-credentials beenet-notary \
+  --apple-id '你的 Apple ID' --team-id 'Membership Team ID' \
+  --password '应用专用密码'
+```
+
+3. 用证书完整名称执行发布：
+
+```bash
+DEVELOPER_ID_APPLICATION='Developer ID Application: 你的公司 (TEAMID)' \
+NOTARYTOOL_PROFILE=beenet-notary make release-macos-dmg
+```
+
+脚本会签名 App 内的 `vfkit`、worker 和 Swift 主程序，验证 hardened runtime，提交公证，staple 票据，并输出 `Beenet-notarized.dmg`。发布前应在一台未安装开发证书的 Mac 上测试：`spctl --assess --type open --context context:primary-signature --verbose Beenet.app`。
+
+GitHub Actions 中请在仓库 `Settings -> Secrets and variables -> Actions` 添加以下 Secrets：`APPLE_CERTIFICATE_P12_BASE64`（Developer ID 证书导出的 `.p12` 做 base64）、`APPLE_CERTIFICATE_PASSWORD`、`DEVELOPER_ID_APPLICATION`、`APPLE_ID`、`APPLE_TEAM_ID`、`APPLE_APP_SPECIFIC_PASSWORD`。这些值只在 `v*` tag 构建中使用；CI 会创建临时钥匙串，任务结束后随 runner 销毁。证书导出示例：`base64 -i developer-id.p12 | pbcopy`。不要使用 Apple ID 主密码。
+
 发版：`git tag v0.1.0 && git push origin v0.1.0`。  
 [`.github/workflows/macos-contributor.yml`](.github/workflows/macos-contributor.yml) 分两台机器：
 

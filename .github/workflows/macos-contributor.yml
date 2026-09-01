@@ -100,18 +100,65 @@ jobs:
           cargo build --release -p beenet-worker
           file target/release/beenet-worker
 
+      - name: Import Developer ID certificate
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          APPLE_CERTIFICATE_P12_BASE64: ${{ secrets.APPLE_CERTIFICATE_P12_BASE64 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          test -n "$APPLE_CERTIFICATE_P12_BASE64"
+          test -n "$APPLE_CERTIFICATE_PASSWORD"
+          keychain="$RUNNER_TEMP/beenet-signing.keychain-db"
+          security create-keychain -p "ci-keychain-password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "ci-keychain-password" "$keychain"
+          printf '%s' "$APPLE_CERTIFICATE_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/developer-id.p12"
+          security import "$RUNNER_TEMP/developer-id.p12" -P "$APPLE_CERTIFICATE_PASSWORD" \
+            -A -t cert -f pkcs12 -k "$keychain"
+          security list-keychains -d user -s "$keychain"
+          security default-keychain -s "$keychain"
+          security set-key-partition-list -S apple-tool:,apple: \
+            -s -k "ci-keychain-password" "$keychain"
+
+      - name: Store Apple notarization credentials
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+        run: |
+          test -n "$APPLE_ID"
+          test -n "$APPLE_TEAM_ID"
+          test -n "$APPLE_APP_SPECIFIC_PASSWORD"
+          xcrun notarytool store-credentials beenet-notary \
+            --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" \
+            --password "$APPLE_APP_SPECIFIC_PASSWORD" \
+            --keychain "$RUNNER_TEMP/beenet-signing.keychain-db"
+
       - name: Package app and DMG
+        if: startsWith(github.ref, 'refs/tags/')
         working-directory: beenet
         env:
           BEENET_KERNEL_PATH: ${{ github.workspace }}/guest/Image
           BEENET_INITRD_PATH: ${{ github.workspace }}/guest/initrd.img
+          DEVELOPER_ID_APPLICATION: ${{ secrets.DEVELOPER_ID_APPLICATION }}
+          NOTARYTOOL_PROFILE: beenet-notary
         run: |
           test -f "$BEENET_KERNEL_PATH"
           test -f "$BEENET_INITRD_PATH"
-          make dmg
+          test -n "$DEVELOPER_ID_APPLICATION"
+          make release-macos-dmg
           stable="deploy/macos-contributor/dist/Beenet-macos-arm64.dmg"
-          cp deploy/macos-contributor/dist/Beenet-*-darwin-arm64.dmg "$stable"
+          cp deploy/macos-contributor/dist/Beenet-notarized.dmg "$stable"
           ls -lh deploy/macos-contributor/dist/*.dmg
+
+      - name: Package unsigned development DMG
+        if: github.event_name == 'workflow_dispatch'
+        working-directory: beenet
+        env:
+          BEENET_KERNEL_PATH: ${{ github.workspace }}/guest/Image
+          BEENET_INITRD_PATH: ${{ github.workspace }}/guest/initrd.img
+        run: make dmg
 
       - name: Upload DMG artifact
         uses: actions/upload-artifact@v4

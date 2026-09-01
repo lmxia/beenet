@@ -60,6 +60,11 @@ dmg: app-macos ## Wrap the macOS contributor app into a DMG
 	chmod +x scripts/package-macos-dmg.sh
 	scripts/package-macos-dmg.sh
 
+.PHONY: release-macos-dmg
+release-macos-dmg: ## Sign, notarize, and staple the macOS DMG (requires Apple credentials)
+	chmod +x scripts/release-macos-dmg.sh
+	scripts/release-macos-dmg.sh
+
 LINUX_ARCH ?= $(shell uname -m)
 LINUX_TARBALL := out/linux/beenet-worker-linux-$(LINUX_ARCH).tar.gz
 
