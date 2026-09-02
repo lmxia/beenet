@@ -2,7 +2,7 @@
 # Install bworker onto PATH, write ~/.config/beenet/config.toml, then run it.
 #
 #   curl -fsSL -o get-bworker.sh \
-#     http://cloud.hyperos.online/api/v1/downloads/get-bworker.sh
+#     https://cloud.hyperos.com.cn/api/v1/downloads/get-bworker.sh
 #   chmod +x get-bworker.sh
 #   ./get-bworker.sh
 #
@@ -12,14 +12,14 @@ set -euo pipefail
 
 REPO="${BEENET_REPO:-lmxia/beenet}"
 VERSION="${BEENET_VERSION:-latest}"
-DOWNLOAD_BASE="${BEENET_DOWNLOAD_BASE:-http://cloud.hyperos.online/api/v1/downloads}"
+DOWNLOAD_BASE="${BEENET_DOWNLOAD_BASE:-https://cloud.hyperos.com.cn/api/v1/downloads}"
 PREFIX="${BEENET_PREFIX:-}"
 INSTALL_ONLY=0
 WORKER_ARGS=()
 
 # Keep in sync with macOS WorkerConfigSnapshot and beenet-common Linux defaults.
-DEFAULT_REGISTRY_URL="http://registry.hyperos.online"
-DEFAULT_WASM_FETCH_BASE="http://cloud.hyperos.online/api/v1/artifacts"
+DEFAULT_REGISTRY_URL="https://registry.hyperos.com.cn"
+DEFAULT_WASM_FETCH_BASE="https://cloud.hyperos.com.cn/api/v1/artifacts"
 DEFAULT_LISTEN_ADDR="/ip4/0.0.0.0/tcp/0"
 DEFAULT_HEARTBEAT_SECS="30"
 DEFAULT_WASM_FETCH_TIMEOUT_SECS="60"
@@ -75,7 +75,7 @@ Needs a writable cgroup subtree (root, sudo, or systemd Delegate=yes).
 
 Environment:
   BEENET_DOWNLOAD_BASE      asset base URL
-                            (default: http://cloud.hyperos.online/api/v1/downloads)
+                            (default: https://cloud.hyperos.com.cn/api/v1/downloads)
   BEENET_REPO, BEENET_VERSION, BEENET_PREFIX, BEENET_CONFIG,
   BEENET_WORKER_NAME, BEENET_REGION
 EOF

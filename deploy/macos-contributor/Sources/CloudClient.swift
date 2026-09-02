@@ -2,7 +2,7 @@ import AppKit
 import Foundation
 
 enum CloudEndpoints {
-    static let apiBase = "http://cloud.hyperos.online/api"
+    static let apiBase = "https://cloud.hyperos.com.cn/api"
 }
 
 struct CloudUser: Decodable {

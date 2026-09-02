@@ -1,7 +1,7 @@
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-const API_BASE: &str = "http://cloud.hyperos.online/api";
+const API_BASE: &str = "https://cloud.hyperos.com.cn/api";
 
 pub struct CloudClient;
 

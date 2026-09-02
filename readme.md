@@ -98,7 +98,7 @@ Linux 服务器把 `beenet-worker` 装到 PATH 后，无子命令即：首次 `e
 
 ```bash
 curl -fsSL -o get-bworker.sh \
-  http://cloud.hyperos.online/api/v1/downloads/get-bworker.sh
+  https://cloud.hyperos.com.cn/api/v1/downloads/get-bworker.sh
 chmod +x get-bworker.sh
 ./get-bworker.sh
 # 配置写入 ~/.config/beenet/config.toml（可用 --quota-cpu-percent 等覆盖默认配额）
@@ -210,6 +210,8 @@ GitHub Actions 中请在仓库 `Settings -> Secrets and variables -> Actions` �
 
 发版：`git tag v0.1.0 && git push origin v0.1.0`。  
 [`.github/workflows/macos-contributor.yml`](.github/workflows/macos-contributor.yml) 分两台机器：
+
+Windows 正式发版同样在 `v*` tag 构建时签名。请在 GitHub Actions Secrets 中添加 `WINDOWS_SIGNING_PFX_BASE64`（代码签名供应商提供的 `.pfx` 转 base64）和 `WINDOWS_SIGNING_PFX_PASSWORD`。CI 会先签名两个程序，再签名最终的 Inno Setup 安装器；手动运行 workflow 仍生成未签名测试包。不要把 `.pfx` 或密码提交到仓库。
 
 | Job | Runner | 编什么 |
 | --- | --- | --- |

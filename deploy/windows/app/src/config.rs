@@ -86,8 +86,8 @@ impl WorkerSnapshot {
             "[worker]\n\
              backend = \"native\"\n\
              listen_addr = \"/ip4/0.0.0.0/tcp/0\"\n\
-             registry_url = \"http://registry.hyperos.online\"\n\
-             wasm_fetch_base = \"http://cloud.hyperos.online/api/v1/artifacts\"\n\
+             registry_url = \"https://registry.hyperos.com.cn\"\n\
+             wasm_fetch_base = \"https://cloud.hyperos.com.cn/api/v1/artifacts\"\n\
              wasm_fetch_timeout_secs = 60\n\
              registry_heartbeat_secs = 30\n\
              wasm_cache_dir = {}\n",

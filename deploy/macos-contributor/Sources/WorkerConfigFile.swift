@@ -1,8 +1,8 @@
 import Foundation
 
 enum NetworkEndpoints {
-    static let registryURL = "http://registry.hyperos.online"
-    static let wasmFetchBase = "http://cloud.hyperos.online/api/v1/artifacts"
+    static let registryURL = "https://registry.hyperos.com.cn"
+    static let wasmFetchBase = "https://cloud.hyperos.com.cn/api/v1/artifacts"
 }
 
 struct WorkerConfigSnapshot: Equatable {

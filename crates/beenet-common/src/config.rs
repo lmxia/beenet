@@ -152,9 +152,9 @@ pub const DEFAULT_MAX_INSTANCE_MEMORY_MB: u32 = 256;
 pub const DEFAULT_REGISTRY_HEARTBEAT_PATH: &str = "/v1/workers/heartbeat";
 pub const DEFAULT_REGISTRY_HEARTBEAT_SECS: u64 = 30;
 /// Production registry used by the macOS contributor app (`NetworkEndpoints.registryURL`).
-pub const DEFAULT_PUBLIC_REGISTRY_URL: &str = "http://registry.hyperos.online";
+pub const DEFAULT_PUBLIC_REGISTRY_URL: &str = "https://registry.hyperos.com.cn";
 /// Production artifact fetch base (`NetworkEndpoints.wasmFetchBase`).
-pub const DEFAULT_PUBLIC_WASM_FETCH_BASE: &str = "http://cloud.hyperos.online/api/v1/artifacts";
+pub const DEFAULT_PUBLIC_WASM_FETCH_BASE: &str = "https://cloud.hyperos.com.cn/api/v1/artifacts";
 pub const DEFAULT_WASM_FETCH_TIMEOUT_SECS: u64 = 60;
 pub const DEFAULT_GATEWAY_HTTP_ADDR: &str = "127.0.0.1:8080";
 pub const DEFAULT_GATEWAY_LIBP2P_LISTEN_ADDR: &str = "/ip4/0.0.0.0/tcp/4001";

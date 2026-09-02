@@ -804,8 +804,8 @@ mod tests {
     #[test]
     fn parse_registry_host_port_defaults_and_overrides() {
         assert_eq!(
-            super::parse_registry_host_port("http://registry.hyperos.online"),
-            Some(("registry.hyperos.online".into(), 80))
+            super::parse_registry_host_port("https://registry.hyperos.com.cn"),
+            Some(("registry.hyperos.com.cn".into(), 443))
         );
         assert_eq!(
             super::parse_registry_host_port("https://example.com/api"),

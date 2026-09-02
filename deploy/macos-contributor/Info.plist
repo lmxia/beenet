@@ -30,7 +30,7 @@
 		<true/>
 		<key>NSExceptionDomains</key>
 		<dict>
-			<key>hyperos.online</key>
+			<key>hyperos.com.cn</key>
 			<dict>
 				<key>NSIncludesSubdomains</key>
 				<true/>

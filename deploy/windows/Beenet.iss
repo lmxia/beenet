@@ -152,8 +152,8 @@ begin
     '[worker]'#13#10 +
     'backend = "native"'#13#10 +
     'listen_addr = "/ip4/0.0.0.0/tcp/0"'#13#10 +
-    'registry_url = "http://registry.hyperos.online"'#13#10 +
-    'wasm_fetch_base = "http://cloud.hyperos.online/api/v1/artifacts"'#13#10 +
+    'registry_url = "https://registry.hyperos.com.cn"'#13#10 +
+    'wasm_fetch_base = "https://cloud.hyperos.com.cn/api/v1/artifacts"'#13#10 +
     'wasm_fetch_timeout_secs = 60'#13#10 +
     'registry_heartbeat_secs = 30'#13#10 +
     'wasm_cache_dir = "' + TomlEscape(CacheDir) + '"'#13#10#13#10 +

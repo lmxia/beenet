@@ -102,6 +102,31 @@ jobs:
       - name: Install Inno Setup
         run: choco install innosetup --no-progress -y
 
+      - name: Import code signing certificate
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        env:
+          WINDOWS_SIGNING_PFX_BASE64: ${{ secrets.WINDOWS_SIGNING_PFX_BASE64 }}
+          WINDOWS_SIGNING_PFX_PASSWORD: ${{ secrets.WINDOWS_SIGNING_PFX_PASSWORD }}
+        run: |
+          if (-not $env:WINDOWS_SIGNING_PFX_BASE64 -or -not $env:WINDOWS_SIGNING_PFX_PASSWORD) {
+            throw 'Windows signing secrets are required for tag builds'
+          }
+          $pfx = Join-Path $env:RUNNER_TEMP 'beenet-signing.pfx'
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WINDOWS_SIGNING_PFX_BASE64))
+          $password = ConvertTo-SecureString $env:WINDOWS_SIGNING_PFX_PASSWORD -AsPlainText -Force
+          Import-PfxCertificate -FilePath $pfx -CertStoreLocation Cert:\CurrentUser\My -Password $password | Out-Null
+
+      - name: Locate SignTool
+        if: startsWith(github.ref, 'refs/tags/')
+        id: signtool
+        shell: pwsh
+        run: |
+          $tool = Get-ChildItem "$env:ProgramFiles(x86)\Windows Kits\10\bin" -Filter signtool.exe -Recurse |
+            Where-Object { $_.FullName -match '\\x64\\signtool.exe$' } | Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $tool) { throw 'signtool.exe not found' }
+          "path=$($tool.FullName)" >> $env:GITHUB_OUTPUT
+
       - name: Compile installer
         working-directory: beenet
         shell: pwsh
@@ -110,12 +135,20 @@ jobs:
           New-Item -ItemType Directory -Force -Path out\windows | Out-Null
           $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
           if (-not (Test-Path $iscc)) { throw "ISCC.exe not found at $iscc" }
+          if ($env:GITHUB_REF_TYPE -eq 'tag') {
+            & "${{ steps.signtool.outputs.path }}" sign /fd SHA256 /a /tr http://timestamp.digicert.com /td SHA256 /d "Beenet" "$pwd\target\release\beenet-worker.exe"
+            & "${{ steps.signtool.outputs.path }}" sign /fd SHA256 /a /tr http://timestamp.digicert.com /td SHA256 /d "Beenet" "$pwd\target\release\Beenet.exe"
+          }
           & $iscc `
             "/DMyAppVersion=$version" `
             "/DBeenetWorkerExe=$pwd\target\release\beenet-worker.exe" `
             "/DBeenetAppExe=$pwd\target\release\Beenet.exe" `
             "/DBeenetOutputDir=$pwd\out\windows" `
             deploy\windows\Beenet.iss
+          if ($env:GITHUB_REF_TYPE -eq 'tag') {
+            & "${{ steps.signtool.outputs.path }}" sign /fd SHA256 /a /tr http://timestamp.digicert.com /td SHA256 /d "Beenet Installer" "$pwd\out\windows\BeenetSetup-x64.exe"
+            & "${{ steps.signtool.outputs.path }}" verify /pa /v "$pwd\out\windows\BeenetSetup-x64.exe"
+          }
           Get-ChildItem out\windows | Format-Table Name, Length
 
       - name: Upload installer

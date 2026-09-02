@@ -58,7 +58,7 @@ fn worker_log_path(wasm_cache_dir: &Path) -> PathBuf {
 #[command(
     name = "beenet-worker",
     about = "Beenet worker",
-    after_help = "bworker is a PATH alias of beenet-worker.\nLinux (no subcommand): first run enrolls, later runs start the daemon.\n  curl -fsSL -o get-bworker.sh http://cloud.hyperos.online/api/v1/downloads/get-bworker.sh\n  ./get-bworker.sh\n  bworker\nWindows: install BeenetSetup-x64.exe, then sign in from the app.\nLinux [worker.quota] CPU/memory/pids write cgroup v2 and need sudo, or systemd Delegate=yes."
+    after_help = "bworker is a PATH alias of beenet-worker.\nLinux (no subcommand): first run enrolls, later runs start the daemon.\n  curl -fsSL -o get-bworker.sh https://cloud.hyperos.com.cn/api/v1/downloads/get-bworker.sh\n  ./get-bworker.sh\n  bworker\nWindows: install BeenetSetup-x64.exe, then sign in from the app.\nLinux [worker.quota] CPU/memory/pids write cgroup v2 and need sudo, or systemd Delegate=yes."
 )]
 struct Args {
     /// `config.toml` path (default: platform config dir `beenet/config.toml`).
