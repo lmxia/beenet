@@ -8,6 +8,7 @@ on:
 
 permissions:
   contents: write
+  actions: write
 
 jobs:
   guest-image:
@@ -19,11 +20,28 @@ jobs:
         with:
           path: beenet
 
+      - name: Restore guest image cache
+        id: guest
+        uses: actions/cache@v4
+        with:
+          path: beenet/out/guest
+          key: macos-guest-${{ hashFiles('beenet/scripts/spin.rev', 'beenet/scripts/build-macos-vm-image.sh', 'beenet/deploy/docker/Dockerfile.worker-vm', 'beenet/deploy/macos-contributor/guest/alpine-init', 'beenet/Cargo.lock', 'beenet/Cargo.toml', 'beenet/crates/beenet-worker/**', 'beenet/crates/beenet-factors/**', 'beenet/crates/beenet-common/**') }}
+
       - name: Read Spin revision
+        if: steps.guest.outputs.cache-hit != 'true'
         id: spin
         run: echo "rev=$(tr -d '[:space:]' < beenet/scripts/spin.rev)" >> "$GITHUB_OUTPUT"
 
+      - name: Restore Spin checkout
+        if: steps.guest.outputs.cache-hit != 'true'
+        id: spin-cache
+        uses: actions/cache@v4
+        with:
+          path: spin
+          key: spin-${{ steps.spin.outputs.rev }}-submodules
+
       - name: Checkout Spin
+        if: steps.guest.outputs.cache-hit != 'true' && steps.spin-cache.outputs.cache-hit != 'true'
         uses: actions/checkout@v4
         with:
           repository: spinframework/spin
@@ -32,19 +50,24 @@ jobs:
           submodules: recursive
 
       - name: Set up Docker Buildx
+        if: steps.guest.outputs.cache-hit != 'true'
         uses: docker/setup-buildx-action@v3
 
       - name: Install ISO tools
+        if: steps.guest.outputs.cache-hit != 'true'
         run: sudo apt-get update && sudo apt-get install -y libarchive-tools cpio gzip
 
       - name: Build kernel and initramfs
+        if: steps.guest.outputs.cache-hit != 'true'
         working-directory: beenet
         env:
           BEENET_VM_CACHE_DIR: ${{ runner.temp }}/beenet-vm
           BEENET_SPIN_DIR: ${{ github.workspace }}/spin
+          BEENET_BUILDX_EXTRA_ARGS: --cache-from=type=gha,scope=macos-guest-worker --cache-to=type=gha,mode=max,scope=macos-guest-worker
         run: scripts/build-macos-vm-image.sh
 
       - name: Stage guest image
+        if: steps.guest.outputs.cache-hit != 'true'
         run: |
           mkdir -p beenet/out/guest
           cp "${{ runner.temp }}/beenet-vm/extracted/boot/Image" beenet/out/guest/Image
@@ -58,10 +81,8 @@ jobs:
           path: beenet/out/guest/*
           if-no-files-found: error
 
-  dmg:
-    name: macOS arm64 DMG
-    needs: guest-image
-    # macos-15 is Apple Silicon (M-series). Intel is macos-15-intel; we do not ship that.
+  host-worker:
+    name: macOS host worker
     runs-on: macos-15
     steps:
       - name: Checkout Beenet
@@ -73,7 +94,15 @@ jobs:
         id: spin
         run: echo "rev=$(tr -d '[:space:]' < beenet/scripts/spin.rev)" >> "$GITHUB_OUTPUT"
 
+      - name: Restore Spin checkout
+        id: spin-cache
+        uses: actions/cache@v4
+        with:
+          path: spin
+          key: spin-${{ steps.spin.outputs.rev }}-submodules
+
       - name: Checkout Spin
+        if: steps.spin-cache.outputs.cache-hit != 'true'
         uses: actions/checkout@v4
         with:
           repository: spinframework/spin
@@ -84,6 +113,36 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: beenet
+          shared-key: macos-beenet-worker
+
+      - name: Build host Mach-O worker
+        working-directory: beenet
+        run: |
+          uname -m
+          cargo build --release -p beenet-worker
+          file target/release/beenet-worker
+
+      - name: Upload host worker
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-host-worker
+          path: beenet/target/release/beenet-worker
+          if-no-files-found: error
+
+  package:
+    name: macOS arm64 DMG
+    needs: [guest-image, host-worker]
+    runs-on: macos-15
+    steps:
+      - name: Checkout Beenet
+        uses: actions/checkout@v4
+        with:
+          path: beenet
+
       - name: Install vfkit
         run: brew install vfkit
 
@@ -93,12 +152,11 @@ jobs:
           name: macos-guest-image
           path: ${{ github.workspace }}/guest
 
-      - name: Build host Mach-O worker
-        working-directory: beenet
-        run: |
-          uname -m
-          cargo build --release -p beenet-worker
-          file target/release/beenet-worker
+      - name: Download host worker
+        uses: actions/download-artifact@v4
+        with:
+          name: macos-host-worker
+          path: ${{ github.workspace }}/host-worker
 
       - name: Import Developer ID certificate
         if: startsWith(github.ref, 'refs/tags/')
@@ -141,9 +199,11 @@ jobs:
         env:
           BEENET_KERNEL_PATH: ${{ github.workspace }}/guest/Image
           BEENET_INITRD_PATH: ${{ github.workspace }}/guest/initrd.img
+          BEENET_WORKER_BIN: ${{ github.workspace }}/host-worker/beenet-worker
           DEVELOPER_ID_APPLICATION: ${{ secrets.DEVELOPER_ID_APPLICATION }}
           NOTARYTOOL_PROFILE: beenet-notary
         run: |
+          chmod +x "$BEENET_WORKER_BIN"
           test -f "$BEENET_KERNEL_PATH"
           test -f "$BEENET_INITRD_PATH"
           test -n "$DEVELOPER_ID_APPLICATION"
@@ -158,7 +218,10 @@ jobs:
         env:
           BEENET_KERNEL_PATH: ${{ github.workspace }}/guest/Image
           BEENET_INITRD_PATH: ${{ github.workspace }}/guest/initrd.img
-        run: make dmg
+          BEENET_WORKER_BIN: ${{ github.workspace }}/host-worker/beenet-worker
+        run: |
+          chmod +x "$BEENET_WORKER_BIN"
+          make dmg
 
       - name: Upload DMG artifact
         uses: actions/upload-artifact@v4

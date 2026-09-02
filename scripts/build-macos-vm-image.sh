@@ -73,10 +73,15 @@ BUILDX_BUILDER_ARGS=""
 if [ -n "${BEENET_BUILDX_BUILDER:-}" ]; then
     BUILDX_BUILDER_ARGS="--builder $BEENET_BUILDX_BUILDER"
 fi
+BUILDX_EXTRA_ARGS=""
+if [ -n "${BEENET_BUILDX_EXTRA_ARGS:-}" ]; then
+    BUILDX_EXTRA_ARGS=$BEENET_BUILDX_EXTRA_ARGS
+fi
 
 # shellcheck disable=SC2086
 docker buildx build \
     $BUILDX_BUILDER_ARGS \
+    $BUILDX_EXTRA_ARGS \
     --platform linux/arm64 \
     --build-context "spin=$SPIN_DIR" \
     --build-arg "HTTP_PROXY=${BEENET_DOCKER_HTTP_PROXY:-${HTTP_PROXY:-}}" \

@@ -204,19 +204,20 @@ DEVELOPER_ID_APPLICATION='Developer ID Application: 你的公司 (TEAMID)' \
 NOTARYTOOL_PROFILE=beenet-notary make release-macos-dmg
 ```
 
-脚本会签名 App 内的 `vfkit`、worker 和 Swift 主程序，验证 hardened runtime，提交公证，staple 票据，并输出 `Beenet-notarized.dmg`。发布前应在一台未安装开发证书的 Mac 上测试：`spctl --assess --type open --context context:primary-signature --verbose Beenet.app`。
+脚本会签名 App 内的 `vfkit`、worker 和 Swift 主程序，验证 hardened runtime，对签名后的 DMG 做一次公证并 staple，输出 `Beenet-notarized.dmg`。发布前应在一台未安装开发证书的 Mac 上测试：`spctl --assess --type open --context context:primary-signature --verbose Beenet.app`。
 
 GitHub Actions 中请在仓库 `Settings -> Secrets and variables -> Actions` 添加以下 Secrets：`APPLE_CERTIFICATE_P12_BASE64`（Developer ID 证书导出的 `.p12` 做 base64）、`APPLE_CERTIFICATE_PASSWORD`、`DEVELOPER_ID_APPLICATION`、`APPLE_ID`、`APPLE_TEAM_ID`、`APPLE_APP_SPECIFIC_PASSWORD`。这些值只在 `v*` tag 构建中使用；CI 会创建临时钥匙串，任务结束后随 runner 销毁。证书导出示例：`base64 -i developer-id.p12 | pbcopy`。不要使用 Apple ID 主密码。
 
 发版：`git tag v0.1.0 && git push origin v0.1.0`。  
-[`.github/workflows/macos-contributor.yml`](.github/workflows/macos-contributor.yml) 分两台机器：
+[`.github/workflows/macos-contributor.yml`](.github/workflows/macos-contributor.yml) 分三台作业，guest 与宿主 worker 并行：
 
 Windows 正式发版同样在 `v*` tag 构建时签名。请在 GitHub Actions Secrets 中添加 `WINDOWS_SIGNING_PFX_BASE64`（代码签名供应商提供的 `.pfx` 转 base64）和 `WINDOWS_SIGNING_PFX_PASSWORD`。CI 会先签名两个程序，再签名最终的 Inno Setup 安装器；手动运行 workflow 仍生成未签名测试包。不要把 `.pfx` 或密码提交到仓库。
 
 | Job | Runner | 编什么 |
 | --- | --- | --- |
-| `guest-image` | `ubuntu-24.04-arm` | Linux aarch64 内核 + musl guest worker + initramfs |
-| `dmg` | `macos-15`（Apple Silicon，不是 Intel） | Mach-O 宿主 `beenet-worker` + Swift App + vfkit + DMG |
+| `guest-image` | `ubuntu-24.04-arm` | Linux aarch64 内核 + musl guest worker + initramfs；内容未变时走 cache |
+| `host-worker` | `macos-15` | Mach-O `beenet-worker`（与 guest 并行，带 rust-cache） |
+| `package` | `macos-15` | Swift App + vfkit + DMG；tag 构建只公证 DMG 一次 |
 
 GitHub 托管的 `macos-15` / `macos-latest` 默认就是 ARM Mac。Intel 要用显式的 `macos-15-intel`，本仓库不发 Intel DMG。未打 tag 时可在 Actions 里手动 `workflow_dispatch`。当前 ad-hoc 签名，第一次打开需右键「打开」。
 

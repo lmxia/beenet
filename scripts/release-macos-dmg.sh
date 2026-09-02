@@ -25,15 +25,8 @@ codesign --sign "$IDENTITY" --force --timestamp --options runtime --entitlements
 codesign --sign "$IDENTITY" --force --timestamp --options runtime --entitlements "$ENTITLEMENTS" "$APP"
 codesign --verify --strict --deep --verbose=2 "$APP"
 
-# Staple the app before making the DMG so offline-installed copies retain the ticket.
-# notarytool cannot ingest a raw .app bundle, so submit a zip; the ticket still
-# binds to the app's code signature and can be stapled onto the .app afterwards.
-APP_ZIP="$(dirname "$APP")/$(basename "$APP" .app)-notarize.zip"
-ditto -c -k --keepParent "$APP" "$APP_ZIP"
-xcrun notarytool submit "$APP_ZIP" --keychain-profile "$PROFILE" --wait
-rm -f "$APP_ZIP"
-xcrun stapler staple "$APP"
-
+# Notarize the signed DMG once. The ticket covers the nested Developer ID app;
+# a second --wait on a zipped .app doubles wall-clock time in Apple's queue.
 DMG_DIR=$(dirname "$APP")
 BEENET_APP_DIST="$APP" BEENET_DMG_PATH="$DMG_DIR/Beenet-notarized.dmg" \
   "$ROOT_DIR/scripts/package-macos-dmg.sh"

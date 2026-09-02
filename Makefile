@@ -51,7 +51,9 @@ endif
 
 .PHONY: app-macos
 app-macos: $(APP_MACOS_DEPS) ## Build the unsigned macOS contributor app
+ifeq ($(BEENET_WORKER_BIN),)
 	cargo build --release -p beenet-worker
+endif
 	chmod +x deploy/macos-contributor/build.sh
 	deploy/macos-contributor/build.sh
 
