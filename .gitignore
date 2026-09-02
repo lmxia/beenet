@@ -22,5 +22,6 @@ gateway_cache/
 .beenet-dev/
 /cloud-hk-worker.toml
 /cloud-hk-worker-cache/
+/deploy/kubernetes/
 **/identity.key
 **/worker.pid
