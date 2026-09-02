@@ -241,3 +241,19 @@ jobs:
             gh release create "$tag" --title "Beenet ${tag}" --generate-notes
           gh release upload "$tag" deploy/macos-contributor/dist/*.dmg --clobber
           gh release upload "$tag" deploy/macos-contributor/dist/Beenet-macos-arm64.dmg --clobber
+
+      - name: Upload Hangzhou OSS
+        if: startsWith(github.ref, 'refs/tags/')
+        working-directory: beenet
+        env:
+          OSS_ENDPOINT: https://oss-cn-hangzhou.aliyuncs.com
+          OSS_BUCKET: beenet-hyperos-prod
+          OSS_PREFIX: releases
+          OSS_ACCESS_KEY_ID: ${{ secrets.OSS_ACCESS_KEY_ID }}
+          OSS_ACCESS_KEY_SECRET: ${{ secrets.OSS_ACCESS_KEY_SECRET }}
+        run: |
+          PY=python3
+          command -v python3 >/dev/null || PY=python
+          "$PY" -m pip install --user oss2 || "$PY" -m pip install --user --break-system-packages oss2
+          "$PY" scripts/oss-upload-release.py "${{ github.ref_name }}" \
+            deploy/macos-contributor/dist/Beenet-macos-arm64.dmg
