@@ -491,6 +491,11 @@ struct SettingsView: View {
                                 .font(.caption)
                                 .foregroundStyle(model.hasIdentity ? .secondary : Color.primary)
                         }
+                        if model.hasIdentity && model.hasCloudSession {
+                            Button("退网并清理本机身份") { model.leaveNetwork() }
+                                .buttonStyle(.bordered)
+                                .disabled(model.busy)
+                        }
                     }
                     VStack(alignment: .leading, spacing: 10) {
                         Text("网络")

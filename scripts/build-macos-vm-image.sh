@@ -60,6 +60,16 @@ mkdir -p "$WORK/root/etc/ssl/certs"
 iso_extract apks/aarch64/ca-certificates-bundle-20260611-r0.apk \
     | tar -xzOf - etc/ssl/certs/ca-certificates.crt \
     > "$WORK/root/etc/ssl/certs/ca-certificates.crt"
+# Alpine's Mozilla CA bundle no longer includes this legacy root, while the
+# Registry's current certificate chain still terminates at it.
+AAA_CA="$ROOT_DIR/assets/certs/AAA-Certificate-Services.pem"
+AAA_CA_SHA256='D7:A7:A0:FB:5D:7E:27:31:D7:71:E9:48:4E:BC:DE:F7:1D:5F:0C:3E:0A:29:48:78:2B:C8:3E:E0:EA:69:9E:F4'
+actual_aaa_ca_sha256=$(openssl x509 -in "$AAA_CA" -noout -fingerprint -sha256 | sed 's/^.*=//')
+[ "$actual_aaa_ca_sha256" = "$AAA_CA_SHA256" ] || {
+    echo "error: invalid AAA Certificate Services root certificate" >&2
+    exit 1
+}
+cat "$AAA_CA" >> "$WORK/root/etc/ssl/certs/ca-certificates.crt"
 
 rm -rf "$WORK/worker-artifact"
 mkdir -p "$WORK/worker-artifact"

@@ -36,11 +36,26 @@ use spin_app::AppComponent;
 use spin_core::wasmtime::component::Component;
 use spin_factors_executor::{ComponentLoader, FactorsExecutor};
 use tokio::sync::{watch, RwLock, Semaphore};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::executor::{
     invoke_prepared, load_factors_app, BeenetExecutor, BeenetExecutorApp, CpuMeter, ExecOutcome,
 };
+
+const AAA_CERTIFICATE_SERVICES_PEM: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../assets/certs/AAA-Certificate-Services.pem"
+));
+
+fn http_client_builder() -> Result<reqwest::ClientBuilder> {
+    let certificate = reqwest::Certificate::from_pem(AAA_CERTIFICATE_SERVICES_PEM)
+        .context("parse embedded AAA Certificate Services root certificate")?;
+    Ok(reqwest::Client::builder().add_root_certificate(certificate))
+}
+
+fn http_client() -> Result<reqwest::Client> {
+    http_client_builder()?.build().context("build HTTP client")
+}
 use crate::quota::apply_os_quota;
 
 fn unix_timestamp_ms() -> u64 {
@@ -608,7 +623,7 @@ impl Runtime {
         let download_url = self.artifact_download_url(base, cid).await?;
         let download_started = Instant::now();
         info!(url = %download_url, %cid, timestamp_ms = unix_timestamp_ms(), "wasm milestone: download_started");
-        let client = reqwest::Client::builder()
+        let client = http_client_builder()?
             .timeout(self.wasm_fetch_timeout)
             .build()
             .context("build HTTP client for wasm fetch")?;
@@ -644,7 +659,7 @@ impl Runtime {
     }
 
     async fn artifact_download_url(&self, base: &str, cid: &BeenetCid) -> Result<String> {
-        let client = reqwest::Client::builder()
+        let client = http_client_builder()?
             .timeout(self.wasm_fetch_timeout)
             .build()
             .context("build HTTP client for artifact URL request")?;
@@ -1417,12 +1432,14 @@ fn remove_worker(cli: &Args, argv: &[String]) -> Result<()> {
         .join(beenet_common::display_name::DISPLAY_NAME_FILE);
     let enrolled_path = beenet_common::display_name::registry_joined_path(&settings.wasm_cache_dir);
     let heartbeat_path = beenet_common::display_name::registry_heartbeat_path(&settings.wasm_cache_dir);
+    let unregistered_path = settings.wasm_cache_dir.join("registry-unregistered");
     for path in [
         &pid_path,
         &identity_path,
         &display_name_path,
         &enrolled_path,
         &heartbeat_path,
+        &unregistered_path,
     ] {
         if path.exists() {
             fs::remove_file(path).with_context(|| format!("remove `{}`", path.display()))?;
@@ -1876,7 +1893,7 @@ async fn main() -> Result<()> {
 
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let cli = Args::parse();
-    match cli.command.clone().unwrap_or_else(default_worker_command) {
+    let result = match cli.command.clone().unwrap_or_else(default_worker_command) {
         WorkerCommand::Join | WorkerCommand::RunInternal => run_worker(cli, &argv).await,
         WorkerCommand::Enroll => enroll_worker(cli, &argv).await,
         WorkerCommand::Start if cli.foreground => {
@@ -1890,7 +1907,11 @@ async fn main() -> Result<()> {
         WorkerCommand::Status => status_background(&cli, &argv),
         WorkerCommand::Remove | WorkerCommand::Rm => remove_worker(&cli, &argv),
         WorkerCommand::Install { prefix } => install_self(&prefix),
+    };
+    if let Err(error) = &result {
+        error!(error = %format!("{error:#}"), "worker exited with an error");
     }
+    result
 }
 
 fn default_worker_command() -> WorkerCommand {
@@ -2023,7 +2044,7 @@ async fn enroll_worker(cli: Args, argv: &[String]) -> Result<()> {
     let peer_s = local_peer_id.to_string();
     let join_url = registry_url(&settings.registry_url, "/v1/workers/join");
     let heartbeat_url = registry_url(&settings.registry_url, &settings.registry_heartbeat_path);
-    let http = reqwest::Client::new();
+    let http = http_client().context("build HTTP client for worker enrollment")?;
     do_join(
         &http,
         &join_url,
@@ -2051,6 +2072,7 @@ async fn enroll_worker(cli: Args, argv: &[String]) -> Result<()> {
     .await?
     .context("worker joined but heartbeat still reports it as unregistered")?;
     beenet_common::display_name::mark_registry_joined(&settings.wasm_cache_dir)?;
+    let _ = fs::remove_file(settings.wasm_cache_dir.join("registry-unregistered"));
     let _ = beenet_common::display_name::mark_registry_heartbeat(&settings.wasm_cache_dir);
     println!("ok: true");
     println!("peer_id: {local_peer_id}");
@@ -2100,9 +2122,6 @@ async fn run_worker(cli: Args, argv: &[String]) -> Result<()> {
     } else {
         backend::validate(&settings)?;
     }
-    // After the macOS vfkit supervisor returns, any guest worker exit must power
-    // off Linux so vfkit exits and launchd KeepAlive can restart the VM.
-    let _guest_shutdown = GuestShutdownOnDrop::from_env();
     let bootstrap_token = bootstrap_token(&cli)?;
     let listen_addr: Multiaddr = settings
         .listen_addr
@@ -2134,7 +2153,7 @@ async fn run_worker(cli: Args, argv: &[String]) -> Result<()> {
 
     let heartbeat_url = registry_url(&settings.registry_url, &settings.registry_heartbeat_path);
     let join_url = registry_url(&settings.registry_url, "/v1/workers/join");
-    let http = reqwest::Client::new();
+    let http = http_client().context("build HTTP client for worker registration")?;
     let peer_s = local_peer_id.to_string();
 
     // Initial registration: try heartbeat first; if unregistered, attempt join.
@@ -2172,6 +2191,7 @@ async fn run_worker(cli: Args, argv: &[String]) -> Result<()> {
                 )
                 .await
                 .context("initial worker registration failed")?;
+                let _ = fs::remove_file(settings.wasm_cache_dir.join("registry-unregistered"));
                 let tip = do_heartbeat(
                     &http,
                     &heartbeat_url,
@@ -2187,6 +2207,10 @@ async fn run_worker(cli: Args, argv: &[String]) -> Result<()> {
                 let _ = beenet_common::display_name::mark_registry_heartbeat(&settings.wasm_cache_dir);
                 tip
             } else {
+                let _ = fs::write(
+                    settings.wasm_cache_dir.join("registry-unregistered"),
+                    "1\n",
+                );
                 anyhow::bail!(
                     "worker is not registered; provide a fresh bootstrap token through \
                      --join-token-stdin, --join-token-file, or --join-token"
@@ -2258,56 +2282,10 @@ fn run_vm_backend(settings: &WorkerSettings, config_path: &Path, cli: &Args) -> 
     backend::supervise_vm(settings, config_path)
 }
 
-struct GuestShutdownOnDrop {
-    enabled: bool,
-}
-
-impl GuestShutdownOnDrop {
-    fn from_env() -> Self {
-        Self {
-            enabled: guest_env_requests_power_off(std::env::var_os("BEENET_VM_GUEST").as_deref()),
-        }
-    }
-}
-
-impl Drop for GuestShutdownOnDrop {
-    fn drop(&mut self) {
-        if self.enabled {
-            request_guest_power_off();
-        }
-    }
-}
-
-fn guest_env_requests_power_off(value: Option<&std::ffi::OsStr>) -> bool {
-    value == Some(std::ffi::OsStr::new("1"))
-}
-
-fn request_guest_power_off() {
-    #[cfg(target_os = "linux")]
-    {
-        info!("guest worker exiting; powering off Linux so vfkit can exit");
-        unsafe {
-            libc::sync();
-        }
-        if let Err(error) = fs::write("/proc/sysrq-trigger", "o") {
-            warn!(%error, "failed to write sysrq poweroff");
-        }
-        unsafe {
-            if libc::reboot(libc::LINUX_REBOOT_CMD_POWER_OFF) != 0 {
-                warn!(
-                    error = %std::io::Error::last_os_error(),
-                    "LINUX_REBOOT_CMD_POWER_OFF failed"
-                );
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{guest_env_requests_power_off, wasm_fetch_url};
+    use super::wasm_fetch_url;
     use beenet_common::BeenetCid;
-    use std::ffi::OsStr;
     use std::str::FromStr;
 
     #[test]
@@ -2319,12 +2297,5 @@ mod tests {
             wasm_fetch_url("https://example.com/wasm/", &cid),
             format!("https://example.com/wasm/{cid}")
         );
-    }
-
-    #[test]
-    fn guest_power_off_only_when_vm_guest_env_is_set() {
-        assert!(guest_env_requests_power_off(Some(OsStr::new("1"))));
-        assert!(!guest_env_requests_power_off(Some(OsStr::new("0"))));
-        assert!(!guest_env_requests_power_off(None));
     }
 }

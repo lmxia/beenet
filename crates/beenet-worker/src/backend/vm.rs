@@ -92,6 +92,12 @@ pub(crate) fn should_rebuild_nat(
 }
 
 #[cfg_attr(not(any(test, target_os = "macos")), allow(dead_code))]
+fn quick_exit_backoff(consecutive_quick_exits: u32) -> Duration {
+    let shift = consecutive_quick_exits.saturating_sub(1).min(4);
+    Duration::from_secs(5u64.saturating_mul(1u64 << shift)).min(Duration::from_secs(60))
+}
+
+#[cfg_attr(not(any(test, target_os = "macos")), allow(dead_code))]
 pub(crate) fn vfkit_pid_path(wasm_cache_dir: &Path) -> PathBuf {
     wasm_cache_dir.join(VFKIT_PID_FILE)
 }
@@ -283,11 +289,19 @@ pub(crate) fn supervise(settings: &WorkerSettings, config_path: &Path) -> Result
     let pid_path = vfkit_pid_path(&settings.wasm_cache_dir);
     let mut rebuild_failures: u32 = 0;
     let mut last_rebuild_at: Option<SystemTime> = None;
+    let mut consecutive_quick_exits: u32 = 0;
 
     loop {
         if STOP_SUPERVISOR.load(Ordering::SeqCst) {
             let _ = fs::remove_file(&pid_path);
             return Ok(());
+        }
+
+        if settings.wasm_cache_dir.join("registry-unregistered").exists() {
+            // Wait for an explicit remove/enroll action instead of restarting
+            // a VM whose identity the current Registry does not recognize.
+            interruptible_sleep(Duration::from_secs(5));
+            continue;
         }
 
         let mut cmd = command(settings, config_path)?;
@@ -315,8 +329,16 @@ pub(crate) fn supervise(settings: &WorkerSettings, config_path: &Path) -> Result
                     if STOP_SUPERVISOR.load(Ordering::SeqCst) {
                         return Ok(());
                     }
-                    warn!(?status, "vfkit exited; launching a new VM");
-                    std::thread::sleep(Duration::from_secs(1));
+                    if wall_elapsed(spawned_at) < Duration::from_secs(30) {
+                        consecutive_quick_exits = consecutive_quick_exits.saturating_add(1);
+                        let backoff = quick_exit_backoff(consecutive_quick_exits);
+                        warn!(?status, backoff_secs = backoff.as_secs(), "vfkit exited shortly after boot; delaying restart");
+                        interruptible_sleep(backoff);
+                    } else {
+                        consecutive_quick_exits = 0;
+                        warn!(?status, "vfkit exited; launching a new VM");
+                        interruptible_sleep(Duration::from_secs(1));
+                    }
                     break;
                 }
                 None => {}
@@ -890,5 +912,13 @@ mod tests {
             true,
             &policy
         ));
+    }
+
+    #[test]
+    fn quick_exit_backoff_caps_at_one_minute() {
+        assert_eq!(super::quick_exit_backoff(1), Duration::from_secs(5));
+        assert_eq!(super::quick_exit_backoff(2), Duration::from_secs(10));
+        assert_eq!(super::quick_exit_backoff(5), Duration::from_secs(60));
+        assert_eq!(super::quick_exit_backoff(100), Duration::from_secs(60));
     }
 }

@@ -280,6 +280,36 @@ final class ContributorModel: ObservableObject {
         }
     }
 
+    func leaveNetwork() {
+        guard !busy else { return }
+        guard let peerId = status.peerId?.trimmingCharacters(in: .whitespacesAndNewlines), !peerId.isEmpty else {
+            message = "本机尚未完成入网"
+            return
+        }
+        busy = true
+        let session = cloudSessionToken
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                if status.running {
+                    _ = try? WorkerProcess.run(binary: try self.requireBinary(), config: URL(fileURLWithPath: configPath), workingDirectory: URL(fileURLWithPath: workingDirectory), command: "stop")
+                }
+                try await CloudClient.removeWorker(session: session, peerId: peerId)
+                _ = try WorkerProcess.run(binary: try self.requireBinary(), config: URL(fileURLWithPath: configPath), workingDirectory: URL(fileURLWithPath: workingDirectory), command: "remove")
+                message = "已退网并清理本机身份"
+                await refreshStatus()
+            } catch {
+                message = error.localizedDescription
+            }
+            busy = false
+        }
+    }
+
+    private func requireBinary() throws -> URL {
+        guard let binary = resolvedBinary() else { throw WorkerError.missingBinary }
+        return binary
+    }
+
     func refreshStatus() async {
         guard let binary = resolvedBinary() else {
             return

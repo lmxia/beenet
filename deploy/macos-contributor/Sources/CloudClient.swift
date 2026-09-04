@@ -111,6 +111,15 @@ enum CloudClient {
         let _: Claim = try await post("/v1/me/workers", body: payload, token: session)
     }
 
+    static func removeWorker(session: String, peerId: String) async throws {
+        let _: DeleteResponse = try await send(
+            "/v1/me/workers/\(peerId.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? peerId)",
+            method: "DELETE",
+            body: nil,
+            token: session
+        )
+    }
+
     static func points(session: String) async throws -> Int {
         struct Points: Decodable { var points: Int }
         let value: Points = try await get("/v1/me/points", token: session)
@@ -175,6 +184,8 @@ enum CloudClient {
         }
         return localizedCloudMessage(String(data: data, encoding: .utf8) ?? "Cloud 请求失败")
     }
+
+    private struct DeleteResponse: Decodable { var deleted: Bool }
 
     private static func localizedCloudMessage(_ message: String) -> String {
         if message.contains("unused bootstrap token") {

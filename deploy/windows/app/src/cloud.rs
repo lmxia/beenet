@@ -2,6 +2,10 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 const API_BASE: &str = "https://cloud.hyperos.com.cn/api";
+const AAA_CERTIFICATE_SERVICES_PEM: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../../assets/certs/AAA-Certificate-Services.pem"
+));
 
 pub struct CloudClient;
 
@@ -80,7 +84,10 @@ impl CloudClient {
 }
 
 fn client() -> Result<reqwest::blocking::Client, String> {
+    let certificate = reqwest::Certificate::from_pem(AAA_CERTIFICATE_SERVICES_PEM)
+        .map_err(|error| format!("invalid embedded root certificate: {error}"))?;
     reqwest::blocking::Client::builder()
+        .add_root_certificate(certificate)
         .timeout(std::time::Duration::from_secs(15))
         .build()
         .map_err(|error| error.to_string())
